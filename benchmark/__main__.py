@@ -13,8 +13,8 @@ if __name__ == "__main__":
     associativity = 16
     aligner = ShiftAligner(cache_line_size)
 
-    evict_type = BeladyAlgorithm
-    #evict_type = FollowBinaryPredictAlgorithm
+    #evict_type = BeladyAlgorithm
+    evict_type = FollowBinaryPredictAlgorithm
 
     hash_type = ShiftHashFunction
     cache = Cache(file_path, aligner, evict_type, hash_type, capacity, associativity)    
