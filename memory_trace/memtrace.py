@@ -103,7 +103,7 @@ class MemoryTrace(object):
         """True if the cursor points to the end of the trace."""
         return not self._look_ahead_buffer
 
-    def next_access_time_by_aligned_address(self, aligned_address):
+    def next_abs_access_time_by_aligned_address(self, aligned_address):
         """Returns number of accesses from cursor of next access of address.
 
         Args:
@@ -116,6 +116,20 @@ class MemoryTrace(object):
         if not accesses:
             return np.inf
         return accesses[0] - self._num_next_calls
+    
+    def next_access_time_by_aligned_address(self, aligned_address):
+        """Returns number of accesses from cursor of next access of address.
+
+        Args:
+        address (int): cache-line aligned memory address (missing offset bits).
+
+        Returns:
+        access_time (int): np.inf if not accessed within max_look_ahead accesses.
+        """
+        accesses = self._access_times[aligned_address]
+        if not accesses:
+            return np.inf
+        return accesses[0]
 
     def __enter__(self):
         self._file = open(self._filename, "r")
