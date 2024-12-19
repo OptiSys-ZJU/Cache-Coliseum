@@ -9,9 +9,6 @@ class Aligner(ABC):
     def get_aligned_addr(self, address):
         pass
 
-    def get_align_size(self):
-        return self._cache_line_size
-
 class ShiftAligner(Aligner):
     def __init__(self, cache_line_size=64):
         def is_pow_of_two(x):

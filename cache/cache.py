@@ -1,6 +1,6 @@
 from cache.evict_algorithms import EvictAlgorithm, OracleAlgorithm
 from cache.hash import HashFunction
-from memory_trace.memtrace import MemoryTrace
+from data_trace.data_trace import OracleDataTrace
 from utils.aligner import Aligner
 from typing import Type, Callable
 from functools import partial
@@ -9,7 +9,7 @@ import numpy as np
 import tqdm
 
 class Cache:
-    def __init__(self, trace_path, aligner: Aligner, evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_capacity, associativity=16):
+    def __init__(self, trace_path, aligner_type: Type[Aligner], evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_line_size, cache_capacity, associativity=16, noise_sigma=0.0):
         def is_pow_of_two(x):
             return (x & (x - 1)) == 0
         
@@ -18,28 +18,27 @@ class Cache:
         self.miss = 0
         self.counts = 0
         self._trace_path = trace_path
-        self._aligner = aligner
-        align_size = self._aligner.get_align_size()
+        self._aligner = aligner_type(cache_line_size)
 
-        num_cache_lines = cache_capacity // align_size
+        num_cache_lines = cache_capacity // cache_line_size
         num_sets = num_cache_lines // associativity
-        if (cache_capacity % align_size != 0 or num_cache_lines % associativity != 0):
+        if (cache_capacity % cache_line_size != 0 or num_cache_lines % associativity != 0):
             raise ValueError(
                 ("Cache capacity ({}) must be an even multiple of "
                 "cache_line_size ({}) and associativity ({})").format(
-                    cache_capacity, align_size, associativity))
+                    cache_capacity, cache_line_size, associativity))
         if not is_pow_of_two(num_sets):
             raise ValueError("Number of cache sets ({}) must be a power of two.".format(num_sets))
         if num_sets == 0:
             raise ValueError(
                 ("Cache capacity ({}) is not great enough for {} cache lines per set "
-                "and cache lines of size {}").format(cache_capacity, associativity, align_size))
+                "and cache lines of size {}").format(cache_capacity, associativity, cache_line_size))
         
         self.hash_func = hash_type(num_sets)
         self.evict_algs = [evict_type(associativity) for i in range(num_sets)]
 
-        if issubclass(evict_type, OracleAlgorithm):
-            with MemoryTrace(trace_path, self._aligner) as sim_trace:
+        if issubclass(evict_type.func if hasattr(evict_type, 'func') else evict_type, OracleAlgorithm):
+            with OracleDataTrace(trace_path, self._aligner) as sim_trace:
                 with tqdm.tqdm(desc="Oracle cache on MemoryTrace") as pbar:
                     while not sim_trace.done():
                         _, address = sim_trace.next()
@@ -59,4 +58,4 @@ class Cache:
     
     def stat(self):
         print("miss count:", self.miss, 'counts:', self.counts, 'hits:', self.hits)
-        print('hit rate:', self.hits / self.counts)
+        print('hit rate:', round(self.hits / self.counts, 4))
