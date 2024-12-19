@@ -24,11 +24,94 @@ import numpy as np
 import six
 import tqdm
 
-from typing import Type
-from utils.aligner import Aligner, ShiftAligner
+from utils.aligner import Aligner
 
 
-class MemoryTrace(object):
+class DataTrace(object):
+    """Represents the ordered load calls for some program with a cursor.
+
+    Should be used in a with block.
+    """
+
+    def __init__(self, filename, max_look_ahead=int(1e7)):
+        """Constructs from a file containing the memory trace.
+
+        Args:
+        filename (str): filename of the file containing the memory trace. Must
+            conform to one of the expected .csv or .txt formats.
+        max_look_ahead (int): number of load calls to look ahead in
+            most_future_access(). All addresses not been loaded by the
+            max_look_ahead limit are considered tied.
+        cache_line_size (int): size of cache line used in Cache reading this
+            trace.
+        """
+        
+
+        self._filename = filename
+        self._max_look_ahead = max_look_ahead
+
+        self._num_next_calls = 0
+
+        # Maps address --> list of next access times in the look ahead buffer
+        self._look_ahead_buffer = collections.deque()
+
+        # Optimization: only catch the StopIteration in _read_next once.
+        # Without this optimization, the StopIteration is caught max_look_ahead
+        # times.
+        self._reader_exhausted = False
+
+    def _read_next(self):
+        """Adds the next row in the CSV memory trace to the look-ahead buffer.
+
+        Does nothing if the cursor points to the end of the trace.
+        """
+        if self._reader_exhausted:
+            return
+
+        try:
+            pc, address = self._reader.next()
+            self._look_ahead_buffer.append((pc, address))
+        except StopIteration:
+            self._reader_exhausted = True
+
+    def next(self):
+        """The next load call under the cursor. Advances the cursor.
+
+        Returns:
+        load_call (tuple)
+        """
+        self._num_next_calls += 1
+        pc, address = self._look_ahead_buffer.popleft()
+
+        self._read_next()
+        return pc, address
+
+    def done(self):
+        """True if the cursor points to the end of the trace."""
+        return not self._look_ahead_buffer
+
+    def __enter__(self):
+        self._file = open(self._filename, "r")
+        _, extension = os.path.splitext(self._filename)
+        if extension == ".csv":
+            self._reader = CSVReader(self._file)
+        elif extension == ".txt":
+            self._reader = TxtReader(self._file)
+        else:
+            raise ValueError(
+                "Extension {} not a supported extension.".format(extension))
+
+        # Initialize look-ahead buffer
+        for _ in tqdm.tqdm(
+            range(self._max_look_ahead), desc="Initializing DataTrace"):
+            self._read_next()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._file.close()
+
+
+class OracleDataTrace(object):
     """Represents the ordered load calls for some program with a cursor.
 
     Should be used in a with block.
@@ -129,6 +212,7 @@ class MemoryTrace(object):
         accesses = self._access_times[aligned_address]
         if not accesses:
             return np.inf
+
         return accesses[0]
 
     def __enter__(self):
@@ -144,7 +228,7 @@ class MemoryTrace(object):
 
         # Initialize look-ahead buffer
         for _ in tqdm.tqdm(
-            range(self._max_look_ahead), desc="Initializing MemoryTrace"):
+            range(self._max_look_ahead), desc="Initializing OracleDataTrace"):
             self._read_next()
         return self
 
