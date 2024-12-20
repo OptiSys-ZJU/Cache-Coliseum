@@ -9,7 +9,7 @@ import numpy as np
 import tqdm
 
 class Cache:
-    def __init__(self, trace_path, aligner_type: Type[Aligner], evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_line_size, cache_capacity, associativity=16, noise_sigma=0.0):
+    def __init__(self, trace_path, aligner_type: Type[Aligner], evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_line_size, cache_capacity, associativity=16):
         def is_pow_of_two(x):
             return (x & (x - 1)) == 0
         
@@ -39,12 +39,12 @@ class Cache:
 
         if issubclass(evict_type.func if hasattr(evict_type, 'func') else evict_type, OracleAlgorithm):
             with OracleDataTrace(trace_path, self._aligner) as sim_trace:
-                with tqdm.tqdm(desc="Oracle cache on MemoryTrace") as pbar:
-                    while not sim_trace.done():
-                        _, address = sim_trace.next()
-                        aligned_address = self._aligner.get_aligned_addr(address)
-                        self.evict_algs[self.hash_func.get_bucket_index(aligned_address)].oracle_access(aligned_address, sim_trace.next_access_time_by_aligned_address(aligned_address))
-                        pbar.update(1)
+                # with tqdm.tqdm(desc="Oracle cache on MemoryTrace") as pbar:
+                while not sim_trace.done():
+                    _, address = sim_trace.next()
+                    aligned_address = self._aligner.get_aligned_addr(address)
+                    self.evict_algs[self.hash_func.get_bucket_index(aligned_address)].oracle_access(aligned_address, sim_trace.next_access_time_by_aligned_address(aligned_address))
+                    # pbar.update(1)
 
     def access(self, address):
         aligned_address = self._aligner.get_aligned_addr(address)
@@ -57,5 +57,4 @@ class Cache:
         self.counts += 1
     
     def stat(self):
-        print("miss count:", self.miss, 'counts:', self.counts, 'hits:', self.hits)
-        print('hit rate:', round(self.hits / self.counts, 4))
+        return (self.hits, self.miss, self.counts, round(self.hits / self.counts, 4))
