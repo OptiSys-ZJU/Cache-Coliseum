@@ -227,8 +227,11 @@ class OracleDataTrace(object):
                 "Extension {} not a supported extension.".format(extension))
 
         # Initialize look-ahead buffer
-        for _ in tqdm.tqdm(
-            range(self._max_look_ahead), desc="Initializing OracleDataTrace"):
+        # for _ in tqdm.tqdm(
+        #     range(self._max_look_ahead), desc="Initializing OracleDataTrace"):
+        #     self._read_next()
+        
+        for _ in range(self._max_look_ahead):
             self._read_next()
         return self
 
