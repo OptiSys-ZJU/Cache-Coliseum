@@ -1,12 +1,11 @@
 from data_trace.data_trace import DataTrace
 from utils.aligner import ShiftAligner
 from cache.cache import Cache
-from cache.evict_algorithms import *
+from cache.evict import *
 from cache.hash import ShiftHashFunction
 from functools import partial
-import tqdm
-import numpy as np
 from prettytable import PrettyTable
+import tqdm
 
 if __name__ == "__main__":
     file_path = 'traces/sphinx3_test.csv'
@@ -97,7 +96,7 @@ if __name__ == "__main__":
     funcs = [
         partial(GuardFollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0, relax_times=5),
         partial(CombineRandomAlgorithm, candidate_algorithms=[MarkerAlgorithm, partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0)], beta=0.99, lazy_evictor_type=LRUEvictor),
-        partial(CombineDeterministicAlgorithm, candidate_algorithms=[MarkerAlgorithm, partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0)], switch_bound=1, lazy_evictor_type=LRUEvictor),
+        partial(CombineDeterministicAlgorithm, candidate_algorithms=[MarkerAlgorithm, partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0)], switch_bound=2, lazy_evictor_type=LRUEvictor),
         partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0),
         MarkerAlgorithm,
         LRUAlgorithm

@@ -1,12 +1,8 @@
-from cache.evict_algorithms import EvictAlgorithm, OracleAlgorithm
+from cache.evict import EvictAlgorithm
 from cache.hash import HashFunction
 from data_trace.data_trace import OracleDataTrace
 from utils.aligner import Aligner
-from typing import Type, Callable
-from functools import partial
-
-import numpy as np
-import tqdm
+from typing import Type
 
 class Cache:
     def __init__(self, trace_path, aligner_type: Type[Aligner], evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_line_size, cache_capacity, associativity=16):
