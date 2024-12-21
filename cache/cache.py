@@ -35,9 +35,16 @@ class Cache:
                 "and cache lines of size {}").format(cache_capacity, associativity, cache_line_size))
         
         self.hash_func = hash_type(num_sets)
-        self.evict_algs = [evict_type(associativity) for i in range(num_sets)]
 
-        if issubclass(evict_type.func if hasattr(evict_type, 'func') else evict_type, OracleAlgorithm):
+        self.evict_algs = []
+        oracle = False
+        for _ in range(num_sets):
+            evict_alg = evict_type(associativity)
+            if hasattr(evict_alg, 'oracle_access'):
+                oracle = True
+            self.evict_algs.append(evict_alg)
+
+        if oracle:
             with OracleDataTrace(trace_path, self._aligner) as sim_trace:
                 # with tqdm.tqdm(desc="Oracle cache on MemoryTrace") as pbar:
                 while not sim_trace.done():

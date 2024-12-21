@@ -1,7 +1,7 @@
 from data_trace.data_trace import DataTrace
 from utils.aligner import ShiftAligner
 from cache.cache import Cache
-from cache.evict_algorithms import BeladyAlgorithm, FollowBinaryPredictAlgorithm, GuardAlgorithm, GuardBeladyAlgorithm, GuardFollowBinaryPredictAlgorithm, LRUAlgorithm, MarkerAlgorithm, OracleAlgorithm, RandAlgorithm, ReuseDistancePredition, BinaryPredition
+from cache.evict_algorithms import *
 from cache.hash import ShiftHashFunction
 from functools import partial
 import tqdm
@@ -9,7 +9,7 @@ import numpy as np
 from prettytable import PrettyTable
 
 if __name__ == "__main__":
-    file_path = 'traces/bzip_test.csv' 
+    file_path = 'traces/sphinx3_test.csv'
 
     cache_line_size = 64
     capacity = 2097152
@@ -27,19 +27,19 @@ if __name__ == "__main__":
         GuardFollowBinaryPredictAlgorithm
     ]
 
+###########################################################
     reuse_dis_noises = [0, 100, 1000, 10000]
     bin_pred_noises = [0, 0.1, 0.2, 0.3, 0.5, 0.8, 1]
 
     guard_relax_times = [0, 1, 2, 3, 4, 5]
     guard_relax_probs = [0, 0.1, 0.2, 0.3, 0.5, 0.8]
 
-    # reuse_dis_noises = [0, 10]
-    # bin_pred_noises = [0, 0.1]
+    reuse_dis_noises = [0, 1000]
+    bin_pred_noises = [0, 0.1]
 
-    # guard_relax_times = [0, 1]
-    # guard_relax_probs = [0, 0.1]
+    guard_relax_times = [0, 1]
+    guard_relax_probs = [0, 0.1]
 ##############################################################
-    funcs = []
     def mask_guard_func(func):
         cur_funcs = []
         for guard_relax_time in guard_relax_times:
@@ -69,6 +69,7 @@ if __name__ == "__main__":
                 cur_funcs.append(func)
         return cur_funcs
 
+    funcs = []
     for evict_type in evict_types:
         is_oracle = issubclass(evict_type, OracleAlgorithm)
         is_reused_dis = issubclass(evict_type, ReuseDistancePredition)
@@ -89,6 +90,18 @@ if __name__ == "__main__":
                     funcs.extend(mask_oracle_bin(g_func))
             else:
                 funcs.append(g_func)
+
+
+###############################################################
+    bin = 1
+    funcs = [
+        partial(GuardFollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0, relax_times=5),
+        partial(CombineRandomAlgorithm, candidate_algorithms=[MarkerAlgorithm, partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0)], beta=0.99, lazy_evictor_type=LRUEvictor),
+        partial(CombineDeterministicAlgorithm, candidate_algorithms=[MarkerAlgorithm, partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0)], switch_bound=1, lazy_evictor_type=LRUEvictor),
+        partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0),
+        MarkerAlgorithm,
+        LRUAlgorithm
+    ]
 
     caches = []
     with tqdm.tqdm(desc="Init caches for benchmark", total=len(funcs)) as pbar:
