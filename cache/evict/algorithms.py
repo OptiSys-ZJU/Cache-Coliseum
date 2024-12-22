@@ -15,15 +15,16 @@ class EvictAlgorithm(ABC):
     """
     def __init__(self, associativity) -> None:
         self.cache = [None] * associativity
+        self.pcs = [None] * associativity
         self.associativity = associativity
     
     @abstractmethod
-    def access(self, key) -> bool:
+    def access(self, pc, address) -> bool:
         pass
 
 class OracleAlgorithm():
-    def oracle_access(self, key, next_access_time):
-        self.predictor.oracle_access(key, next_access_time)
+    def oracle_access(self, pc, address, next_access_time):
+        self.predictor.oracle_access(pc, address, next_access_time)
 
 class PredictAlgorithm(EvictAlgorithm):
     def __init__(self, associativity, evictor: Evictor, predictor: Predictor) -> None:
@@ -39,24 +40,25 @@ class PredictAlgorithm(EvictAlgorithm):
         self.evictor = evictor
         self.predictor = predictor
     
-    def trigger_pred(self, key):
-        pred = self.predictor.pred(key, self.timestamp)
+    def trigger_pred(self, pc, address):
+        pred = self.predictor.pred(pc, address, self.timestamp)
         self.timestamp += 1
         return pred
 
-    def access(self, key):
+    def access(self, pc, address):
         target_index = -1
         hit = False
-        if key in self.cache:
-            target_index = self.cache.index(key)
+        if address in self.cache:
+            target_index = self.cache.index(address)
             hit = True
         elif None in self.cache:
             target_index = self.cache.index(None)
         else:
             target_index = self.evictor.evict(list(enumerate(self.preds)))
         
-        self.cache[target_index] = key
-        self.preds[target_index] = self.trigger_pred(key)
+        self.cache[target_index] = address
+        self.pcs[target_index] = pc
+        self.preds[target_index] = self.trigger_pred(pc, address)
         return hit
 
 class GuardAlgorithm(PredictAlgorithm):
@@ -70,12 +72,12 @@ class GuardAlgorithm(PredictAlgorithm):
         self.relax_times = relax_times
         self.relax_prob = relax_prob
     
-    def access(self, key):
+    def access(self, pc, address):
         to_guard = 0
         target_index = -1
         hit = False
-        if key in self.cache:
-            target_index = self.cache.index(key)
+        if address in self.cache:
+            target_index = self.cache.index(address)
             hit = True
         elif None in self.cache:
             target_index = self.cache.index(None)
@@ -86,7 +88,7 @@ class GuardAlgorithm(PredictAlgorithm):
                 self.phase_evicted_set = set()
                 self.error_times = 0
             
-            if key in self.phase_evicted_set:
+            if address in self.phase_evicted_set:
                 if self.relax_times != 0:
                     self.error_times += 1
                     if self.error_times >= self.relax_times:
@@ -105,8 +107,9 @@ class GuardAlgorithm(PredictAlgorithm):
         if target_index in self.old_unvisited_set:
             self.old_unvisited_set.remove(target_index)
 
-        self.cache[target_index] = key
-        self.preds[target_index] = self.trigger_pred(key)
+        self.cache[target_index] = address
+        self.pcs[target_index] = pc
+        self.preds[target_index] = self.trigger_pred(pc, address)
         if to_guard == 1:
             self.unguarded_set.remove(target_index)
 
@@ -133,38 +136,38 @@ class CombineAlgorithm(EvictAlgorithm):
                 self.oracle_algs.append(alg_instance)
 
         if len(self.oracle_algs) != 0:
-            def oracle_access(self, key, next_access_time):
+            def oracle_access(self, pc, address, next_access_time):
                 for oracle_alg in self.oracle_algs:
-                    oracle_alg.oracle_access(key, next_access_time)
+                    oracle_alg.oracle_access(pc, address, next_access_time)
             self.oracle_access = types.MethodType(oracle_access, self)
         
         if len(self.candidate_algs) < 2:
             raise ValueError('CombineAlgorithm: Algorithm Count < 2')
 
-    def __push_candidates__(self, key):
+    def __push_candidates__(self, pc, address):
         for i, (alg, _) in enumerate(self.candidate_algs):
-            if not alg.access(key):
+            if not alg.access(pc, address):
                 self.candidate_algs[i][1] += 1
-                self.__trigger_miss__(i, key)
+                self.__trigger_miss__(i, address)
         
         if self.key_scores is not None:
-            self.key_scores[key] = self.timestamp
+            self.key_scores[address] = self.timestamp
         self.timestamp += 1
     
-    def __trigger_miss__(self, i, key):
+    def __trigger_miss__(self, i, address):
         pass
 
     @abstractmethod
     def __trigger_elect_center__(self):
         pass
 
-    def access(self, key):
-        self.__push_candidates__(key)
+    def access(self, pc, address):
+        self.__push_candidates__(pc, address)
 
         target_index = -1
         hit = False
-        if key in self.cache:
-            target_index = self.cache.index(key)
+        if address in self.cache:
+            target_index = self.cache.index(address)
             hit = True
         elif None in self.cache:
             target_index = self.cache.index(None)
@@ -173,12 +176,14 @@ class CombineAlgorithm(EvictAlgorithm):
             center_cache = self.candidate_algs[self.center][0].cache
             if self.lazy_evictor is None:
                 self.cache = copy.deepcopy(center_cache)
-                target_index = self.cache.index(key)
+                self.pcs = copy.deepcopy(self.candidate_algs[self.center][0].pcs)
+                target_index = self.cache.index(address)
             else:
                 diff_keys = set(center_cache) - set(self.cache)
                 target_index = self.lazy_evictor.evict([(center_cache.index(k), self.key_scores[k] if self.key_scores is not None else 0) for k in diff_keys])
         
-        self.cache[target_index] = key
+        self.cache[target_index] = address
+        self.pcs[target_index] = pc
         return hit
 
 class CombineDeterministicAlgorithm(CombineAlgorithm):
@@ -229,18 +234,19 @@ class RandAlgorithm(EvictAlgorithm):
         super().__init__(associativity)
         self.evictor = RandEvictor()
     
-    def access(self, key):
+    def access(self, pc, address):
         target_index = -1
         hit = False
-        if key in self.cache:
-            target_index = self.cache.index(key)
+        if address in self.cache:
+            target_index = self.cache.index(address)
             hit = True
         elif None in self.cache:
             target_index = self.cache.index(None)
         else:
             target_index = self.evictor.evict(list(enumerate(self.cache)))
         
-        self.cache[target_index] = key
+        self.cache[target_index] = address
+        self.pcs[target_index] = pc
         return hit
 
 class LRUAlgorithm(EvictAlgorithm):
@@ -250,18 +256,19 @@ class LRUAlgorithm(EvictAlgorithm):
         self.scores = [0] * associativity
         self.timestamp = 0
     
-    def access(self, key):
+    def access(self, pc, address):
         target_index = -1
         hit = False
-        if key in self.cache:
-            target_index = self.cache.index(key)
+        if address in self.cache:
+            target_index = self.cache.index(address)
             hit = True
         elif None in self.cache:
             target_index = self.cache.index(None)
         else:
             target_index = self.evictor.evict(list(enumerate(self.scores)))
         
-        self.cache[target_index] = key
+        self.cache[target_index] = address
+        self.pcs[target_index] = pc
         self.scores[target_index] = self.timestamp
         self.timestamp += 1
         return hit
@@ -272,21 +279,22 @@ class MarkerAlgorithm(EvictAlgorithm):
         self.evictor = MarkerEvictor()
         self.scores = [0] * associativity
     
-    def access(self, key):
+    def access(self, pc, address):
         if all(x == 1 for x in self.scores):
             self.scores = [0] * self.associativity
 
         target_index = -1
         hit = False
-        if key in self.cache:
-            target_index = self.cache.index(key)
+        if address in self.cache:
+            target_index = self.cache.index(address)
             hit = True
         elif None in self.cache:
             target_index = self.cache.index(None)
         else:
             target_index = self.evictor.evict(list(enumerate(self.scores)))
         
-        self.cache[target_index] = key
+        self.cache[target_index] = address
+        self.pcs[target_index] = pc
         self.scores[target_index] = 1
         return hit
 

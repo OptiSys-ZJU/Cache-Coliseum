@@ -10,6 +10,8 @@ class ReuseDistanceEvictor(Evictor):
     def evict(self, candidates):
         return max(candidates, key=lambda x: x[1])[0]
 
+MaxEvictor = ReuseDistanceEvictor
+
 class BinaryEvictor(Evictor):
     def evict(self, candidates):
         indices_with_1 = [i for i, pred in candidates if pred == 1]
@@ -22,6 +24,8 @@ class BinaryEvictor(Evictor):
 class LRUEvictor(Evictor):
     def evict(self, candidates):
         return min(candidates, key=lambda x: x[1])[0]
+
+MinEvictor = LRUEvictor
 
 class MarkerEvictor(Evictor):
     def evict(self, candidates):
