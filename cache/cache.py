@@ -31,23 +31,25 @@ class Cache:
                 "and cache lines of size {}").format(cache_capacity, associativity, cache_line_size))
         
         self.hash_func = hash_type(num_sets)
-
         self.evict_algs = []
+        ###################################################################
         oracle = False
         for _ in range(num_sets):
             evict_alg = evict_type(associativity)
             if hasattr(evict_alg, 'oracle_access'):
                 oracle = True
             self.evict_algs.append(evict_alg)
-
         if oracle:
-            with OracleDataTrace(trace_path, self._aligner) as sim_trace:
-                # with tqdm.tqdm(desc="Oracle cache on MemoryTrace") as pbar:
-                while not sim_trace.done():
-                    pc, address = sim_trace.next()
-                    aligned_address = self._aligner.get_aligned_addr(address)
-                    self.evict_algs[self.hash_func.get_bucket_index(aligned_address)].oracle_access(pc, aligned_address, sim_trace.next_access_time_by_aligned_address(aligned_address))
-                    # pbar.update(1)
+            self.__handle_oracle(trace_path)
+
+    def __handle_oracle(self, trace_path):
+        with OracleDataTrace(trace_path, self._aligner) as sim_trace:
+            # with tqdm.tqdm(desc="Oracle cache on MemoryTrace") as pbar:
+            while not sim_trace.done():
+                pc, address = sim_trace.next()
+                aligned_address = self._aligner.get_aligned_addr(address)
+                self.evict_algs[self.hash_func.get_bucket_index(aligned_address)].oracle_access(pc, aligned_address, sim_trace.next_access_time_by_aligned_address(aligned_address))
+                # pbar.update(1)
 
     def access(self, pc, address):
         aligned_address = self._aligner.get_aligned_addr(address)

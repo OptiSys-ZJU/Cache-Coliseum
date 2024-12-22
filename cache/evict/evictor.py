@@ -6,11 +6,11 @@ class Evictor(ABC):
     def evict(self, candidates):
         pass
 
-class ReuseDistanceEvictor(Evictor):
+class MaxEvictor(Evictor):
     def evict(self, candidates):
         return max(candidates, key=lambda x: x[1])[0]
 
-MaxEvictor = ReuseDistanceEvictor
+ReuseDistanceEvictor = MaxEvictor
 
 class BinaryEvictor(Evictor):
     def evict(self, candidates):
@@ -21,11 +21,11 @@ class BinaryEvictor(Evictor):
             chosen_index = random.choice(candidates)[0]
         return chosen_index
 
-class LRUEvictor(Evictor):
+class MinEvictor(Evictor):
     def evict(self, candidates):
         return min(candidates, key=lambda x: x[1])[0]
 
-MinEvictor = LRUEvictor
+LRUEvictor = MinEvictor
 
 class MarkerEvictor(Evictor):
     def evict(self, candidates):
