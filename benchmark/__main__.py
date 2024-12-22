@@ -1,4 +1,5 @@
 from data_trace.data_trace import DataTrace
+from model.models import ParrotModel
 from utils.aligner import ShiftAligner
 from cache.cache import Cache
 from cache.evict import *
@@ -6,6 +7,8 @@ from cache.hash import ShiftHashFunction
 from functools import partial
 from prettytable import PrettyTable
 import tqdm
+import os
+import json
 
 if __name__ == "__main__":
     file_path = 'traces/sphinx3_test.csv'
@@ -93,11 +96,17 @@ if __name__ == "__main__":
 
 ###############################################################
     bin = 1
+
+    with open(os.path.join("", "model_config.json"), "r") as f:
+        model_config = json.load(f)
+        shared_model = ParrotModel(model_config)
+
     funcs = [
-        partial(GuardFollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0, relax_times=5),
-        partial(CombineRandomAlgorithm, candidate_algorithms=[MarkerAlgorithm, partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0)], beta=0.99, lazy_evictor_type=LRUEvictor),
-        partial(CombineDeterministicAlgorithm, candidate_algorithms=[MarkerAlgorithm, partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0)], switch_bound=2, lazy_evictor_type=LRUEvictor),
-        partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0),
+        # partial(GuardFollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0, relax_times=5),
+        # partial(CombineRandomAlgorithm, candidate_algorithms=[partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0), MarkerAlgorithm], beta=0.99, lazy_evictor_type=LRUEvictor),
+        # partial(CombineDeterministicAlgorithm, candidate_algorithms=[partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0), MarkerAlgorithm], switch_bound=1, lazy_evictor_type=LRUEvictor),
+        # partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0),
+        partial(ParrotAlgorithm, shared_model=shared_model),
         MarkerAlgorithm,
         LRUAlgorithm
     ]

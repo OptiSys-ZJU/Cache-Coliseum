@@ -40,14 +40,22 @@ class PredictAlgorithm(EvictAlgorithm):
         self.evictor = evictor
         self.predictor = predictor
     
-    def trigger_pred(self, pc, address):
-        pred = self.predictor.pred(pc, address, self.timestamp)
+    def before_pred(self, pc, address):
+        preds = self.predictor.pred_before_evict(self.timestamp, pc, address, list(zip(self.cache, self.pcs)))
+        if preds is not None:
+            self.preds = preds
+    
+    def after_pred(self, pc ,address, target_index):
+        pred = self.predictor.pred_after_evict(self.timestamp, pc, address)
+        if pred is not None:
+            self.preds[target_index] = pred
         self.timestamp += 1
-        return pred
 
     def access(self, pc, address):
         target_index = -1
         hit = False
+
+        self.before_pred(pc, address)
         if address in self.cache:
             target_index = self.cache.index(address)
             hit = True
@@ -55,10 +63,8 @@ class PredictAlgorithm(EvictAlgorithm):
             target_index = self.cache.index(None)
         else:
             target_index = self.evictor.evict(list(enumerate(self.preds)))
-        
-        self.cache[target_index] = address
-        self.pcs[target_index] = pc
-        self.preds[target_index] = self.trigger_pred(pc, address)
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.after_pred(pc, address, target_index)
         return hit
 
 class GuardAlgorithm(PredictAlgorithm):
@@ -76,6 +82,8 @@ class GuardAlgorithm(PredictAlgorithm):
         to_guard = 0
         target_index = -1
         hit = False
+
+        self.before_pred(pc, address)
         if address in self.cache:
             target_index = self.cache.index(address)
             hit = True
@@ -107,12 +115,11 @@ class GuardAlgorithm(PredictAlgorithm):
         if target_index in self.old_unvisited_set:
             self.old_unvisited_set.remove(target_index)
 
-        self.cache[target_index] = address
-        self.pcs[target_index] = pc
-        self.preds[target_index] = self.trigger_pred(pc, address)
         if to_guard == 1:
             self.unguarded_set.remove(target_index)
-
+        
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.after_pred(pc, address, target_index)
         return hit
 
 class CombineAlgorithm(EvictAlgorithm):
@@ -315,3 +322,7 @@ class GuardBeladyAlgorithm(GuardAlgorithm, OracleAlgorithm, ReuseDistancePrediti
 class GuardFollowBinaryPredictAlgorithm(GuardAlgorithm, OracleAlgorithm, BinaryPredition):
     def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, relax_times=0, relax_prob=0):
         super().__init__(associativity, ReuseDistanceEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob), relax_times, relax_prob)
+
+class ParrotAlgorithm(PredictAlgorithm):
+    def __init__(self, associativity, shared_model):
+        super().__init__(associativity, MaxEvictor(), ParrotPredictor(shared_model))

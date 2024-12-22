@@ -1,20 +1,23 @@
 from abc import ABC, abstractmethod
+from typing import Union, List
+from types import SimpleNamespace
 import numpy as np
 import collections
 import random
+import torch
 
 class Predictor(ABC):
-    @abstractmethod
-    def pred(self, pc, address, ts):
-        pass
+    def pred_before_evict(self, ts, pc, address, cache_state) -> Union[List[Union[int, float]], None]:
+        return None
+
+    def pred_after_evict(self, ts, pc, address) -> Union[int, float, None]:
+        return None
 
 class ReuseDistancePredictor(Predictor):
-    def pred(self, pc, address, ts):
-        pass 
+    pass
 
 class BinaryPredictor(Predictor):
-    def pred(self, pc, address, ts):
-        pass
+    pass
 
 class ReuseDistancePredition:
     pass
@@ -41,7 +44,7 @@ class OracleReuseDistancePredictor(ReuseDistancePredictor, OraclePredictor):
         self.oracle_preds = collections.deque()
         self.oracle_check = oracle_check
     
-    def pred(self, pc, address, ts):
+    def pred_after_evict(self, ts, pc, address):
         oracle_key, next_access_time = self.oracle_preds.popleft()
         if self.oracle_check and oracle_key != address:
             raise ValueError("OracleReuseDistancePredictAlgorithm: oracle key not equals to key")
@@ -61,7 +64,7 @@ class OracleBinaryPredictor(BinaryPredictor, OraclePredictor):
         self.oracle_t = 0
         self.bin_noise_prob = bin_noise_prob
     
-    def pred(self, pc, address, ts):
+    def pred_after_evict(self, ts, pc, address):
         oracle_key, bin_pred = self.oracle_preds.popleft()
         if self.oracle_check and oracle_key != address:
             raise ValueError("OracleBinaryPredictAlgorithm: oracle key not equals to key")
@@ -89,6 +92,14 @@ class OracleBinaryPredictor(BinaryPredictor, OraclePredictor):
         self.oracle_last_time[address] = self.oracle_t
         self.oracle_t += 1
 
-class ParrotPredictor(ABC):
-    def pred(self, pc, address, ts):
-        pass
+class ParrotPredictor(Predictor):
+    def __init__(self, shared_model):
+        self._model = shared_model
+
+    def pred_before_evict(self, ts, pc, address, cache_state) -> Union[List[Union[int, float]], None]:
+        cache_access = SimpleNamespace()
+        cache_access.pc = pc
+        cache_access.address = address
+        cache_access.cache_lines = cache_state
+        scores = self._model(cache_access)
+        return [scores[0, i].item() for i in range(len(cache_state))]
