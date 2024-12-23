@@ -269,11 +269,11 @@ class EvictionPolicyModel(nn.Module):
         (scalar). The total loss is sum(loss.values()).
     """
     def log(score):
-      """Takes log(-score), handling infs."""
+      """Takes log(score), handling infs."""
       upperbound = 5.
-      if score == -np.inf:
+      if score == np.inf:
         return upperbound
-      return min(np.log10(-score), upperbound)
+      return min(np.log10(score, out=score, where=score > 0), upperbound)
 
     if warmup_period >= len(eviction_traces[0]):
       raise ValueError(
@@ -285,13 +285,13 @@ class EvictionPolicyModel(nn.Module):
     batch_size = len(eviction_traces)
     hidden_state = self._initial_hidden_state(batch_size)
     for i in range(warmup_period):
-      cache_accesses = [trace[i].cache_access for trace in eviction_traces]
+      cache_accesses = [trace[i] for trace in eviction_traces]
       _, _, hidden_state, _ = self(cache_accesses, hidden_state)
 
     # Generate predictions
     losses = collections.defaultdict(list)
     for i in range(warmup_period, len(eviction_traces[0])):
-      cache_accesses = [trace[i].cache_access for trace in eviction_traces]
+      cache_accesses = [trace[i] for trace in eviction_traces]
       scores, pred_reuse_distances, hidden_state, _ = self(
           cache_accesses, hidden_state)
 
@@ -299,11 +299,9 @@ class EvictionPolicyModel(nn.Module):
       # Shouldn't use a loss function with use_scores, otherwise.
       log_reuse_distances = []
       for trace in eviction_traces:
-        log_reuse_distances.append(
-            [log(trace[i].eviction_decision.cache_line_scores[line])
-             for line, _ in trace[i].cache_access.cache_lines])
+        log_reuse_distances.append([log(trace[i].cache_line_scores[j]) for j in range(len(trace[i].cache_line_scores))])
       log_reuse_distances, mask = utils.pad(log_reuse_distances)
-      log_reuse_distances = torch.tensor(log_reuse_distances)
+      log_reuse_distances = torch.tensor(log_reuse_distances, dtype=torch.float32)
 
       for name, loss_fn in self._loss_fns.items():
         loss = loss_fn(scores, pred_reuse_distances, log_reuse_distances, mask)
@@ -416,4 +414,4 @@ class ReuseDistanceLoss(LossFunction):
 
     return F.mse_loss(
         predicted_log_reuse_distances * mask.float(),
-        true_log_reuse_distances * mask.float(), reduce=False).mean(-1)
+        true_log_reuse_distances * mask.float(), reduction='none').mean(-1)

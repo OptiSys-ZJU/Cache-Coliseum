@@ -2,12 +2,7 @@ import torch
 from model.parrot.model import EvictionPolicyModel as BasedParrotModel
 
 class ParrotModel:
-    def __init__(self, model_config, model_checkpoint=None):
-        device = "cpu"
-        if torch.cuda.is_available():
-            torch.set_default_tensor_type(torch.cuda.FloatTensor)
-            device = "cuda:0"
-        
+    def __init__(self, model_config, device=torch.device("cpu"), model_checkpoint=None):        
         self._model = BasedParrotModel.from_config(model_config).to(torch.device(device))
         self._hidden_state = None
 

@@ -18,6 +18,9 @@ class EvictAlgorithm(ABC):
         self.pcs = [None] * associativity
         self.associativity = associativity
     
+    def snapshot(self):
+        return list(zip(self.cache, self.pcs))
+    
     @abstractmethod
     def access(self, pc, address) -> bool:
         pass
@@ -40,8 +43,11 @@ class PredictAlgorithm(EvictAlgorithm):
         self.evictor = evictor
         self.predictor = predictor
     
+    def snapshot(self):
+        return (list(zip(self.cache, self.pcs)), self.preds)
+    
     def before_pred(self, pc, address):
-        preds = self.predictor.pred_before_evict(self.timestamp, pc, address, list(zip(self.cache, self.pcs)))
+        preds = self.predictor.pred_before_evict(self.timestamp, pc, address, self.snapshot()[0])
         if preds is not None:
             self.preds = preds
     
@@ -68,18 +74,19 @@ class PredictAlgorithm(EvictAlgorithm):
         return hit
 
 class GuardAlgorithm(PredictAlgorithm):
-    def __init__(self, associativity, evictor: Evictor, predictor: Predictor, relax_times=0, relax_prob=0) -> None:
+    def __init__(self, associativity, evictor: Evictor, predictor: Predictor, follow_if_guarded=False, relax_times=0, relax_prob=0) -> None:
         super().__init__(associativity, evictor, predictor)
         self.old_unvisited_set = []
         self.unguarded_set = []
         self.phase_evicted_set = set()
 
+        self.follow_if_guarded = follow_if_guarded
         self.error_times = 0
         self.relax_times = relax_times
         self.relax_prob = relax_prob
     
     def access(self, pc, address):
-        to_guard = 0
+        to_guard = False
         target_index = -1
         hit = False
 
@@ -100,12 +107,12 @@ class GuardAlgorithm(PredictAlgorithm):
                 if self.relax_times != 0:
                     self.error_times += 1
                     if self.error_times >= self.relax_times:
-                        to_guard = 1
+                        to_guard = True
                 else:
                     if random.random() > self.relax_prob:
-                        to_guard = 1
+                        to_guard = True
 
-            if to_guard:
+            if to_guard and not self.follow_if_guarded:
                 target_index = random.choice(self.old_unvisited_set)
             else:
                 target_index = self.evictor.evict([(i, self.preds[i]) for i in self.unguarded_set])
@@ -115,7 +122,7 @@ class GuardAlgorithm(PredictAlgorithm):
         if target_index in self.old_unvisited_set:
             self.old_unvisited_set.remove(target_index)
 
-        if to_guard == 1:
+        if to_guard:
             self.unguarded_set.remove(target_index)
         
         self.cache[target_index], self.pcs[target_index] = address, pc
@@ -234,6 +241,24 @@ class CombineRandomAlgorithm(CombineAlgorithm):
         if valid_weights:
             self.center = random.choices(valid_index, weights=valid_weights)[0]
 
+class CombineWeightsAlgorithm(CombineAlgorithm):
+    def __init__(self, associativity, candidate_algorithms: List[Union[EvictAlgorithm, partial]], weights: Union[List[float], None], lazy_evictor_type: Union[LRUEvictor, RandEvictor, None] = LRUEvictor):
+        super().__init__(associativity, candidate_algorithms, lazy_evictor_type)
+        self.n = len(self.candidate_algs)
+        if weights is not None:
+            self.weights = weights
+        else:
+            self.weights = [1] * self.n
+    
+    def snapshot(self):
+        return (list(zip(self.cache, self.pcs)), self.candidate_algs[self.center][0].preds)
+
+    def reset(self, weights):
+        self.weights = weights
+
+    def __trigger_elect_center__(self):
+        self.center = random.choices(list(range(self.n)), weights=self.weights)[0]
+
 #######################################################################
 
 class RandAlgorithm(EvictAlgorithm):
@@ -316,12 +341,12 @@ class FollowBinaryPredictAlgorithm(PredictAlgorithm, OracleAlgorithm, BinaryPred
         super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
 
 class GuardBeladyAlgorithm(GuardAlgorithm, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, relax_times=0, relax_prob=0):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma), relax_times, relax_prob)
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, follow_if_guarded=False, relax_times=0, relax_prob=0):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma), follow_if_guarded, relax_times, relax_prob)
 
 class GuardFollowBinaryPredictAlgorithm(GuardAlgorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, relax_times=0, relax_prob=0):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob), relax_times, relax_prob)
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, follow_if_guarded=False, bin_noise_prob=0, relax_times=0, relax_prob=0):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob), follow_if_guarded, relax_times, relax_prob)
 
 class ParrotAlgorithm(PredictAlgorithm):
     def __init__(self, associativity, shared_model):
