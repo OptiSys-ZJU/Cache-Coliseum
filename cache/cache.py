@@ -3,6 +3,7 @@ from cache.hash import HashFunction
 from data_trace.data_trace import OracleDataTrace
 from utils.aligner import Aligner
 from typing import Type
+from types import SimpleNamespace
 
 class Cache:
     def __init__(self, trace_path, aligner_type: Type[Aligner], evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_line_size, cache_capacity, associativity=16):
@@ -63,3 +64,28 @@ class Cache:
     
     def stat(self):
         return (self.hits, self.miss, self.counts, round(self.hits / self.counts, 4))
+
+
+
+class TrainingCache(Cache):
+    def __init__(self, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity=16):
+        super().__init__(trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity)
+
+    def reset(self, model_prob):
+        for alg in self.evict_algs:
+            alg.reset([1-model_prob, model_prob])
+
+    def snapshot(self, pc, address):
+        snapshot = SimpleNamespace()
+        snapshot.pc = pc
+        snapshot.address = address
+
+        aligned_address = self._aligner.get_aligned_addr(address)
+        idx = self.hash_func.get_bucket_index(aligned_address)
+        alg = self.evict_algs[idx]
+
+        cache_lines, scores = alg.snapshot()
+        snapshot.cache_lines = cache_lines
+        snapshot.cache_line_scores = scores
+        hit = alg.access(pc, aligned_address)
+        return snapshot

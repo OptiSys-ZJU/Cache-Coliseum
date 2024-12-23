@@ -11,7 +11,7 @@ import os
 import json
 
 if __name__ == "__main__":
-    file_path = 'traces/sphinx3_test.csv'
+    file_path = 'traces/bzip_test.csv'
 
     cache_line_size = 64
     capacity = 2097152
@@ -37,7 +37,7 @@ if __name__ == "__main__":
     guard_relax_probs = [0, 0.1, 0.2, 0.3, 0.5, 0.8]
 
     reuse_dis_noises = [0, 1000]
-    bin_pred_noises = [0, 0.1]
+    bin_pred_noises = [0, 0.8, 1]
 
     guard_relax_times = [0, 1]
     guard_relax_probs = [0, 0.1]
@@ -95,18 +95,19 @@ if __name__ == "__main__":
 
 
 ###############################################################
-    bin = 1
+    bin = 0.3
 
-    with open(os.path.join("", "model_config.json"), "r") as f:
+    with open(os.path.join("", "tmp/model_config.json"), "r") as f:
         model_config = json.load(f)
         shared_model = ParrotModel(model_config)
 
     funcs = [
-        # partial(GuardFollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0, relax_times=5),
-        # partial(CombineRandomAlgorithm, candidate_algorithms=[partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0), MarkerAlgorithm], beta=0.99, lazy_evictor_type=LRUEvictor),
-        # partial(CombineDeterministicAlgorithm, candidate_algorithms=[partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0), MarkerAlgorithm], switch_bound=1, lazy_evictor_type=LRUEvictor),
-        # partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0),
-        partial(ParrotAlgorithm, shared_model=shared_model),
+        partial(GuardFollowBinaryPredictAlgorithm, bin_noise_prob=bin, follow_if_guarded=True, reuse_dis_noise_sigma=0, relax_times=0),
+        partial(GuardFollowBinaryPredictAlgorithm, bin_noise_prob=bin, follow_if_guarded=False, reuse_dis_noise_sigma=0, relax_times=0),
+        partial(CombineRandomAlgorithm, candidate_algorithms=[partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0), MarkerAlgorithm], beta=0.99, lazy_evictor_type=LRUEvictor),
+        partial(CombineDeterministicAlgorithm, candidate_algorithms=[partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0), MarkerAlgorithm], switch_bound=1, lazy_evictor_type=LRUEvictor),
+        partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0),
+        # partial(ParrotAlgorithm, shared_model=shared_model),
         MarkerAlgorithm,
         LRUAlgorithm
     ]
@@ -143,6 +144,12 @@ if __name__ == "__main__":
                 else:
                     exp_name = f"{exp_name}_no-noise"
             
+            if 'follow_if_guarded' in this_func.keywords:
+                if this_func.keywords.get('follow_if_guarded'):
+                    exp_name = f"{exp_name}_follow-pred"
+                else:
+                    exp_name = f"{exp_name}_select-unvisited"
+
             if 'relax_prob' in this_func.keywords:
                 assert this_func.keywords.get('relax_times') == 0
                 exp_name = f"{exp_name}_relax-prob-{str(this_func.keywords.get('relax_prob'))}"
