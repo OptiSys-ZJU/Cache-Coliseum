@@ -39,7 +39,7 @@ if __name__ == '__main__':
     dagger_update_freq = 10000
     
     exp_root_dir = 'tmp'
-    save_freq = 20000
+    save_freq = 5000
     tb_freq = 100
 
     res_dir = os.path.join(exp_root_dir, args.dataset)

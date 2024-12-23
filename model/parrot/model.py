@@ -273,7 +273,9 @@ class EvictionPolicyModel(nn.Module):
       upperbound = 5.
       if score == np.inf:
         return upperbound
-      return min(np.log10(score, out=score, where=score > 0), upperbound)
+      if score <= 1:
+        return 0
+      return min(np.log10(score), upperbound)
 
     if warmup_period >= len(eviction_traces[0]):
       raise ValueError(

@@ -9,6 +9,7 @@ from prettytable import PrettyTable
 import tqdm
 import os
 import json
+import copy
 
 if __name__ == "__main__":
     file_path = 'traces/bzip_test.csv'
@@ -19,99 +20,86 @@ if __name__ == "__main__":
     align_type = ShiftAligner
     hash_type = ShiftHashFunction
 
-    evict_types = [
+    online_types = [
         RandAlgorithm,
         LRUAlgorithm,
         MarkerAlgorithm,
-        BeladyAlgorithm,
-        FollowBinaryPredictAlgorithm,
-        GuardBeladyAlgorithm,
-        GuardFollowBinaryPredictAlgorithm
     ]
 
-###########################################################
-    reuse_dis_noises = [0, 100, 1000, 10000]
-    bin_pred_noises = [0, 0.1, 0.2, 0.3, 0.5, 0.8, 1]
+    ## mask noises
+    oracle_dis_noise_mask = [0, 100, 1000, 10000]
+    oracle_bin_noise_mask = [0, 0.1, 0.2, 0.5, 0.8, 1]
 
-    guard_relax_times = [0, 1, 2, 3, 4, 5]
-    guard_relax_probs = [0, 0.1, 0.2, 0.3, 0.5, 0.8]
+    #noise_type = 'dis'
+    noise_type = 'bin'
 
-    reuse_dis_noises = [0, 1000]
-    bin_pred_noises = [0, 0.8, 1]
+    oracle_types = [
+        partial(BeladyAlgorithm),
+        partial(FollowBinaryPredictAlgorithm),
+        partial(GuardBeladyAlgorithm, follow_if_guarded=False, relax_prob=0.2),
+        partial(GuardFollowBinaryPredictAlgorithm, follow_if_guarded=True, relax_times=5),
+    ]
 
-    guard_relax_times = [0, 1]
-    guard_relax_probs = [0, 0.1]
+    combiner_types = [
+        (CombineDeterministicAlgorithm, [BeladyAlgorithm, LRUAlgorithm]),
+        (CombineRandomAlgorithm, [FollowBinaryPredictAlgorithm, MarkerAlgorithm]),
+    ]
+
 ##############################################################
-    def mask_guard_func(func):
-        cur_funcs = []
-        for guard_relax_time in guard_relax_times:
-            func = partial(func, relax_times=guard_relax_time)
-            cur_funcs.append(func)
-        for guard_relax_prob in guard_relax_probs:
-            if guard_relax_prob != 0:
-                func = partial(func, relax_prob=guard_relax_prob, relax_times=0)
-                cur_funcs.append(func)
-        return cur_funcs
-    
-    def mask_oracle_dis(func):
-        cur_funcs = []
-        for reuse_dis_noise in reuse_dis_noises:
-            func = partial(func, reuse_dis_noise_sigma=reuse_dis_noise)
-            cur_funcs.append(func)
-        return cur_funcs
-    
-    def mask_oracle_bin(func):
-        cur_funcs = []
-        for reuse_dis_noise in reuse_dis_noises:
-            func = partial(func, reuse_dis_noise_sigma=reuse_dis_noise)
-            cur_funcs.append(func)
-        for bin_pred_noise in bin_pred_noises:
-            if bin_pred_noise != 0:
-                func = partial(func, bin_noise_prob=bin_pred_noise, reuse_dis_noise_sigma=0)
-                cur_funcs.append(func)
-        return cur_funcs
-
     funcs = []
-    for evict_type in evict_types:
-        is_oracle = issubclass(evict_type, OracleAlgorithm)
-        is_reused_dis = issubclass(evict_type, ReuseDistancePredition)
-        is_binary = issubclass(evict_type, BinaryPredition)
-        is_guard = issubclass(evict_type, GuardAlgorithm)
-        
-        func = evict_type
 
-        if is_guard:
-            guard_funcs = mask_guard_func(func)
+    funcs.extend(online_types)
+
+    for oracle_alg_type in oracle_types:
+        if noise_type == 'dis':
+            for noise in oracle_dis_noise_mask:
+                this_partial = copy.deepcopy(oracle_alg_type)
+                this_partial.keywords['reuse_dis_noise_sigma'] = noise
+                funcs.append(this_partial)
+        elif noise_type == 'bin':
+            if issubclass(oracle_alg_type.func, BinaryPredition):
+                for noise in oracle_bin_noise_mask:
+                    this_partial = copy.deepcopy(oracle_alg_type)
+                    oracle_alg_type.keywords['bin_noise_prob'] = noise
+                    funcs.append(this_partial)
         else:
-            guard_funcs = [func]
-        for g_func in guard_funcs:
-            if is_oracle:
-                if is_reused_dis:
-                    funcs.extend(mask_oracle_dis(g_func))
-                if is_binary:
-                    funcs.extend(mask_oracle_bin(g_func))
-            else:
-                funcs.append(g_func)
+            raise ValueError('Invalid noise type')
 
+    def mask_combiner(noise):
+        for combiner, algs in combiner_types:
+            candidate_algorithms = []
+            for alg in algs:
+                if issubclass(alg, OracleAlgorithm):
+                    if noise_type == 'dis':
+                        this_partial = partial(alg, reuse_dis_noise_sigma=noise)
+                        candidate_algorithms.append(this_partial)
+                    elif noise_type == 'bin':
+                        if issubclass(alg, BinaryPredition):
+                            this_partial = partial(alg, bin_noise_prob=noise)
+                            candidate_algorithms.append(this_partial)
+                    else:
+                        raise ValueError('Invalid noise type')
+                else:
+                    candidate_algorithms.append(alg)
+            
+            if len(candidate_algorithms) > 1:
+                funcs.append(partial(combiner, candidate_algorithms=candidate_algorithms))
+    
+    if noise_type == 'dis':
+        for noise in oracle_dis_noise_mask:
+            mask_combiner(noise)
+    elif noise_type == 'bin':
+        for noise in oracle_bin_noise_mask:
+            mask_combiner(noise)
+    else:
+        raise ValueError('Invalid noise type')
 
 ###############################################################
-    bin = 0.3
+    # with open(os.path.join("", "tmp/model_config.json"), "r") as f:
+    #     model_config = json.load(f)
+    #     shared_model = ParrotModel(model_config)
 
-    with open(os.path.join("", "tmp/model_config.json"), "r") as f:
-        model_config = json.load(f)
-        shared_model = ParrotModel(model_config)
-
-    funcs = [
-        partial(GuardFollowBinaryPredictAlgorithm, bin_noise_prob=bin, follow_if_guarded=True, reuse_dis_noise_sigma=0, relax_times=0),
-        partial(GuardFollowBinaryPredictAlgorithm, bin_noise_prob=bin, follow_if_guarded=False, reuse_dis_noise_sigma=0, relax_times=0),
-        partial(CombineRandomAlgorithm, candidate_algorithms=[partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0), MarkerAlgorithm], beta=0.99, lazy_evictor_type=LRUEvictor),
-        partial(CombineDeterministicAlgorithm, candidate_algorithms=[partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0), MarkerAlgorithm], switch_bound=1, lazy_evictor_type=LRUEvictor),
-        partial(FollowBinaryPredictAlgorithm, bin_noise_prob=bin, reuse_dis_noise_sigma=0),
-        # partial(ParrotAlgorithm, shared_model=shared_model),
-        MarkerAlgorithm,
-        LRUAlgorithm
-    ]
-
+    pretty_names = [pretty_print(func) for func in funcs]
     caches = []
     with tqdm.tqdm(desc="Init caches for benchmark", total=len(funcs)) as pbar:
         for evict_type in funcs:
@@ -129,44 +117,11 @@ if __name__ == "__main__":
                 pbar.update(1)     
 
     table = PrettyTable() 
+    #table.field_names = ["Name", "Hit", "Miss", "Total", "Hit Rate"] + [f'Dis-{noise}' for noise in oracle_dis_noise_mask]
     table.field_names = ["Name", "Hit", "Miss", "Total", "Hit Rate"]
-    for i, this_func in enumerate(funcs):
-        if hasattr(this_func, 'func'):
-            # partial
-            exp_name = this_func.func.__name__
-            if 'bin_noise_prob' in this_func.keywords:
-                assert this_func.keywords.get('reuse_dis_noise_sigma') == 0
-                exp_name = f"{exp_name}_bin-noise-{str(this_func.keywords.get('bin_noise_prob'))}"
-            elif 'reuse_dis_noise_sigma' in this_func.keywords:
-                noise = this_func.keywords.get('reuse_dis_noise_sigma')
-                if noise != 0:
-                    exp_name = f"{exp_name}_dis-noise-{str(noise)}"
-                else:
-                    exp_name = f"{exp_name}_no-noise"
-            
-            if 'follow_if_guarded' in this_func.keywords:
-                if this_func.keywords.get('follow_if_guarded'):
-                    exp_name = f"{exp_name}_follow-pred"
-                else:
-                    exp_name = f"{exp_name}_select-unvisited"
-
-            if 'relax_prob' in this_func.keywords:
-                assert this_func.keywords.get('relax_times') == 0
-                exp_name = f"{exp_name}_relax-prob-{str(this_func.keywords.get('relax_prob'))}"
-            elif 'relax_times' in this_func.keywords:
-                relax_times = this_func.keywords.get('relax_times')
-                if relax_times != 0:
-                    exp_name = f"{exp_name}_relax-time-{str(this_func.keywords.get('relax_times'))}"
-                else:
-                    exp_name = f"{exp_name}_no-relaxed"
-        else:
-            # class
-            exp_name = this_func.__name__
-
-        exp_name = exp_name.replace("Algorithm", '').replace("FollowBinaryPredict", 'FBP')
-
+    for i, pretty_name in enumerate(pretty_names):
         hit, miss, total, rate = caches[i].stat()
-        table.add_row([exp_name, hit, miss, total, rate])
+        table.add_row([pretty_name, hit, miss, total, rate])
 
     print(table)
             

@@ -351,3 +351,65 @@ class GuardFollowBinaryPredictAlgorithm(GuardAlgorithm, OracleAlgorithm, BinaryP
 class ParrotAlgorithm(PredictAlgorithm):
     def __init__(self, associativity, shared_model):
         super().__init__(associativity, MaxEvictor(), ParrotPredictor(shared_model))
+
+def format_guard(relax_times, relax_prob):
+    if relax_times == 0 and relax_prob == 0:
+        return "-no-relax"
+    elif relax_times == 0 and relax_prob != 0:
+        return f"-relax-prob-{relax_prob}"
+    elif relax_times != 0 and relax_prob == 0:
+        return f"-relax-times-{relax_times}"
+    else:
+        raise ValueError('relax_times and relax_prob invaild')
+
+def format_oracle(reuse_dis_noise_sigma, bin_noise_prob):
+    if reuse_dis_noise_sigma == 0 and bin_noise_prob == 0:
+        return "-oracle"
+    elif reuse_dis_noise_sigma == 0 and bin_noise_prob != 0:
+        return f"-bin-{bin_noise_prob}"
+    elif reuse_dis_noise_sigma != 0 and bin_noise_prob == 0:
+        return f"-dis-{reuse_dis_noise_sigma}"
+    else:
+        return f"-dis-{reuse_dis_noise_sigma}-bin-{bin_noise_prob}"
+
+def pretty_print(callable: Union[EvictAlgorithm, partial]) -> str:
+    this_cls = callable
+    if hasattr(callable, 'func'):
+        this_cls = callable.func
+    this_cls_name = this_cls.__name__.replace("Algorithm", '').replace("FollowBinaryPredict", 'FBP')
+    metadata = this_cls_name
+    if hasattr(callable, 'keywords'):
+        kw = callable.keywords
+        if issubclass(this_cls, CombineAlgorithm):
+            algs = kw['candidate_algorithms']
+            alg_names = []
+            for alg in algs:
+                alg_names.append(pretty_print(alg))
+            metadata += ("[" + (", ".join(alg_names)) + "]")
+        if issubclass(this_cls, GuardAlgorithm):
+            follow_if_guarded = False
+            relax_times = relax_prob = 0
+            if 'follow_if_guarded' in kw:
+                follow_if_guarded = kw['follow_if_guarded']
+            if follow_if_guarded:
+                metadata += '-unv'
+            else:
+                metadata += '-f-pred'
+            if 'relax_times' in kw:
+                relax_times = kw['relax_times']
+            if 'relax_prob' in kw:
+                relax_prob = kw['relax_prob']
+            metadata += format_guard(relax_times, relax_prob)
+
+        if issubclass(this_cls, OracleAlgorithm):
+            reuse_dis_noise_sigma = bin_noise_prob = 0
+            if 'reuse_dis_noise_sigma' in kw:
+                reuse_dis_noise_sigma = kw['reuse_dis_noise_sigma']
+            if 'bin_noise_prob' in kw:
+                bin_noise_prob = kw['bin_noise_prob']
+            metadata += format_oracle(reuse_dis_noise_sigma, bin_noise_prob) 
+    
+    return metadata
+        
+
+
