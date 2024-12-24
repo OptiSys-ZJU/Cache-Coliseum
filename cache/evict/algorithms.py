@@ -348,6 +348,10 @@ class GuardFollowBinaryPredictAlgorithm(GuardAlgorithm, OracleAlgorithm, BinaryP
     def __init__(self, associativity, reuse_dis_noise_sigma=0, follow_if_guarded=False, bin_noise_prob=0, relax_times=0, relax_prob=0):
         super().__init__(associativity, ReuseDistanceEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob), follow_if_guarded, relax_times, relax_prob)
 
+class GuardParrotAlgorithm(GuardAlgorithm):
+    def __init__(self, associativity, shared_model, follow_if_guarded=False, relax_times=0, relax_prob=0):
+        super().__init__(associativity, MaxEvictor(), ParrotPredictor(shared_model), follow_if_guarded, relax_times, relax_prob)
+
 class ParrotAlgorithm(PredictAlgorithm):
     def __init__(self, associativity, shared_model):
         super().__init__(associativity, MaxEvictor(), ParrotPredictor(shared_model))

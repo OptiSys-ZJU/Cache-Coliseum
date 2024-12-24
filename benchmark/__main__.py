@@ -1,5 +1,6 @@
 from data_trace.data_trace import DataTrace
 from model.models import ParrotModel
+from model import device_manager
 from utils.aligner import ShiftAligner
 from cache.cache import Cache
 from cache.evict import *
@@ -7,13 +8,17 @@ from cache.hash import ShiftHashFunction
 from functools import partial
 from prettytable import PrettyTable
 import tqdm
-import os
-import json
 import copy
 
 if __name__ == "__main__":
-    file_path = 'traces/bzip_test.csv'
-    verbose = False
+    file_path = 'traces/xalanc_test.csv'
+    print(file_path)
+    verbose = True
+    sorted = False
+
+    device = 'cuda:1'
+
+    device_manager.set_device(device)
 
     cache_line_size = 64
     capacity = 2097152
@@ -21,30 +26,36 @@ if __name__ == "__main__":
     align_type = ShiftAligner
     hash_type = ShiftHashFunction
 
+    parrot_gen = lambda : ParrotModel.from_config("tmp/model_config.json", '215000.ckpt')
+
     online_types = [
         RandAlgorithm,
         LRUAlgorithm,
         MarkerAlgorithm,
-    ]
-
-    ## mask noises
-    oracle_dis_noise_mask = [0, 100, 1000, 10000]
-    oracle_bin_noise_mask = [0, 0.1, 0.2, 0.5, 0.8, 1]
-
-    noise_type = 'dis'
-    #noise_type = 'bin'
-
-    oracle_types = [
-        partial(BeladyAlgorithm),
-        partial(FollowBinaryPredictAlgorithm),
-        partial(GuardBeladyAlgorithm, follow_if_guarded=False, relax_prob=0.2),
-        partial(GuardFollowBinaryPredictAlgorithm, follow_if_guarded=True, relax_times=5),
+        partial(ParrotAlgorithm, shared_model=parrot_gen()),
+        partial(GuardParrotAlgorithm, shared_model=parrot_gen(), follow_if_guarded=False, relax_times=0, relax_prob=0)
     ]
 
     combiner_types = [
-        (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [BeladyAlgorithm, LRUAlgorithm]),
-        (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [FollowBinaryPredictAlgorithm, MarkerAlgorithm]),
+        #(partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [BeladyAlgorithm, LRUAlgorithm]),
+        #(partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [FollowBinaryPredictAlgorithm, MarkerAlgorithm]),
+        (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [partial(ParrotAlgorithm, shared_model=parrot_gen()), MarkerAlgorithm])
     ]
+
+    noise_type = None
+    #noise_type = 'dis'
+    #noise_type = 'bin'
+
+    if noise_type is not None:
+        ## mask noises
+        oracle_dis_noise_mask = [0, 100, 1000, 10000]
+        oracle_bin_noise_mask = [0, 0.1, 0.2, 0.5, 0.8, 1]
+        oracle_types = [
+            # partial(BeladyAlgorithm),
+            # partial(FollowBinaryPredictAlgorithm),
+            # partial(GuardBeladyAlgorithm, follow_if_guarded=False, relax_prob=0.2),
+            # partial(GuardFollowBinaryPredictAlgorithm, follow_if_guarded=True, relax_times=5),
+        ]
 
 ##############################################################
     func_dict = {}
@@ -57,26 +68,27 @@ if __name__ == "__main__":
     for online_type in online_types:
         register_func(online_type, 0)
 
-    for oracle_alg_type in oracle_types:
-        if noise_type == 'dis':
-            for noise in oracle_dis_noise_mask:
-                this_partial = copy.deepcopy(oracle_alg_type)
-                this_partial.keywords['reuse_dis_noise_sigma'] = noise
-                register_func(this_partial, noise)
-        elif noise_type == 'bin':
-            if issubclass(oracle_alg_type.func, BinaryPredition):
-                for noise in oracle_bin_noise_mask:
+    if noise_type is not None:
+        for oracle_alg_type in oracle_types:
+            if noise_type == 'dis':
+                for noise in oracle_dis_noise_mask:
                     this_partial = copy.deepcopy(oracle_alg_type)
-                    this_partial.keywords['bin_noise_prob'] = noise
+                    this_partial.keywords['reuse_dis_noise_sigma'] = noise
                     register_func(this_partial, noise)
-        else:
-            raise ValueError('Invalid noise type')
+            elif noise_type == 'bin':
+                if issubclass(oracle_alg_type.func, BinaryPredition):
+                    for noise in oracle_bin_noise_mask:
+                        this_partial = copy.deepcopy(oracle_alg_type)
+                        this_partial.keywords['bin_noise_prob'] = noise
+                        register_func(this_partial, noise)
+            else:
+                raise ValueError('Invalid noise type')
 
     def mask_combiner(noise):
         for combiner, algs in combiner_types:
             candidate_algorithms = []
             for alg in algs:
-                if issubclass(alg, OracleAlgorithm):
+                if isinstance(alg, type) and issubclass(alg, OracleAlgorithm):
                     if noise_type == 'dis':
                         this_partial = partial(alg, reuse_dis_noise_sigma=noise)
                         candidate_algorithms.append(this_partial)
@@ -94,19 +106,19 @@ if __name__ == "__main__":
                 this_partial.keywords['candidate_algorithms'] = candidate_algorithms
                 register_func(this_partial, noise)
     
-    if noise_type == 'dis':
-        for noise in oracle_dis_noise_mask:
-            mask_combiner(noise)
-    elif noise_type == 'bin':
-        for noise in oracle_bin_noise_mask:
-            mask_combiner(noise)
+    if noise_type is not None:
+        if noise_type == 'dis':
+            for noise in oracle_dis_noise_mask:
+                mask_combiner(noise)
+        elif noise_type == 'bin':
+            for noise in oracle_bin_noise_mask:
+                mask_combiner(noise)
+        else:
+            raise ValueError('Invalid noise type')
     else:
-        raise ValueError('Invalid noise type')
+        mask_combiner(0)
 
 ###############################################################
-    # with open(os.path.join("", "tmp/model_config.json"), "r") as f:
-    #     model_config = json.load(f)
-    #     shared_model = ParrotModel(model_config)
     cache_dict = {}
     caches = []
     funcs = [(outer_key, inner_key, value) for outer_key, inner_dict in func_dict.items() for inner_key, value in inner_dict.items()]
@@ -138,6 +150,9 @@ if __name__ == "__main__":
         for i, (pretty_name, _, _) in enumerate(funcs):
             hit, miss, total, rate = caches[i].stat()
             table.add_row([pretty_name, hit, miss, total, rate])
+        if sorted:
+            table.sortby = "Hit Rate"
+            table.reversesort = True
     else:
         if noise_type == 'dis':
             table.field_names = ["Name"] + [f'Dis-{noise}' for noise in oracle_dis_noise_mask]
