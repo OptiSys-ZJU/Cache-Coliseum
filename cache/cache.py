@@ -88,4 +88,4 @@ class TrainingCache(Cache):
         snapshot.cache_lines = cache_lines
         snapshot.cache_line_scores = scores
         hit = alg.access(pc, aligned_address)
-        return snapshot
+        return snapshot, hit
