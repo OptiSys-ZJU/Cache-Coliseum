@@ -1,24 +1,23 @@
 from data_trace.data_trace import DataTrace
-from model.parrot import utils, model
+from model.parrot import utils
 from model.models import ParrotModel
+from model import device_manager
 from utils.aligner import ShiftAligner
 from cache.hash import ShiftHashFunction
 from cache.cache import TrainingCache
 from cache.evict import *
 import os
 import torch
-from torch.nn.parallel import DataParallel
-import tensorflow._api.v2.compat.v1 as tf
 import io
-import logging
-import json
 import tqdm
 import argparse
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str)
+    parser.add_argument("--device", type=str, default='cpu')
     args = parser.parse_args()
+    device_manager.set_device(args.device)
 
     file_path = f'traces/{args.dataset}_train.csv'
 
@@ -29,6 +28,8 @@ if __name__ == '__main__':
     hash_type = ShiftHashFunction
 #################################################################################################
     total_steps = 1e6
+
+    lr = 0.001
 
     batch_size = 32
     collection_multiplier = 5
@@ -54,15 +55,9 @@ if __name__ == '__main__':
     # dagger_update_freq = 5
     # save_freq = 200
 #################################################################################################
-    device = torch.device("cpu")
-    if torch.cuda.is_available():
-        torch.set_default_tensor_type(torch.cuda.FloatTensor)
-        device = torch.device("cuda:0")
-    print("Device:", device, flush=True)
-    with open(os.path.join(exp_root_dir, "model_config.json"), "r") as f:
-        model_config = json.load(f)
-    parrot_model = ParrotModel(model_config, device)
-    optimizer = torch.optim.Adam(parrot_model._model.parameters(), lr=model_config.get("lr"))
+    model_config_path = os.path.join(exp_root_dir, "model_config.json")
+    parrot_model = ParrotModel.from_config(model_config_path, None)
+    optimizer = torch.optim.Adam(parrot_model._model.parameters(), lr=lr)
 #################################################################################################
     def get_model_prob(get_step_lambda):
         fraction = min(float(get_step_lambda()) / dagger_steps, 1.0)

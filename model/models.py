@@ -1,14 +1,23 @@
 import torch
+import json
 from model.parrot.model import EvictionPolicyModel as BasedParrotModel
+from model.device import device_manager
 
 class ParrotModel:
-    def __init__(self, model_config, device=torch.device("cpu"), model_checkpoint=None):        
-        self._model = BasedParrotModel.from_config(model_config).to(torch.device(device))
+    @classmethod
+    def from_config(cls, model_config_path, model_checkpoint=None):
+         with open(model_config_path, "r") as f:
+            model_config = json.load(f)
+            return cls(model_config, model_checkpoint)
+
+    def __init__(self, model_config, model_checkpoint=None):        
+        self._model = BasedParrotModel.from_config(model_config).to(device_manager.get_default_device())
         self._hidden_state = None
 
         if model_checkpoint is not None:
             with open(model_checkpoint, "rb") as f:
-                self._model.load_state_dict(torch.load(f, map_location=device))
+                print(f"ParrotModel: Load {model_checkpoint}, Device: {device_manager.get_default_device()}")
+                self._model.load_state_dict(torch.load(f, map_location=device_manager.get_default_device()))
     
     def __call__(self, cache_access):
         return self.forward(cache_access)
