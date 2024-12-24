@@ -372,7 +372,7 @@ def format_oracle(reuse_dis_noise_sigma, bin_noise_prob):
     else:
         return f"-dis-{reuse_dis_noise_sigma}-bin-{bin_noise_prob}"
 
-def pretty_print(callable: Union[EvictAlgorithm, partial]) -> str:
+def pretty_print(callable: Union[EvictAlgorithm, partial], verbose=False) -> str:
     this_cls = callable
     if hasattr(callable, 'func'):
         this_cls = callable.func
@@ -384,7 +384,7 @@ def pretty_print(callable: Union[EvictAlgorithm, partial]) -> str:
             algs = kw['candidate_algorithms']
             alg_names = []
             for alg in algs:
-                alg_names.append(pretty_print(alg))
+                alg_names.append(pretty_print(alg, verbose))
             metadata += ("[" + (", ".join(alg_names)) + "]")
         if issubclass(this_cls, GuardAlgorithm):
             follow_if_guarded = False
@@ -401,7 +401,7 @@ def pretty_print(callable: Union[EvictAlgorithm, partial]) -> str:
                 relax_prob = kw['relax_prob']
             metadata += format_guard(relax_times, relax_prob)
 
-        if issubclass(this_cls, OracleAlgorithm):
+        if issubclass(this_cls, OracleAlgorithm) and verbose:
             reuse_dis_noise_sigma = bin_noise_prob = 0
             if 'reuse_dis_noise_sigma' in kw:
                 reuse_dis_noise_sigma = kw['reuse_dis_noise_sigma']
