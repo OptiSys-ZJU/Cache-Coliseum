@@ -579,9 +579,17 @@ class LMarkerBeladyAlgorithm(LMarkerAlgorithm, OracleAlgorithm, ReuseDistancePre
     def __init__(self, associativity, reuse_dis_noise_sigma=0):
         super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma))
 
+class LMarkerFollowBinaryPredictAlgorithm(LMarkerAlgorithm, OracleAlgorithm, BinaryPredition):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
+        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+
 class LNonMarkerBeladyAlgorithm(LNonMarkerAlgorithm, OracleAlgorithm, ReuseDistancePredition):
     def __init__(self, associativity, reuse_dis_noise_sigma=0):
         super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma))
+
+class LNonMarkerFollowBinaryPredictAlgorithm(LNonMarkerAlgorithm, OracleAlgorithm, BinaryPredition):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
+        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
 
 class Mark0FollowBinaryPredictAlgorithm(Mark0Algorithm, OracleAlgorithm, BinaryPredition):
     def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
