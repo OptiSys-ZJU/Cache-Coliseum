@@ -38,6 +38,8 @@ class PredictAlgorithm(EvictAlgorithm):
             self.preds = [np.inf] * associativity
         elif isinstance(predictor, BinaryPredictor):
             self.preds = [0] * associativity
+        elif isinstance(predictor, PhasePredictor):
+            self.preds = [1] * associativity
         else:
             self.preds = None
         self.evictor = evictor
@@ -73,7 +75,229 @@ class PredictAlgorithm(EvictAlgorithm):
         self.after_pred(pc, address, target_index)
         return hit
 
+class PredictiveMarker(PredictAlgorithm):
+    """
+    PredictiveMarker algorithm
+
+    Designed by Thodoris Lykouris and Sergei Vassilvitskii. 2018. Competitive Caching with Machine Learned Advice.
+    https://dl.acm.org/doi/10.1145/3447579
+    """
+    def __init__(self, associativity, evictor: Evictor, predictor: Predictor) -> None:
+        def harmonic_number(k):
+            return sum(1 / i for i in range(1, k + 1))
+        super().__init__(associativity, evictor, predictor)
+        self.marked = [0] * associativity
+        self.tracking_set = []
+        self.h_k = harmonic_number(associativity)
+        self.chains_len = []
+        self.chains_rep = []
+    
+    def access(self, pc, address):
+        hit = False
+        self.before_pred(pc, address)
+        target_index = -1
+
+        if address in self.cache:
+            target_index = self.cache.index(address)
+            hit = True
+        elif None in self.cache:
+            target_index = self.cache.index(None)
+        else:
+            if all(mark == 1 for mark in self.marked):
+                # new phase
+                self.tracking_set = copy.deepcopy(self.cache)
+                self.marked = [0] * self.associativity
+            if address not in self.tracking_set:
+                target_index = self.evictor.evict([(i, self.preds[i]) for i, mark in enumerate(self.marked) if mark == 0])
+                self.chains_len.append(1)
+                self.chains_rep.append(self.cache[target_index])
+            if address in self.tracking_set:
+                index = self.chains_rep.index(address)
+                if self.chains_len[index] <= self.h_k:
+                    target_index = self.evictor.evict([(i, self.preds[i]) for i, mark in enumerate(self.marked) if mark == 0])
+                else:
+                    target_index = random.choice([i for i, mark in enumerate(self.marked) if mark == 0])
+                self.chains_rep[index] = self.cache[target_index]
+
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.marked[target_index] = 1
+        self.after_pred(pc, address, target_index)
+        return hit
+
+class LMarkerAlgorithm(PredictAlgorithm):
+    """
+    LMARKER Algorithm
+
+    Designed by Dhruv Rohatgi. 2020. Near-Optimal Bounds for Online Caching with Machine Learned Advice
+    https://epubs.siam.org/doi/10.1137/1.9781611975994.112
+    """
+    def __init__(self, associativity, evictor: Evictor, predictor: Predictor) -> None:
+        super().__init__(associativity, evictor, predictor)
+
+        self.stale = []
+        self.marked = [0] * associativity
+    
+    def access(self, pc, address):
+        target_index = -1
+        hit = False
+
+        self.before_pred(pc, address)
+        if address in self.cache:
+            target_index = self.cache.index(address)
+            hit = True
+        elif None in self.cache:
+            target_index = self.cache.index(None)
+        else:
+            if all(mark == 1 for mark in self.marked):
+                self.stale = copy.deepcopy(self.cache)
+                self.marked = [0] * self.associativity
+            
+            if address in self.stale:
+                target_index = random.choice([i for i, mark in enumerate(self.marked) if mark == 0])
+            else:
+                target_index = self.evictor.evict([(i, self.preds[i]) for i, mark in enumerate(self.marked) if mark == 0])
+        
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.marked[target_index] = 1
+        self.after_pred(pc, address, target_index)
+        return hit
+
+class LNonMarkerAlgorithm(PredictAlgorithm):
+    """
+    LNONMARKER Algorithm
+
+    Designed by Dhruv Rohatgi. 2020. Near-Optimal Bounds for Online Caching with Machine Learned Advice
+    https://epubs.siam.org/doi/10.1137/1.9781611975994.112
+    """
+    def __init__(self, associativity, evictor: Evictor, predictor: Predictor) -> None:
+        super().__init__(associativity, evictor, predictor)
+
+        self.phase = set()
+        self.stale = []
+        self.marked = [0] * associativity
+        self.evicts = {}
+    
+    def access(self, pc, address):
+        target_index = -1
+        hit = False
+        self.before_pred(pc, address)
+
+        if len(self.phase) == self.associativity:
+            self.stale = copy.deepcopy(self.cache)
+            self.marked = [0] * self.associativity
+            self.evicts = {}
+            self.phase = set()
+
+        if address in self.cache:
+            target_index = self.cache.index(address)
+            hit = True
+        elif None in self.cache:
+            target_index = self.cache.index(None)
+        else:
+            if address in self.stale:
+                if self.evicts[address] not in self.stale:
+                    target_index = random.choice(range(self.associativity))
+                else:
+                    target_index = random.choice([i for i, mark in enumerate(self.marked) if mark == 0])
+            else:
+                target_index = self.evictor.evict([(i, self.preds[i]) for i, mark in enumerate(self.marked) if mark == 0])
+        
+        self.evicts[self.cache[target_index]] = address
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.marked[target_index] = 1
+        self.phase.add(address)
+        self.after_pred(pc, address, target_index)
+        return hit
+
+class Mark0Algorithm(PredictAlgorithm):
+    """
+    MARK0 Eviction Strategy
+
+    Designed by Antonios Antoniadis, Joan Boyar, Marek Eliáš, Lene M. Favrholdt, Ruben Hoeksma, Kim S. Larsen, Adam Polak, and Bertrand Simon. 2023. Paging with Succinct Prediction.
+    https://dl.acm.org/doi/10.5555/3618408.3618447
+    """
+    def __init__(self, associativity, evictor, predictor):
+        if not isinstance(predictor, BinaryPredictor):
+            raise ValueError('Mark0Algorithm: predictor must be a BinaryPredictor')
+        super().__init__(associativity, evictor, predictor)
+        self.marked = [0] * associativity
+        self.S_address = [None] * associativity
+        self.S_visited = [0] * associativity
+    
+    def access(self, pc, address):
+        target_index = -1
+        hit = False
+
+        self.before_pred(pc, address)
+        if address in self.cache:
+            target_index = self.cache.index(address)
+            hit = True
+        elif None in self.cache:
+            if address in self.S_address and 0 in self.S_visited:
+                target_index = random.choice([i for i, visited in enumerate(self.S_visited) if visited == 0])
+            else:
+                target_index = self.cache.index(None)
+        else:
+            if all(visited == 1 for visited in self.S_visited):
+                self.marked = [0] * self.associativity
+                self.S_address = copy.deepcopy(self.cache)
+                self.S_visited = [0] * self.associativity
+
+            if address in self.S_address and 0 in self.S_visited:
+                target_index = random.choice([i for i, visited in enumerate(self.S_visited) if visited == 0])
+            else:
+                target_index = random.choice([i for i, mark in enumerate(self.marked) if mark == 0])
+        
+        self.S_address[target_index] = None
+        self.S_visited[target_index] = 1
+        self.marked[target_index] = 1
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.after_pred(pc, address, target_index)
+        if self.preds[target_index] == 1:
+            self.cache[target_index], self.pcs[target_index] = None, None
+        return hit
+
+class MarkAndPredictAlgorithm(PredictAlgorithm):
+    """
+    MARK&PREDICT Eviction Strategy
+
+    Designed by Antonios Antoniadis, Joan Boyar, Marek Eliáš, Lene M. Favrholdt, Ruben Hoeksma, Kim S. Larsen, Adam Polak, and Bertrand Simon. 2023. Paging with Succinct Prediction.
+    https://dl.acm.org/doi/10.5555/3618408.3618447
+    """
+    def __init__(self, associativity, evictor, predictor):
+        if not isinstance(predictor, PhasePredictor):
+            raise ValueError('MarkAndPredictAlgorithm: predictor must be a PhasePredictor')
+        if not isinstance(evictor, BinaryEvictor):
+            raise ValueError('MarkAndPredictAlgorithm: evictor must be a BinaryEvictor')
+        super().__init__(associativity, evictor, predictor)
+        self.marked = [0] * associativity
+    
+    def access(self, pc, address):
+        target_index = -1
+        hit = False
+
+        self.before_pred(pc, address)
+        if address in self.cache:
+            target_index = self.cache.index(address)
+            hit = True
+        elif None in self.cache:
+            target_index = self.cache.index(None)
+        else:
+            if all(mark == 1 for mark in self.marked):
+                self.marked = [0] * self.associativity
+            target_index = self.evictor.evict([(i, self.preds[i]) for i, mark in enumerate(self.marked) if mark == 0])
+        
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.marked[target_index] = 1
+        self.after_pred(pc, address, target_index)
+        return hit
+
 class GuardAlgorithm(PredictAlgorithm):
+    """
+    Guard algorithm
+
+    Our work
+    """
     def __init__(self, associativity, evictor: Evictor, predictor: Predictor, follow_if_guarded=False, relax_times=0, relax_prob=0) -> None:
         super().__init__(associativity, evictor, predictor)
         self.old_unvisited_set = []
@@ -204,7 +428,7 @@ class CombineDeterministicAlgorithm(CombineAlgorithm):
     """
     black-box algorithm
 
-    Designed by Thodoris Lykouris and Sergei Vassilvitskii. 2021. Competitive Caching with Machine Learned Advice.
+    Designed by Thodoris Lykouris and Sergei Vassilvitskii. 2018. Competitive Caching with Machine Learned Advice.
     https://dl.acm.org/doi/10.1145/3447579
     """
     def __init__(self, associativity, candidate_algorithms: List[Union[EvictAlgorithm, partial]], switch_bound=2, lazy_evictor_type: Union[LRUEvictor, RandEvictor, None] = LRUEvictor):
@@ -242,6 +466,9 @@ class CombineRandomAlgorithm(CombineAlgorithm):
             self.center = random.choices(valid_index, weights=valid_weights)[0]
 
 class CombineWeightsAlgorithm(CombineAlgorithm):
+    """
+    Imitation learing for Parrot
+    """
     def __init__(self, associativity, candidate_algorithms: List[Union[EvictAlgorithm, partial]], weights: Union[List[float], None], lazy_evictor_type: Union[LRUEvictor, RandEvictor, None] = LRUEvictor):
         super().__init__(associativity, candidate_algorithms, lazy_evictor_type)
         self.n = len(self.candidate_algs)
@@ -340,6 +567,30 @@ class FollowBinaryPredictAlgorithm(PredictAlgorithm, OracleAlgorithm, BinaryPred
     def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
         super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
 
+class PredictiveMarkerBeladyAlgorithm(PredictiveMarker, OracleAlgorithm, ReuseDistancePredition):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma))
+
+class PredictiveMarkerFollowBinaryPredictAlgorithm(PredictiveMarker, OracleAlgorithm, BinaryPredition):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
+        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+
+class LMarkerBeladyAlgorithm(LMarkerAlgorithm, OracleAlgorithm, ReuseDistancePredition):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma))
+
+class LNonMarkerBeladyAlgorithm(LNonMarkerAlgorithm, OracleAlgorithm, ReuseDistancePredition):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma))
+
+class Mark0FollowBinaryPredictAlgorithm(Mark0Algorithm, OracleAlgorithm, BinaryPredition):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
+        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+
+class MarkAndPredictOracleAlgorithm(MarkAndPredictAlgorithm, OracleAlgorithm, PhasePredition):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
+        super().__init__(associativity, BinaryEvictor(), OraclePhasePredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+
 class GuardBeladyAlgorithm(GuardAlgorithm, OracleAlgorithm, ReuseDistancePredition):
     def __init__(self, associativity, reuse_dis_noise_sigma=0, follow_if_guarded=False, relax_times=0, relax_prob=0):
         super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma), follow_if_guarded, relax_times, relax_prob)
@@ -356,6 +607,7 @@ class ParrotAlgorithm(PredictAlgorithm):
     def __init__(self, associativity, shared_model):
         super().__init__(associativity, MaxEvictor(), ParrotPredictor(shared_model))
 
+####################################################################
 def format_guard(relax_times, relax_prob):
     if relax_times == 0 and relax_prob == 0:
         return "-no-relax"
@@ -380,7 +632,7 @@ def pretty_print(callable: Union[EvictAlgorithm, partial], verbose=False) -> str
     this_cls = callable
     if hasattr(callable, 'func'):
         this_cls = callable.func
-    this_cls_name = this_cls.__name__.replace("Algorithm", '').replace("FollowBinaryPredict", 'FBP')
+    this_cls_name = this_cls.__name__.replace("Algorithm", '').replace("FollowBinaryPredict", 'FBP').replace("MarkAndPredict", "Mark&Predict")
     metadata = this_cls_name
     if hasattr(callable, 'keywords'):
         kw = callable.keywords

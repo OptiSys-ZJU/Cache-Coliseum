@@ -11,9 +11,10 @@ import tqdm
 import copy
 
 if __name__ == "__main__":
-    file_path = 'traces/xalanc_test.csv'
+    file_path = 'traces/sphinx3_test.csv'
     print(file_path)
     verbose = True
+    verbose = False
     sorted = False
 
     device = 'cuda:1'
@@ -26,36 +27,42 @@ if __name__ == "__main__":
     align_type = ShiftAligner
     hash_type = ShiftHashFunction
 
-    parrot_gen = lambda : ParrotModel.from_config("tmp/model_config.json", '215000.ckpt')
+    #parrot_gen = lambda : ParrotModel.from_config("tmp/model_config.json", 'tmp/xalanc/250000.ckpt')
 
     online_types = [
         RandAlgorithm,
         LRUAlgorithm,
         MarkerAlgorithm,
-        partial(ParrotAlgorithm, shared_model=parrot_gen()),
-        partial(GuardParrotAlgorithm, shared_model=parrot_gen(), follow_if_guarded=False, relax_times=0, relax_prob=0)
+        # partial(ParrotAlgorithm, shared_model=parrot_gen()),
+        # partial(GuardParrotAlgorithm, shared_model=parrot_gen(), follow_if_guarded=False, relax_times=0, relax_prob=0)
     ]
 
     combiner_types = [
-        #(partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [BeladyAlgorithm, LRUAlgorithm]),
-        #(partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [FollowBinaryPredictAlgorithm, MarkerAlgorithm]),
-        (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [partial(ParrotAlgorithm, shared_model=parrot_gen()), MarkerAlgorithm])
+        (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [BeladyAlgorithm, LRUAlgorithm]),
+        (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [FollowBinaryPredictAlgorithm, MarkerAlgorithm]),
+        #(partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [partial(ParrotAlgorithm, shared_model=parrot_gen()), MarkerAlgorithm])
     ]
 
-    noise_type = None
+    #noise_type = None
     #noise_type = 'dis'
-    #noise_type = 'bin'
+    noise_type = 'bin'
 
     if noise_type is not None:
         ## mask noises
-        oracle_dis_noise_mask = [0, 100, 1000, 10000]
+        oracle_dis_noise_mask = [0, 10, 20, 50, 100, 1000, 10000, 100000]
         oracle_bin_noise_mask = [0, 0.1, 0.2, 0.5, 0.8, 1]
-        oracle_types = [
-            # partial(BeladyAlgorithm),
-            # partial(FollowBinaryPredictAlgorithm),
-            # partial(GuardBeladyAlgorithm, follow_if_guarded=False, relax_prob=0.2),
-            # partial(GuardFollowBinaryPredictAlgorithm, follow_if_guarded=True, relax_times=5),
-        ]
+    oracle_types = [
+        partial(BeladyAlgorithm),
+        partial(FollowBinaryPredictAlgorithm),
+        partial(PredictiveMarkerBeladyAlgorithm),
+        partial(LMarkerBeladyAlgorithm),
+        partial(LNonMarkerBeladyAlgorithm),
+        partial(Mark0FollowBinaryPredictAlgorithm),
+        partial(MarkAndPredictOracleAlgorithm),
+        partial(GuardBeladyAlgorithm, follow_if_guarded=False, relax_prob=0.2),
+        partial(GuardFollowBinaryPredictAlgorithm, follow_if_guarded=True, relax_times=0),
+        partial(GuardFollowBinaryPredictAlgorithm, follow_if_guarded=True, relax_times=5),
+    ]
 
 ##############################################################
     func_dict = {}
@@ -76,13 +83,16 @@ if __name__ == "__main__":
                     this_partial.keywords['reuse_dis_noise_sigma'] = noise
                     register_func(this_partial, noise)
             elif noise_type == 'bin':
-                if issubclass(oracle_alg_type.func, BinaryPredition):
+                if issubclass(oracle_alg_type.func, BinaryPredition) or issubclass(oracle_alg_type.func, PhasePredition):
                     for noise in oracle_bin_noise_mask:
                         this_partial = copy.deepcopy(oracle_alg_type)
                         this_partial.keywords['bin_noise_prob'] = noise
                         register_func(this_partial, noise)
             else:
                 raise ValueError('Invalid noise type')
+    else:
+        for oracle_alg_type in oracle_types:
+            register_func(oracle_alg_type, 0)
 
     def mask_combiner(noise):
         for combiner, algs in combiner_types:
@@ -93,7 +103,7 @@ if __name__ == "__main__":
                         this_partial = partial(alg, reuse_dis_noise_sigma=noise)
                         candidate_algorithms.append(this_partial)
                     elif noise_type == 'bin':
-                        if issubclass(alg, BinaryPredition):
+                        if issubclass(alg, BinaryPredition) or issubclass(alg, PhasePredition):
                             this_partial = partial(alg, bin_noise_prob=noise)
                             candidate_algorithms.append(this_partial)
                     else:
