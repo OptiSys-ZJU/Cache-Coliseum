@@ -39,13 +39,15 @@ if __name__ == "__main__":
 
     combiner_types = [
         (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [BeladyAlgorithm, LRUAlgorithm]),
+        (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [BeladyAlgorithm, MarkerAlgorithm]),
+        (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [FollowBinaryPredictAlgorithm, LRUAlgorithm]),
         (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [FollowBinaryPredictAlgorithm, MarkerAlgorithm]),
         #(partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [partial(ParrotAlgorithm, shared_model=parrot_gen()), MarkerAlgorithm])
     ]
 
     #noise_type = None
-    #noise_type = 'dis'
-    noise_type = 'bin'
+    noise_type = 'dis'
+    #noise_type = 'bin'
 
     if noise_type is not None:
         ## mask noises
@@ -56,7 +58,9 @@ if __name__ == "__main__":
         partial(FollowBinaryPredictAlgorithm),
         partial(PredictiveMarkerBeladyAlgorithm),
         partial(LMarkerBeladyAlgorithm),
+        partial(LMarkerFollowBinaryPredictAlgorithm),
         partial(LNonMarkerBeladyAlgorithm),
+        partial(LNonMarkerFollowBinaryPredictAlgorithm),
         partial(Mark0FollowBinaryPredictAlgorithm),
         partial(MarkAndPredictOracleAlgorithm),
         partial(GuardBeladyAlgorithm, follow_if_guarded=False, relax_prob=0.2),
