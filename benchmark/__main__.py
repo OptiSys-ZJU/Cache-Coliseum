@@ -9,15 +9,27 @@ from functools import partial
 from prettytable import PrettyTable
 import tqdm
 import copy
+import argparse
+import os
 
 if __name__ == "__main__":
-    file_path = 'traces/sphinx3_test.csv'
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default='xalanc')
+    parser.add_argument("--device", type=str, default='cpu')
+    parser.add_argument("--noise_type", type=str, default='none', choices=['dis', 'bin', 'logdis', 'none'])
+    parser.add_argument("--output_root_dir", type=str, default='res')
+    args = parser.parse_args()
+
+
+    file_path = f'traces/{args.dataset}_test.csv'
     print(file_path)
-    verbose = True
-    verbose = False
+    if args.noise_type == 'none':
+        verbose = True
+    else:
+        verbose = False
     sorted = False
 
-    device = 'cuda:1'
+    device = args.device
 
     device_manager.set_device(device)
 
@@ -44,10 +56,18 @@ if __name__ == "__main__":
         (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [FollowBinaryPredictAlgorithm, MarkerAlgorithm]),
         #(partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [partial(ParrotAlgorithm, shared_model=parrot_gen()), MarkerAlgorithm])
     ]
-
-    #noise_type = None
-    noise_type = 'dis'
-    #noise_type = 'bin'
+    
+    if args.noise_type == 'dis':
+        noise_type = 'dis'
+        lognormal = False
+    elif args.noise_type == 'bin':
+        noise_type = 'bin'
+        lognormal = False
+    elif args.noise_type == 'logdis':
+        noise_type = 'dis'
+        lognormal = True
+    else:
+        noise_type = None
 
     if noise_type is not None:
         ## mask noises
@@ -63,6 +83,7 @@ if __name__ == "__main__":
         partial(LNonMarkerFollowBinaryPredictAlgorithm),
         partial(Mark0FollowBinaryPredictAlgorithm),
         partial(MarkAndPredictOracleAlgorithm),
+        partial(FollowerRobustOracleAlgorithm),
         partial(GuardBeladyAlgorithm, follow_if_guarded=False, relax_prob=0.2),
         partial(GuardFollowBinaryPredictAlgorithm, follow_if_guarded=True, relax_times=0),
         partial(GuardFollowBinaryPredictAlgorithm, follow_if_guarded=True, relax_times=5),
@@ -85,6 +106,7 @@ if __name__ == "__main__":
                 for noise in oracle_dis_noise_mask:
                     this_partial = copy.deepcopy(oracle_alg_type)
                     this_partial.keywords['reuse_dis_noise_sigma'] = noise
+                    this_partial.keywords['lognormal'] = lognormal
                     register_func(this_partial, noise)
             elif noise_type == 'bin':
                 if issubclass(oracle_alg_type.func, BinaryPredition) or issubclass(oracle_alg_type.func, PhasePredition):
@@ -104,7 +126,7 @@ if __name__ == "__main__":
             for alg in algs:
                 if isinstance(alg, type) and issubclass(alg, OracleAlgorithm):
                     if noise_type == 'dis':
-                        this_partial = partial(alg, reuse_dis_noise_sigma=noise)
+                        this_partial = partial(alg, reuse_dis_noise_sigma=noise, lognormal=lognormal)
                         candidate_algorithms.append(this_partial)
                     elif noise_type == 'bin':
                         if issubclass(alg, BinaryPredition) or issubclass(alg, PhasePredition):
@@ -181,5 +203,15 @@ if __name__ == "__main__":
                 lst.extend([lst[-1]] * (len(table.field_names) - 2))
             table.add_row(lst)
 
+
+    res_dir = os.path.join(args.output_root_dir, args.dataset)
+    if not os.path.exists(res_dir):
+        os.makedirs(res_dir)
+    if args.noise_type is None:
+        with open(os.path.join(res_dir, "stat.csv"), "w", encoding="utf-8") as file:
+            file.write(table.get_csv_string())
+    else:
+        with open(os.path.join(res_dir, f"{args.noise_type}.csv"), "w", encoding="utf-8") as file:
+            file.write(table.get_csv_string())
     print(table)
             

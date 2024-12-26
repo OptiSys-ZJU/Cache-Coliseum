@@ -292,6 +292,206 @@ class MarkAndPredictAlgorithm(PredictAlgorithm):
         self.after_pred(pc, address, target_index)
         return hit
 
+class FollowerRobustAlgorithm(PredictAlgorithm):
+    """
+    F&R Algorithm
+
+    Designed by Karim Abdel Sadek and Marek Elias. 2024. Algorithms for Caching and MTS with reduced number of predictions.
+    https://arxiv.org/abs/2404.06280
+    """
+    @staticmethod
+    def create_windows(S, W, F, k, a):
+        def func(i):    
+            return (2**(i+1))-1
+        for i in range(0, int(np.log2(k)) + 1):
+            S.append((int(k - (k // (2 ** i)) + 1)))
+        for i in range(1, int(np.log2(k)) + 1):
+            n = []
+            for h in range(S[i - 1], S[i]):
+                n.append(h)
+            W.append(n)
+        W.append([S[-1]])
+        for g in range(0, len(W)-1):
+            gap = int(len(W[g])//(func(g+1)-func(g)))
+            if (gap >= a):
+                for m in W[g][::gap]:
+                    F.append(m)
+            else:
+                for m in range(S[g], S[-1]+1, a):
+                    F.append(m)
+                break
+        if k == 10:
+            F = [1,6,9]
+        return S, W, F
+
+    @staticmethod
+    def differ(a, b):
+        aa = list(a).copy()
+        bb = list(b).copy()
+        for x in bb:
+            if x == None:
+                continue
+            elif x in aa:
+                aa.remove(x)
+        if aa == []:
+            return bb
+        return aa
+
+    def __init__(self, associativity, evictor, predictor, a=1, lazy_evictor_type: Union[LRUEvictor, RandEvictor, None] = LRUEvictor):
+        if lazy_evictor_type is not None and not issubclass(lazy_evictor_type, Evictor):
+            raise ValueError('FollowerRobustAlgorithm: Invalid Evictor')
+
+        if not isinstance(predictor, CachePredictor):
+            raise ValueError('FollowerRobustAlgorithm: predictor must be a CachePredictor')
+
+        super().__init__(associativity, evictor, predictor)
+        
+        self.lazy_evictor = lazy_evictor_type() if lazy_evictor_type is not None else None
+        self.key_scores = {} if lazy_evictor_type == LRUEvictor else None
+        self.timestamp = 0
+
+        self.remaining_robust_step = 0
+        self.follower_cost = 0
+        self.belady_cost = 0
+        self.pred_gap = 0
+
+        self.sim_cache = [None] * associativity
+        self.sim_pcs = [None] * associativity
+        self.traces = []
+        
+        self.old = []
+        self.unmarked = []
+        self.unmarked_for_reload = []
+        self.marked = []
+        self.clean = []
+
+        self.a = a
+        self.S = []
+        self.W = []
+        self.F = []
+        if (self.a == 1):
+            self.S, self.W, self.F = FollowerRobustAlgorithm.create_windows(self.S, self.W, self.F, self.associativity, self.a)
+
+    def online_belady(self):
+        cache = []
+        for i, current in enumerate(self.traces):
+            if current in cache:
+                continue
+            if len(cache) < self.associativity:
+                cache.append(current)
+            else:
+                future_uses = {item: self.traces[i + 1:].index(item) if item in self.traces[i + 1:] else float('inf') for item in cache}
+                to_remove = max(future_uses, key=future_uses.get)
+                cache.remove(to_remove)
+                cache.append(current)
+        
+        return cache
+    
+    def follow_robust(self, pc, address):
+        target_index = -1
+        # get next state
+        preds = self.predictor.pred_before_evict(self.timestamp, pc, address, self.snapshot()[0])
+        assert(preds is not None)
+        if address in self.sim_cache:
+            target_index = self.sim_cache.index(address)
+        elif None in self.sim_cache:
+            target_index = self.sim_cache.index(None)
+            self.preds = preds
+        else:
+            if self.remaining_robust_step == 0:
+                # follower
+                self.follower_cost += 1
+                if address not in self.online_belady():
+                    self.belady_cost += 1
+
+                if address not in self.preds and (self.follower_cost <= self.belady_cost):
+                    if self.pred_gap <= 0:
+                        self.preds = preds
+                        self.pred_gap = self.a
+                        dd = FollowerRobustAlgorithm.differ(self.cache, self.preds)
+                        target_index = self.sim_cache.index(random.choice(dd))
+                    else:
+                        target_index = random.choice(range(self.associativity))
+                elif address in self.preds:
+                    dd = FollowerRobustAlgorithm.differ(self.cache, self.preds)
+                    target_index = self.sim_cache.index(random.choice(dd))
+                else:
+                    self.follower_cost = 0
+                    self.belady_cost = 0
+                    self.remaining_robust_step = self.associativity
+
+                    self.old = copy.deepcopy(self.sim_cache)
+                    self.unmarked = copy.deepcopy(self.sim_cache)
+                    self.marked = []
+                    self.unmarked_for_reload = []
+                    self.clean = []
+                                    
+            if self.remaining_robust_step != 0:
+                if address not in self.marked:
+                    self.remaining_robust_step -= 1
+                    this_arrival_index = self.associativity - self.remaining_robust_step
+                    if address in self.unmarked:
+                        self.unmarked.remove(address)
+                    if address not in self.marked:
+                        self.marked.append(address)
+                    if address not in self.old:
+                        self.clean.append(address)
+                    if ((self.a==1) and (this_arrival_index in self.F)) or ((self.a > 1) and (self.pred_gap <= 0)):
+                        self.pred_gap = self.a
+                        self.preds = preds
+                    if this_arrival_index in self.S:
+                        self.unmarked_for_reload = []
+                        for p in self.unmarked:
+                            if (p in self.preds) and (p not in self.sim_cache):
+                                self.unmarked_for_reload.append(p)
+                    if address in self.unmarked_for_reload:
+                        dd = FollowerRobustAlgorithm.differ(self.cache, self.preds)
+                        target_index = self.sim_cache.index(random.choice(dd))
+                    if address in self.clean:
+                        dd = FollowerRobustAlgorithm.differ(self.cache, self.preds)
+                        target_index = self.sim_cache.index(random.choice(dd))
+                if target_index == -1:
+                    # random select unmark
+                    unmarked_slots = []
+                    for page in self.sim_cache:
+                        if page in self.unmarked:
+                            unmarked_slots.append(self.sim_cache.index(page))
+                    target_index = random.choice(unmarked_slots)
+        
+        self.sim_cache[target_index], self.sim_pcs[target_index] = address, pc
+        self.after_pred(pc, address, target_index)
+        self.pred_gap -= 1
+        self.traces.append(address)
+    
+    def access(self, pc, address):
+        if self.key_scores is not None:
+            self.key_scores[address] = self.timestamp
+        self.timestamp += 1
+
+        self.follow_robust(pc, address)
+
+        ## Lazy
+        target_index = -1
+        hit = False
+        if address in self.cache:
+            target_index = self.cache.index(address)
+            hit = True
+        elif None in self.cache:
+            target_index = self.cache.index(None)
+        else:
+            center_cache = self.sim_cache
+            if self.lazy_evictor is None:
+                self.cache = copy.deepcopy(center_cache)
+                self.pcs = copy.deepcopy(self.sim_pcs)
+                target_index = self.cache.index(address)
+            else:
+                diff_keys = set(center_cache) - set(self.cache)
+                target_index = self.lazy_evictor.evict([(center_cache.index(k), self.key_scores[k] if self.key_scores is not None else 0) for k in diff_keys])
+        
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        return hit
+
+
 class GuardAlgorithm(PredictAlgorithm):
     """
     Guard algorithm
@@ -560,52 +760,56 @@ class MarkerAlgorithm(EvictAlgorithm):
 #######################################################################
 
 class BeladyAlgorithm(PredictAlgorithm, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0) -> None:
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True) -> None:
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal))
 
 class FollowBinaryPredictAlgorithm(PredictAlgorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
+        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
 
 class PredictiveMarkerBeladyAlgorithm(PredictiveMarker, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal))
 
 class PredictiveMarkerFollowBinaryPredictAlgorithm(PredictiveMarker, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
+        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
 
 class LMarkerBeladyAlgorithm(LMarkerAlgorithm, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal))
 
 class LMarkerFollowBinaryPredictAlgorithm(LMarkerAlgorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
+        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
 
 class LNonMarkerBeladyAlgorithm(LNonMarkerAlgorithm, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal))
 
 class LNonMarkerFollowBinaryPredictAlgorithm(LNonMarkerAlgorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
+        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
 
 class Mark0FollowBinaryPredictAlgorithm(Mark0Algorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
+        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
 
 class MarkAndPredictOracleAlgorithm(MarkAndPredictAlgorithm, OracleAlgorithm, PhasePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0):
-        super().__init__(associativity, BinaryEvictor(), OraclePhasePredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob))
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
+        super().__init__(associativity, BinaryEvictor(), OraclePhasePredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
+
+class FollowerRobustOracleAlgorithm(FollowerRobustAlgorithm, OracleAlgorithm, CachePredition):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True, a=1, lazy_evictor_type = LRUEvictor):
+        super().__init__(associativity, DummyEvictor(), OracleCachePredictor(associativity, reuse_dis_noise_sigma, lognormal), a, lazy_evictor_type)
 
 class GuardBeladyAlgorithm(GuardAlgorithm, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, follow_if_guarded=False, relax_times=0, relax_prob=0):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma), follow_if_guarded, relax_times, relax_prob)
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True, follow_if_guarded=False, relax_times=0, relax_prob=0):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal), follow_if_guarded, relax_times, relax_prob)
 
 class GuardFollowBinaryPredictAlgorithm(GuardAlgorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, follow_if_guarded=False, bin_noise_prob=0, relax_times=0, relax_prob=0):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob), follow_if_guarded, relax_times, relax_prob)
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True, follow_if_guarded=False, bin_noise_prob=0, relax_times=0, relax_prob=0):
+        super().__init__(associativity, ReuseDistanceEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal), follow_if_guarded, relax_times, relax_prob)
 
 class GuardParrotAlgorithm(GuardAlgorithm):
     def __init__(self, associativity, shared_model, follow_if_guarded=False, relax_times=0, relax_prob=0):
@@ -674,6 +878,3 @@ def pretty_print(callable: Union[EvictAlgorithm, partial], verbose=False) -> str
             metadata += format_oracle(reuse_dis_noise_sigma, bin_noise_prob) 
     
     return metadata
-        
-
-

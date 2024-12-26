@@ -6,6 +6,10 @@ class Evictor(ABC):
     def evict(self, candidates):
         pass
 
+class DummyEvictor(ABC):
+    def evict(self, candidates):
+        return 0
+
 class MaxEvictor(Evictor):
     def evict(self, candidates):
         return max(candidates, key=lambda x: x[1])[0]

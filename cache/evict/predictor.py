@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import collections
 import random
-import torch
+import copy
 
 class Predictor(ABC):
     def pred_before_evict(self, ts, pc, address, cache_state) -> Union[List[Union[int, float]], None]:
@@ -19,6 +19,8 @@ class BinaryPredictor(Predictor):
     pass
 class PhasePredictor(Predictor):
     pass
+class CachePredictor(Predictor):
+    pass
 
 class ReuseDistancePredition:
     pass
@@ -26,24 +28,29 @@ class BinaryPredition:
     pass
 class PhasePredition:
     pass
+class CachePredition:
+    pass
 
 class OraclePredictor(ABC):
-    def __init__(self, reuse_dis_noise_sigma=0) -> None:
+    def __init__(self, reuse_dis_noise_sigma=0, lognormal=True) -> None:
         self.reuse_dis_noise_sigma = reuse_dis_noise_sigma
+        self.enable_lognormal = lognormal
     
     def oracle_access(self, pc, address, next_access_time):
         if self.reuse_dis_noise_sigma == 0:
             self.__oracle_access__(pc, address, next_access_time)
         else:
-            self.__oracle_access__(pc, address, next_access_time + np.random.lognormal(0, self.reuse_dis_noise_sigma))
-
+            if self.enable_lognormal:
+                self.__oracle_access__(pc, address, next_access_time + np.random.lognormal(0, self.reuse_dis_noise_sigma))
+            else:
+                self.__oracle_access__(pc, address, next_access_time + np.random.normal(0, self.reuse_dis_noise_sigma))
     @abstractmethod
     def __oracle_access__(self, pc, address, next_access_time):
         pass
 
 class OracleReuseDistancePredictor(ReuseDistancePredictor, OraclePredictor):
-    def __init__(self, reuse_dis_noise_sigma=0, oracle_check=True) -> None:
-        super().__init__(reuse_dis_noise_sigma)
+    def __init__(self, reuse_dis_noise_sigma=0, lognormal=True, oracle_check=True) -> None:
+        super().__init__(reuse_dis_noise_sigma, lognormal)
         self.oracle_preds = collections.deque()
         self.oracle_check = oracle_check
     
@@ -57,8 +64,8 @@ class OracleReuseDistancePredictor(ReuseDistancePredictor, OraclePredictor):
         self.oracle_preds.append((address, next_access_time))
 
 class OracleBinaryPredictor(BinaryPredictor, OraclePredictor):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, oracle_check=True) -> None:
-        super().__init__(reuse_dis_noise_sigma)
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True, oracle_check=True) -> None:
+        super().__init__(reuse_dis_noise_sigma, lognormal)
         self.oracle_cache = [None] * associativity
         self.oracle_preds = collections.deque()
         self.oracle_check = oracle_check
@@ -96,8 +103,8 @@ class OracleBinaryPredictor(BinaryPredictor, OraclePredictor):
         self.oracle_t += 1
 
 class OraclePhasePredictor(PhasePredictor, OraclePredictor):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, oracle_check=True):
-        super().__init__(reuse_dis_noise_sigma)
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True, oracle_check=True):
+        super().__init__(reuse_dis_noise_sigma, lognormal)
         self.associativity = associativity
 
         self.oracle_t = 0
@@ -112,7 +119,7 @@ class OraclePhasePredictor(PhasePredictor, OraclePredictor):
     def pred_after_evict(self, ts, pc, address):
         oracle_key, bin_pred = self.oracle_preds.popleft()
         if self.oracle_check and oracle_key != address:
-            raise ValueError("OraclePhasePredictorm: oracle key not equals to key")
+            raise ValueError("OraclePhasePredictor: oracle key not equals to key")
 
         if self.bin_noise_prob == 0:
             return bin_pred
@@ -134,7 +141,35 @@ class OraclePhasePredictor(PhasePredictor, OraclePredictor):
         self.oracle_curr_key_set.add(address)
         self.oracle_preds.append([address, 1])
         self.oracle_t += 1
+
+class OracleCachePredictor(CachePredictor, OraclePredictor):
+    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True, oracle_check=True):
+        super().__init__(reuse_dis_noise_sigma, lognormal)
+        self.associativity = associativity
+
+        self.oracle_cache = [None] * associativity
+        self.oracle_next_access_times = [np.inf] * associativity
+        self.oracle_check = oracle_check
+        self.oracle_preds = collections.deque()
+    
+    def pred_before_evict(self, ts, pc, address, cache_state) -> Union[List[Union[int, float]], None]:
+        oracle_key, next_cache_state = self.oracle_preds.popleft()
+        if self.oracle_check and oracle_key != address:
+            raise ValueError("OracleCachePredictor: oracle key not equals to key")
+        return next_cache_state
+
+    def __oracle_access__(self, pc, address, next_access_time):
+        if address in self.oracle_cache:
+            target_index = self.oracle_cache.index(address)
+        elif None in self.oracle_cache:
+            target_index = self.oracle_cache.index(None)
+        else:
+            target_index = self.oracle_next_access_times.index(max(self.oracle_next_access_times))
         
+        self.oracle_cache[target_index] = address
+        self.oracle_next_access_times[target_index] = next_access_time 
+        self.oracle_preds.append([address, copy.deepcopy(self.oracle_cache)])
+
 class ParrotPredictor(Predictor):
     def __init__(self, shared_model):
         self._model = shared_model
