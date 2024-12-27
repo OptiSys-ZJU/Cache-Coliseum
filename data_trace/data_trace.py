@@ -92,8 +92,11 @@ class DataTrace(object):
 
     def __enter__(self):
         self._file = open(self._filename, "r")
+        filename = os.path.basename(self._filename)
         _, extension = os.path.splitext(self._filename)
-        if extension == ".csv":
+        if filename.startswith('brightkite') or filename.startswith('citi'):
+            self._reader = CSVStringReader(self._file)
+        elif extension == ".csv":
             self._reader = CSVReader(self._file)
         elif extension == ".txt":
             self._reader = TxtReader(self._file)
@@ -217,8 +220,11 @@ class OracleDataTrace(object):
 
     def __enter__(self):
         self._file = open(self._filename, "r")
+        filename = os.path.basename(self._filename)
         _, extension = os.path.splitext(self._filename)
-        if extension == ".csv":
+        if filename.startswith('brightkite') or filename.startswith('citi'):
+            self._reader = CSVStringReader(self._file)
+        elif extension == ".csv":
             self._reader = CSVReader(self._file)
         elif extension == ".txt":
             self._reader = TxtReader(self._file)
@@ -283,6 +289,15 @@ class CSVReader(MemoryTraceReader):
         # Convert hex string to int
         return int(pc, 16), int(address, 16)
 
+class CSVStringReader(MemoryTraceReader):
+    def __init__(self, f):
+        super(CSVStringReader, self).__init__(f)
+        self._csv_reader = csv.reader(f)
+
+    def next(self):
+        # Raises StopIteration when CSV reader is eof
+        pc, address = next(self._csv_reader)
+        return pc, address.lstrip()
 
 class TxtReader(MemoryTraceReader):
     """Reads .txt extension memory traces.

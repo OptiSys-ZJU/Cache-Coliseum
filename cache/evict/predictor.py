@@ -1,35 +1,53 @@
 from abc import ABC, abstractmethod
-from typing import Union, List
+from typing import Union, List, Tuple
 from types import SimpleNamespace
+from cache.evict.evictor import MaxEvictor
 import numpy as np
 import collections
 import random
 import copy
 
 class Predictor(ABC):
-    def pred_before_evict(self, ts, pc, address, cache_state) -> Union[List[Union[int, float]], None]:
-        return None
+    def refresh_scores(self, ts, pc, address, cache_state: Tuple[List, List]) -> List[Union[int, float, str]]:
+        '''
+        Before evict, use predictor to refresh all slots' scores
 
-    def pred_after_evict(self, ts, pc, address) -> Union[int, float, None]:
-        return None
+        Scores can be reuse-distance, binary preds and cache's state(keys)
+
+        When evicting, the scores must be the latest.
+        '''
+        raise NotImplementedError('Predictor: refresh_scores not implemented')
+    
+    def predict_score(self, ts, pc, address, cache_state) -> Union[int, float, str, None]:
+        '''
+        Predict this address's score, based on pc, address and cache_state.
+
+        The score is only related to address, with the assistance of other variables
+
+        '''
+        raise NotImplementedError('Predictor: predict_score not implemented')
 
 class ReuseDistancePredictor(Predictor):
-    pass
-class BinaryPredictor(Predictor):
-    pass
-class PhasePredictor(Predictor):
-    pass
-class CachePredictor(Predictor):
-    pass
+    '''
+    ReuseDistancePredictor only focus on address's score
+    '''
+    def refresh_scores(self, ts, pc, address, cache_state: Tuple[List, List]) -> List[Union[int, float, str]]:
+        return None 
 
-class ReuseDistancePredition:
-    pass
-class BinaryPredition:
-    pass
-class PhasePredition:
-    pass
-class CachePredition:
-    pass
+class BinaryPredictor(Predictor):
+    '''
+    BinaryPredictor only focus on address's score 
+    '''
+    def refresh_scores(self, ts, pc, address, cache_state: Tuple[List, List]) -> List[Union[int, float, str]]:
+        return None 
+
+class PhasePredictor(Predictor):
+    def refresh_scores(self, ts, pc, address, cache_state: Tuple[List, List]) -> List[Union[int, float, str]]:
+        return None 
+
+class StatePredictor(Predictor):
+    def predict_score(self, ts, pc, address, cache_state) -> Union[int, float, None]:
+        return None
 
 class OraclePredictor(ABC):
     def __init__(self, reuse_dis_noise_sigma=0, lognormal=True) -> None:
@@ -54,7 +72,7 @@ class OracleReuseDistancePredictor(ReuseDistancePredictor, OraclePredictor):
         self.oracle_preds = collections.deque()
         self.oracle_check = oracle_check
     
-    def pred_after_evict(self, ts, pc, address):
+    def predict_score(self, ts, pc, address, cache_state):
         oracle_key, next_access_time = self.oracle_preds.popleft()
         if self.oracle_check and oracle_key != address:
             raise ValueError("OracleReuseDistancePredictAlgorithm: oracle key not equals to key")
@@ -74,7 +92,7 @@ class OracleBinaryPredictor(BinaryPredictor, OraclePredictor):
         self.oracle_t = 0
         self.bin_noise_prob = bin_noise_prob
     
-    def pred_after_evict(self, ts, pc, address):
+    def predict_score(self, ts, pc, address, cache_state):
         oracle_key, bin_pred = self.oracle_preds.popleft()
         if self.oracle_check and oracle_key != address:
             raise ValueError("OracleBinaryPredictAlgorithm: oracle key not equals to key")
@@ -116,7 +134,7 @@ class OraclePhasePredictor(PhasePredictor, OraclePredictor):
         self.oracle_curr_phase = []
         self.oracle_curr_key_set = set()
     
-    def pred_after_evict(self, ts, pc, address):
+    def predict_score(self, ts, pc, address, cache_state):
         oracle_key, bin_pred = self.oracle_preds.popleft()
         if self.oracle_check and oracle_key != address:
             raise ValueError("OraclePhasePredictor: oracle key not equals to key")
@@ -142,7 +160,7 @@ class OraclePhasePredictor(PhasePredictor, OraclePredictor):
         self.oracle_preds.append([address, 1])
         self.oracle_t += 1
 
-class OracleCachePredictor(CachePredictor, OraclePredictor):
+class OracleStatePredictor(StatePredictor, OraclePredictor):
     def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True, oracle_check=True):
         super().__init__(reuse_dis_noise_sigma, lognormal)
         self.associativity = associativity
@@ -152,10 +170,10 @@ class OracleCachePredictor(CachePredictor, OraclePredictor):
         self.oracle_check = oracle_check
         self.oracle_preds = collections.deque()
     
-    def pred_before_evict(self, ts, pc, address, cache_state) -> Union[List[Union[int, float]], None]:
+    def refresh_scores(self, ts, pc, address, cache_state: Tuple[List, List]):
         oracle_key, next_cache_state = self.oracle_preds.popleft()
         if self.oracle_check and oracle_key != address:
-            raise ValueError("OracleCachePredictor: oracle key not equals to key")
+            raise ValueError("OracleStatePredictor: oracle key not equals to key")
         return next_cache_state
 
     def __oracle_access__(self, pc, address, next_access_time):
@@ -170,14 +188,96 @@ class OracleCachePredictor(CachePredictor, OraclePredictor):
         self.oracle_next_access_times[target_index] = next_access_time 
         self.oracle_preds.append([address, copy.deepcopy(self.oracle_cache)])
 
-class ParrotPredictor(Predictor):
+################################################
+class SimulateCache:
+    '''
+    SimulateCache
+
+    Based on normal reuse distance predictor, we can generate other type's predictor
+
+    A simulation cache is necessary.
+    '''
+    def __init__(self, associativity, reuse_dis_predictor: ReuseDistancePredictor):
+        super().__init__()
+
+        self.reuse_dis_predictor = reuse_dis_predictor
+
+        self.sim_cache = [None] * associativity
+        self.sim_pcs = [None] * associativity
+        # Evict max reuse dis
+        self.sim_evictor = MaxEvictor()
+        self.sim_scores = [np.inf] * associativity
+    
+    def access(self, pc, address):
+        if address in self.sim_cache:
+            target_index = self.sim_cache.index(address)
+        elif None in self.sim_cache:
+            target_index = self.sim_cache.index(None)
+        else:
+            target_index = self.sim_evictor.evict(list(enumerate(self.sim_scores)))
+        self.sim_cache[target_index], self.sim_pcs[target_index] = address, pc
+
+class HybridStatePredictor(SimulateCache, StatePredictor):
+    def __init__(self, associativity, reuse_dis_predictor):
+        super().__init__(associativity, reuse_dis_predictor)
+    
+    def refresh_scores(self, ts, pc, address, cache_state: Tuple[List, List]) -> List[Union[int, float, str]]:
+        self.access(pc, address)
+        return copy.deepcopy(self.sim_cache)
+
+class ParrotPredictor(ReuseDistancePredictor):
     def __init__(self, shared_model):
         self._model = shared_model
 
-    def pred_before_evict(self, ts, pc, address, cache_state) -> Union[List[Union[int, float]], None]:
+    def refresh_scores(self, ts, pc, address, cache_state: Tuple[List, List]) -> List[Union[int, float, str]]:
         cache_access = SimpleNamespace()
         cache_access.pc = pc
         cache_access.address = address
         cache_access.cache_lines = cache_state
         scores = self._model(cache_access)
         return [scores[0, i].item() for i in range(len(cache_state))]
+
+class PLECOPredictor(ReuseDistancePredictor):
+    def __init__(self):
+        super().__init__()
+        self.timestamp = 1
+        self.weights = []
+        self.sum_weights = 0
+        self.prev_occs = {}
+        self.p = False
+    
+    def predict_score(self, ts, pc, address, cache_state):
+        this_weight = (self.timestamp + 10) ** (-1.8) * np.exp(-self.timestamp / 670)
+        self.weights.append(this_weight)
+        self.sum_weights += this_weight
+        if address not in self.prev_occs:
+            self.prev_occs[address] = []
+        self.prev_occs[address].append(self.timestamp)
+        prob = sum(self.weights[self.timestamp - i] for i in self.prev_occs[address]) / self.sum_weights
+        pred = 1 / prob + self.timestamp - 1
+        self.timestamp += 1
+
+        return pred
+
+class PLECOStatePredictor(HybridStatePredictor):
+    def __init__(self, associativity):
+        super().__init__(associativity, PLECOPredictor())
+
+class POPUPredictor(ReuseDistancePredictor):
+    def __init__(self):
+        super().__init__()
+        self.counts = {}
+        self.timestamp = 1
+    
+    def predict_score(self, ts, pc, address, cache_state):
+        if address not in self.counts:
+            self.counts[address] = 0
+        self.counts[address] += 1
+
+        pred = self.timestamp + self.timestamp / self.counts[address]
+        self.timestamp += 1
+        return pred
+
+class POPUStatePredictor(HybridStatePredictor):
+    def __init__(self, associativity):
+        super().__init__(associativity, POPUPredictor())

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import List, Union
+from typing import List, Union, Type
 from cache.evict.evictor import *
 from cache.evict.predictor import *
 import numpy as np
@@ -25,36 +25,39 @@ class EvictAlgorithm(ABC):
     def access(self, pc, address) -> bool:
         pass
 
-class OracleAlgorithm():
-    def oracle_access(self, pc, address, next_access_time):
-        self.predictor.oracle_access(pc, address, next_access_time)
-
 class PredictAlgorithm(EvictAlgorithm):
-    def __init__(self, associativity, evictor: Evictor, predictor: Predictor) -> None:
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial]) -> None:
         super().__init__(associativity)
         self.timestamp = 0
 
-        if isinstance(predictor, ReuseDistancePredictor):
+        cls_type = predictor_type.func if hasattr(predictor_type, 'func') else predictor_type
+        if issubclass(cls_type, ReuseDistancePredictor):
             self.preds = [np.inf] * associativity
-        elif isinstance(predictor, BinaryPredictor):
+        elif issubclass(cls_type, BinaryPredictor):
             self.preds = [0] * associativity
-        elif isinstance(predictor, PhasePredictor):
+        elif issubclass(cls_type, PhasePredictor):
             self.preds = [1] * associativity
         else:
             self.preds = None
-        self.evictor = evictor
-        self.predictor = predictor
+        
+        if issubclass(cls_type, OraclePredictor):
+            def oracle_access(self, pc, address, next_access_time):
+                self.predictor.oracle_access(pc, address, next_access_time)
+            self.oracle_access = types.MethodType(oracle_access, self)
+        
+        self.evictor = evictor_type()
+        self.predictor = predictor_type()
     
     def snapshot(self):
         return (list(zip(self.cache, self.pcs)), self.preds)
     
     def before_pred(self, pc, address):
-        preds = self.predictor.pred_before_evict(self.timestamp, pc, address, self.snapshot()[0])
+        preds = self.predictor.refresh_scores(self.timestamp, pc, address, self.snapshot()[0])
         if preds is not None:
             self.preds = preds
     
     def after_pred(self, pc ,address, target_index):
-        pred = self.predictor.pred_after_evict(self.timestamp, pc, address)
+        pred = self.predictor.predict_score(self.timestamp, pc, address, self.snapshot()[0])
         if pred is not None:
             self.preds[target_index] = pred
         self.timestamp += 1
@@ -75,6 +78,8 @@ class PredictAlgorithm(EvictAlgorithm):
         self.after_pred(pc, address, target_index)
         return hit
 
+######################################################################
+
 class PredictiveMarker(PredictAlgorithm):
     """
     PredictiveMarker algorithm
@@ -82,10 +87,10 @@ class PredictiveMarker(PredictAlgorithm):
     Designed by Thodoris Lykouris and Sergei Vassilvitskii. 2018. Competitive Caching with Machine Learned Advice.
     https://dl.acm.org/doi/10.1145/3447579
     """
-    def __init__(self, associativity, evictor: Evictor, predictor: Predictor) -> None:
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial]) -> None:
         def harmonic_number(k):
             return sum(1 / i for i in range(1, k + 1))
-        super().__init__(associativity, evictor, predictor)
+        super().__init__(associativity, evictor_type, predictor_type)
         self.marked = [0] * associativity
         self.tracking_set = []
         self.h_k = harmonic_number(associativity)
@@ -124,15 +129,15 @@ class PredictiveMarker(PredictAlgorithm):
         self.after_pred(pc, address, target_index)
         return hit
 
-class LMarkerAlgorithm(PredictAlgorithm):
+class LMarker(PredictAlgorithm):
     """
     LMARKER Algorithm
 
     Designed by Dhruv Rohatgi. 2020. Near-Optimal Bounds for Online Caching with Machine Learned Advice
     https://epubs.siam.org/doi/10.1137/1.9781611975994.112
     """
-    def __init__(self, associativity, evictor: Evictor, predictor: Predictor) -> None:
-        super().__init__(associativity, evictor, predictor)
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial]) -> None:
+        super().__init__(associativity, evictor_type, predictor_type)
 
         self.stale = []
         self.marked = [0] * associativity
@@ -162,15 +167,15 @@ class LMarkerAlgorithm(PredictAlgorithm):
         self.after_pred(pc, address, target_index)
         return hit
 
-class LNonMarkerAlgorithm(PredictAlgorithm):
+class LNonMarker(PredictAlgorithm):
     """
     LNONMARKER Algorithm
 
     Designed by Dhruv Rohatgi. 2020. Near-Optimal Bounds for Online Caching with Machine Learned Advice
     https://epubs.siam.org/doi/10.1137/1.9781611975994.112
     """
-    def __init__(self, associativity, evictor: Evictor, predictor: Predictor) -> None:
-        super().__init__(associativity, evictor, predictor)
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial]) -> None:
+        super().__init__(associativity, evictor_type, predictor_type)
 
         self.phase = set()
         self.stale = []
@@ -209,17 +214,17 @@ class LNonMarkerAlgorithm(PredictAlgorithm):
         self.after_pred(pc, address, target_index)
         return hit
 
-class Mark0Algorithm(PredictAlgorithm):
+class Mark0(PredictAlgorithm):
     """
     MARK0 Eviction Strategy
 
     Designed by Antonios Antoniadis, Joan Boyar, Marek Eliáš, Lene M. Favrholdt, Ruben Hoeksma, Kim S. Larsen, Adam Polak, and Bertrand Simon. 2023. Paging with Succinct Prediction.
     https://dl.acm.org/doi/10.5555/3618408.3618447
     """
-    def __init__(self, associativity, evictor, predictor):
-        if not isinstance(predictor, BinaryPredictor):
-            raise ValueError('Mark0Algorithm: predictor must be a BinaryPredictor')
-        super().__init__(associativity, evictor, predictor)
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial]):
+        super().__init__(associativity, evictor_type, predictor_type)
+        if not isinstance(self.predictor, BinaryPredictor):
+            raise ValueError('Mark0: predictor must be a BinaryPredictor')
         self.marked = [0] * associativity
         self.S_address = [None] * associativity
         self.S_visited = [0] * associativity
@@ -257,19 +262,19 @@ class Mark0Algorithm(PredictAlgorithm):
             self.cache[target_index], self.pcs[target_index] = None, None
         return hit
 
-class MarkAndPredictAlgorithm(PredictAlgorithm):
+class MarkAndPredict(PredictAlgorithm):
     """
     MARK&PREDICT Eviction Strategy
 
     Designed by Antonios Antoniadis, Joan Boyar, Marek Eliáš, Lene M. Favrholdt, Ruben Hoeksma, Kim S. Larsen, Adam Polak, and Bertrand Simon. 2023. Paging with Succinct Prediction.
     https://dl.acm.org/doi/10.5555/3618408.3618447
     """
-    def __init__(self, associativity, evictor, predictor):
-        if not isinstance(predictor, PhasePredictor):
-            raise ValueError('MarkAndPredictAlgorithm: predictor must be a PhasePredictor')
-        if not isinstance(evictor, BinaryEvictor):
-            raise ValueError('MarkAndPredictAlgorithm: evictor must be a BinaryEvictor')
-        super().__init__(associativity, evictor, predictor)
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial]):
+        super().__init__(associativity, evictor_type, predictor_type)
+        if not isinstance(self.predictor, PhasePredictor):
+            raise ValueError('MarkAndPredict: predictor must be a PhasePredictor')
+        if not isinstance(self.evictor, BinaryEvictor):
+            raise ValueError('MarkAndPredict: evictor must be a BinaryEvictor')
         self.marked = [0] * associativity
     
     def access(self, pc, address):
@@ -292,9 +297,15 @@ class MarkAndPredictAlgorithm(PredictAlgorithm):
         self.after_pred(pc, address, target_index)
         return hit
 
-class FollowerRobustAlgorithm(PredictAlgorithm):
+class FollowerRobust(PredictAlgorithm):
     """
     F&R Algorithm
+
+    Parameters:
+
+    - a
+
+    - lazy_evictor_type
 
     Designed by Karim Abdel Sadek and Marek Elias. 2024. Algorithms for Caching and MTS with reduced number of predictions.
     https://arxiv.org/abs/2404.06280
@@ -337,17 +348,23 @@ class FollowerRobustAlgorithm(PredictAlgorithm):
             return bb
         return aa
 
-    def __init__(self, associativity, evictor, predictor, a=1, lazy_evictor_type: Union[LRUEvictor, RandEvictor, None] = LRUEvictor):
-        if lazy_evictor_type is not None and not issubclass(lazy_evictor_type, Evictor):
-            raise ValueError('FollowerRobustAlgorithm: Invalid Evictor')
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial], **kwargs):
+        super().__init__(associativity, evictor_type, predictor_type)
+        if not isinstance(self.predictor, StatePredictor):
+            raise ValueError('FollowerRobust: predictor must be a StatePredictor')
 
-        if not isinstance(predictor, CachePredictor):
-            raise ValueError('FollowerRobustAlgorithm: predictor must be a CachePredictor')
-
-        super().__init__(associativity, evictor, predictor)
-        
-        self.lazy_evictor = lazy_evictor_type() if lazy_evictor_type is not None else None
-        self.key_scores = {} if lazy_evictor_type == LRUEvictor else None
+        if 'a' in kwargs:
+            self.a = kwargs['a']
+        else:
+            self.a = 1
+        if 'lazy_evictor_type' in kwargs:
+            if kwargs['lazy_evictor_type'] is None:
+                self.lazy_evictor = None
+            else:
+                self.lazy_evictor = kwargs['lazy_evictor_type']()
+        else:
+            self.lazy_evictor = LRUEvictor()
+        self.key_scores = {} if self.lazy_evictor is not None else None
         self.timestamp = 0
 
         self.remaining_robust_step = 0
@@ -364,13 +381,11 @@ class FollowerRobustAlgorithm(PredictAlgorithm):
         self.unmarked_for_reload = []
         self.marked = []
         self.clean = []
-
-        self.a = a
         self.S = []
         self.W = []
         self.F = []
         if (self.a == 1):
-            self.S, self.W, self.F = FollowerRobustAlgorithm.create_windows(self.S, self.W, self.F, self.associativity, self.a)
+            self.S, self.W, self.F = FollowerRobust.create_windows(self.S, self.W, self.F, self.associativity, self.a)
 
     def online_belady(self):
         cache = []
@@ -390,7 +405,7 @@ class FollowerRobustAlgorithm(PredictAlgorithm):
     def follow_robust(self, pc, address):
         target_index = -1
         # get next state
-        preds = self.predictor.pred_before_evict(self.timestamp, pc, address, self.snapshot()[0])
+        preds = self.predictor.refresh_scores(self.timestamp, pc, address, self.snapshot()[0])
         assert(preds is not None)
         if address in self.sim_cache:
             target_index = self.sim_cache.index(address)
@@ -408,12 +423,12 @@ class FollowerRobustAlgorithm(PredictAlgorithm):
                     if self.pred_gap <= 0:
                         self.preds = preds
                         self.pred_gap = self.a
-                        dd = FollowerRobustAlgorithm.differ(self.cache, self.preds)
+                        dd = FollowerRobust.differ(self.cache, self.preds)
                         target_index = self.sim_cache.index(random.choice(dd))
                     else:
                         target_index = random.choice(range(self.associativity))
                 elif address in self.preds:
-                    dd = FollowerRobustAlgorithm.differ(self.cache, self.preds)
+                    dd = FollowerRobust.differ(self.cache, self.preds)
                     target_index = self.sim_cache.index(random.choice(dd))
                 else:
                     self.follower_cost = 0
@@ -445,10 +460,10 @@ class FollowerRobustAlgorithm(PredictAlgorithm):
                             if (p in self.preds) and (p not in self.sim_cache):
                                 self.unmarked_for_reload.append(p)
                     if address in self.unmarked_for_reload:
-                        dd = FollowerRobustAlgorithm.differ(self.cache, self.preds)
+                        dd = FollowerRobust.differ(self.cache, self.preds)
                         target_index = self.sim_cache.index(random.choice(dd))
                     if address in self.clean:
-                        dd = FollowerRobustAlgorithm.differ(self.cache, self.preds)
+                        dd = FollowerRobust.differ(self.cache, self.preds)
                         target_index = self.sim_cache.index(random.choice(dd))
                 if target_index == -1:
                     # random select unmark
@@ -491,23 +506,39 @@ class FollowerRobustAlgorithm(PredictAlgorithm):
         self.cache[target_index], self.pcs[target_index] = address, pc
         return hit
 
-
-class GuardAlgorithm(PredictAlgorithm):
+class Guard(PredictAlgorithm):
     """
     Guard algorithm
 
+    Parameters:
+    
+    - follow_if_guarded
+
+    - relax_times
+
+    - relax_prob
+
     Our work
     """
-    def __init__(self, associativity, evictor: Evictor, predictor: Predictor, follow_if_guarded=False, relax_times=0, relax_prob=0) -> None:
-        super().__init__(associativity, evictor, predictor)
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial], **kwargs) -> None:
+        super().__init__(associativity, evictor_type, predictor_type)
         self.old_unvisited_set = []
         self.unguarded_set = []
         self.phase_evicted_set = set()
-
-        self.follow_if_guarded = follow_if_guarded
         self.error_times = 0
-        self.relax_times = relax_times
-        self.relax_prob = relax_prob
+
+        if 'follow_if_guarded' in kwargs:
+            self.follow_if_guarded = kwargs['follow_if_guarded']
+        else:
+            self.follow_if_guarded = False
+        if 'relax_times' in kwargs:
+            self.relax_times = kwargs['relax_times']
+        else:
+            self.relax_times = 0
+        if 'relax_prob' in kwargs:
+            self.relax_prob = kwargs['relax_prob']
+        else:
+            self.relax_prob = 0
     
     def access(self, pc, address):
         to_guard = False
@@ -553,6 +584,8 @@ class GuardAlgorithm(PredictAlgorithm):
         self.after_pred(pc, address, target_index)
         return hit
 
+#######################################################################
+
 class CombineAlgorithm(EvictAlgorithm):
     def __init__(self, associativity, candidate_algorithms: List[Union[EvictAlgorithm, partial]], lazy_evictor_type: Union[LRUEvictor, RandEvictor, None] = LRUEvictor):
         if lazy_evictor_type is not None and not issubclass(lazy_evictor_type, Evictor):
@@ -569,8 +602,7 @@ class CombineAlgorithm(EvictAlgorithm):
         for alg_type in candidate_algorithms:
             alg_instance = alg_type(associativity)
             self.candidate_algs.append([alg_instance, 0])
-            alg_class = alg_type.func if hasattr(alg_type, 'func') else alg_type
-            if hasattr(alg_class, 'oracle_access'):
+            if hasattr(alg_instance, 'oracle_access'):
                 self.oracle_algs.append(alg_instance)
 
         if len(self.oracle_algs) != 0:
@@ -757,69 +789,67 @@ class MarkerAlgorithm(EvictAlgorithm):
         self.scores[target_index] = 1
         return hit
 
-#######################################################################
-
-class BeladyAlgorithm(PredictAlgorithm, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True) -> None:
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal))
-
-class FollowBinaryPredictAlgorithm(PredictAlgorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
-
-class PredictiveMarkerBeladyAlgorithm(PredictiveMarker, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal))
-
-class PredictiveMarkerFollowBinaryPredictAlgorithm(PredictiveMarker, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
-
-class LMarkerBeladyAlgorithm(LMarkerAlgorithm, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal))
-
-class LMarkerFollowBinaryPredictAlgorithm(LMarkerAlgorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
-
-class LNonMarkerBeladyAlgorithm(LNonMarkerAlgorithm, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal))
-
-class LNonMarkerFollowBinaryPredictAlgorithm(LNonMarkerAlgorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
-
-class Mark0FollowBinaryPredictAlgorithm(Mark0Algorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
-        super().__init__(associativity, BinaryEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
-
-class MarkAndPredictOracleAlgorithm(MarkAndPredictAlgorithm, OracleAlgorithm, PhasePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, bin_noise_prob=0, lognormal=True):
-        super().__init__(associativity, BinaryEvictor(), OraclePhasePredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal))
-
-class FollowerRobustOracleAlgorithm(FollowerRobustAlgorithm, OracleAlgorithm, CachePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True, a=1, lazy_evictor_type = LRUEvictor):
-        super().__init__(associativity, DummyEvictor(), OracleCachePredictor(associativity, reuse_dis_noise_sigma, lognormal), a, lazy_evictor_type)
-
-class GuardBeladyAlgorithm(GuardAlgorithm, OracleAlgorithm, ReuseDistancePredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True, follow_if_guarded=False, relax_times=0, relax_prob=0):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleReuseDistancePredictor(reuse_dis_noise_sigma, lognormal), follow_if_guarded, relax_times, relax_prob)
-
-class GuardFollowBinaryPredictAlgorithm(GuardAlgorithm, OracleAlgorithm, BinaryPredition):
-    def __init__(self, associativity, reuse_dis_noise_sigma=0, lognormal=True, follow_if_guarded=False, bin_noise_prob=0, relax_times=0, relax_prob=0):
-        super().__init__(associativity, ReuseDistanceEvictor(), OracleBinaryPredictor(associativity, reuse_dis_noise_sigma, bin_noise_prob, lognormal), follow_if_guarded, relax_times, relax_prob)
-
-class GuardParrotAlgorithm(GuardAlgorithm):
-    def __init__(self, associativity, shared_model, follow_if_guarded=False, relax_times=0, relax_prob=0):
-        super().__init__(associativity, MaxEvictor(), ParrotPredictor(shared_model), follow_if_guarded, relax_times, relax_prob)
-
-class ParrotAlgorithm(PredictAlgorithm):
-    def __init__(self, associativity, shared_model):
-        super().__init__(associativity, MaxEvictor(), ParrotPredictor(shared_model))
-
 ####################################################################
+
+class PredictAlgorithmFactory:
+    predictor_evict_dict = {
+        "PLECO": (MaxEvictor, PLECOPredictor),
+        "PLECO-State": (DummyEvictor, PLECOStatePredictor),
+        "POPU": (MaxEvictor, POPUPredictor),
+        "POPU-State": (DummyEvictor, POPUStatePredictor),
+        "Parrot": (MaxEvictor, ParrotPredictor),
+        "OracleDis": (ReuseDistanceEvictor, OracleReuseDistancePredictor),
+        "OracleBin": (BinaryEvictor, OracleBinaryPredictor),
+        "OraclePhase": (BinaryEvictor, OraclePhasePredictor),
+        "OracleState": (DummyEvictor, OracleStatePredictor),
+    }
+
+    @staticmethod
+    def generate_predictive_algorithm(alg_type: Union[Type[PredictAlgorithm], partial], pred_type_str: str, **kwargs) -> partial:
+        evictor_type, predictor_type = PredictAlgorithmFactory.predictor_evict_dict[pred_type_str]
+        
+        evictor_partial = evictor_type
+        predictor_partial = predictor_type
+        if pred_type_str == 'Parrot':
+            # shared_model
+            if 'shared_model' not in kwargs:
+                raise ValueError('PredictAlgorithmFactory: Parrot need [shared_model]')
+            predictor_partial = partial(predictor_type, shared_model=kwargs['shared_model'])
+        elif pred_type_str.startswith('Oracle'):
+            reuse_dis_noise_sigma = 0
+            lognormal = True
+            if 'reuse_dis_noise_sigma' in kwargs:
+                reuse_dis_noise_sigma = kwargs['reuse_dis_noise_sigma']
+            if 'lognormal' in kwargs:
+                lognormal = kwargs['lognormal']
+
+            if pred_type_str == 'OracleDis':
+                predictor_partial = partial(predictor_type, reuse_dis_noise_sigma=reuse_dis_noise_sigma, lognormal=lognormal)
+            else:
+                if 'associativity' not in kwargs:
+                    raise ValueError(f'PredictAlgorithmFactory: {pred_type_str} need [associativity]')
+                associativity = kwargs['associativity']
+                if pred_type_str == 'OracleState':
+                    predictor_partial = partial(predictor_type, associativity=associativity, reuse_dis_noise_sigma=reuse_dis_noise_sigma, lognormal=lognormal)
+                else:
+                    bin_noise_prob = 0
+                    if 'bin_noise_prob' in kwargs:
+                        bin_noise_prob = kwargs['bin_noise_prob']
+                    predictor_partial = partial(predictor_type, associativity=associativity, bin_noise_prob=bin_noise_prob, reuse_dis_noise_sigma=reuse_dis_noise_sigma, lognormal=lognormal)
+        elif pred_type_str.endswith('State'):
+            if 'associativity' not in kwargs:
+                raise ValueError(f'PredictAlgorithmFactory: {pred_type_str} need [associativity]')
+            associativity = kwargs['associativity']
+            predictor_partial = partial(predictor_type, associativity=associativity)
+
+        if isinstance(alg_type, partial):
+            this_partial = copy.deepcopy(alg_type)
+            this_partial.keywords['evictor_type'] = evictor_partial
+            this_partial.keywords['predictor_type'] = predictor_partial
+            return this_partial
+        else:
+            return partial(alg_type, evictor_type=evictor_partial, predictor_type=predictor_partial)
+
 def format_guard(relax_times, relax_prob):
     if relax_times == 0 and relax_prob == 0:
         return "-no-relax"
@@ -844,7 +874,7 @@ def pretty_print(callable: Union[EvictAlgorithm, partial], verbose=False) -> str
     this_cls = callable
     if hasattr(callable, 'func'):
         this_cls = callable.func
-    this_cls_name = this_cls.__name__.replace("Algorithm", '').replace("FollowBinaryPredict", 'FBP').replace("MarkAndPredict", "Mark&Predict")
+    this_cls_name = this_cls.__name__.replace("Algorithm", '').replace("CombineDeterministic", 'CombDet').replace('CombineRandomAlgorithm', 'CombRand').replace("MarkAndPredict", "Mark&Predict").replace('PredictiveMarker', 'PredMark')
     metadata = this_cls_name
     if hasattr(callable, 'keywords'):
         kw = callable.keywords
@@ -854,7 +884,25 @@ def pretty_print(callable: Union[EvictAlgorithm, partial], verbose=False) -> str
             for alg in algs:
                 alg_names.append(pretty_print(alg, verbose))
             metadata += ("[" + (", ".join(alg_names)) + "]")
-        if issubclass(this_cls, GuardAlgorithm):
+        
+        if 'predictor_type' in kw:
+            predictor_type = kw['predictor_type']
+            pred_kw = {}
+            if hasattr(predictor_type, 'func'):
+                pred_kw = predictor_type.keywords
+                predictor_type = predictor_type.func
+            predictor = predictor_type.__name__.replace("Predictor", '').replace('OracleReuseDistance', 'Belady').replace('OracleBinary', 'FBP')
+            metadata += f'[{predictor}]'
+
+            if issubclass(predictor_type, OraclePredictor) and verbose:
+                reuse_dis_noise_sigma = bin_noise_prob = 0
+                if 'reuse_dis_noise_sigma' in pred_kw:
+                    reuse_dis_noise_sigma = pred_kw['reuse_dis_noise_sigma']
+                if 'bin_noise_prob' in pred_kw:
+                    bin_noise_prob = pred_kw['bin_noise_prob']
+                metadata += format_oracle(reuse_dis_noise_sigma, bin_noise_prob) 
+
+        if issubclass(this_cls, Guard):
             follow_if_guarded = False
             relax_times = relax_prob = 0
             if 'follow_if_guarded' in kw:
@@ -868,13 +916,5 @@ def pretty_print(callable: Union[EvictAlgorithm, partial], verbose=False) -> str
             if 'relax_prob' in kw:
                 relax_prob = kw['relax_prob']
             metadata += format_guard(relax_times, relax_prob)
-
-        if issubclass(this_cls, OracleAlgorithm) and verbose:
-            reuse_dis_noise_sigma = bin_noise_prob = 0
-            if 'reuse_dis_noise_sigma' in kw:
-                reuse_dis_noise_sigma = kw['reuse_dis_noise_sigma']
-            if 'bin_noise_prob' in kw:
-                bin_noise_prob = kw['bin_noise_prob']
-            metadata += format_oracle(reuse_dis_noise_sigma, bin_noise_prob) 
-    
+            
     return metadata

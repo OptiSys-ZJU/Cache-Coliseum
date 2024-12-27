@@ -1,4 +1,6 @@
 from cache.evict import EvictAlgorithm
+from cache.evict.algorithms import PredictAlgorithm
+from cache.evict.predictor import OraclePredictor
 from cache.hash import HashFunction
 from data_trace.data_trace import OracleDataTrace
 from utils.aligner import Aligner
@@ -24,8 +26,6 @@ class Cache:
                 ("Cache capacity ({}) must be an even multiple of "
                 "cache_line_size ({}) and associativity ({})").format(
                     cache_capacity, cache_line_size, associativity))
-        if not is_pow_of_two(num_sets):
-            raise ValueError("Number of cache sets ({}) must be a power of two.".format(num_sets))
         if num_sets == 0:
             raise ValueError(
                 ("Cache capacity ({}) is not great enough for {} cache lines per set "
