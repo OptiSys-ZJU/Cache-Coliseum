@@ -19,3 +19,30 @@ class ShiftHashFunction(HashFunction):
     
     def get_bucket_index(self, aligned_address):
         return aligned_address & ((1 << self._set_bits) - 1)
+
+
+class BrightKiteHashFunction(HashFunction):
+    def __init__(self, num_buckets):
+        if num_buckets != 100:
+            raise ValueError("BrightKiteHashFunction: num_buckets must be 100")
+        super().__init__(num_buckets)
+    
+    def get_bucket_index(self, aligned_address):
+        bucket_index, data = aligned_address.split('_')
+        bucket_index = int(bucket_index)
+        if bucket_index < 0 or bucket_index > 100:
+            raise ValueError("BrightKiteHashFunction: Invalid data")
+        return int(bucket_index)
+
+class CitiHashFunction(HashFunction):
+    def __init__(self, num_buckets):
+        if num_buckets != 12:
+            raise ValueError("CitiHashFunction: num_buckets must be 12")
+        super().__init__(num_buckets)
+    
+    def get_bucket_index(self, aligned_address):
+        bucket_index, data = aligned_address.split('_')
+        bucket_index = int(bucket_index)
+        if bucket_index < 0 or bucket_index > 12:
+            raise ValueError("CitiHashFunction: Invalid data")
+        return int(bucket_index)
