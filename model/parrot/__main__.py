@@ -32,22 +32,21 @@ if __name__ == '__main__':
     align_type = ShiftAligner
     hash_type = ShiftHashFunction
 #################################################################################################
-    total_steps = 1e6
+    total_steps = 120000
 
     lr = 0.001
 
     batch_size = 32
     collection_multiplier = 5
     
-    dagger_init = 0.0
-    dagger_final = 1.0
+    dagger_init = 1
+    dagger_final = 1
     dagger_steps = 200000
-    dagger_update_freq = 10000
+    dagger_update_freq = 50000
     
     exp_root_dir = 'tmp'
-    eval_freq = 40000
-    save_freq = 20000
-    tb_freq = 100
+    eval_freq = 5000
+    save_freq = 5000
 
     res_dir = os.path.join(exp_root_dir, args.dataset)
     if not os.path.exists(res_dir):
@@ -68,8 +67,8 @@ if __name__ == '__main__':
     optimizer = torch.optim.Adam(parrot_model._model.parameters(), lr=lr)
 #################################################################################################
     evict_type = partial(CombineWeightsAlgorithm, 
-                         candidate_algorithms=[BeladyAlgorithm, 
-                                               partial(ParrotAlgorithm, shared_model=parrot_model)], 
+                         candidate_algorithms=[PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'OracleDis'), 
+                                               PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_model)], 
                          weights=[1, 0], lazy_evictor_type=None)
     
     def get_model_prob(get_step_lambda):
@@ -127,7 +126,7 @@ if __name__ == '__main__':
                 for batch_num, batch in enumerate(utils.as_batches([train_data], batch_size, model_config.get("sequence_length"))):
                     if step % eval_freq == 0 and step != 0:
                         eval_data, eval_hit_rate = next(generate_snapshots(valid_file_path, None, lambda:1))
-                        postfix_dict['eval_hit_rate'] = eval_hit_rate
+                        postfix_dict['eval_now_hit_rate'] = eval_hit_rate
                     
                     if step % save_freq == 0 and step != 0:
                         save_path = os.path.join(res_dir, f"{step}_{eval_hit_rate}.ckpt")

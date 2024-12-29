@@ -21,6 +21,7 @@ if __name__ == "__main__":
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument('--oracle', action='store_true')
     mode_group.add_argument('--real', action='store_true')
+    # mode_group.add_argument('--boost', action='store_true')
 
     parser.add_argument("--noise_type", type=str, default='logdis', choices=['dis', 'bin', 'logdis'])
     parser.add_argument("--output_root_dir", type=str, default='res')
@@ -74,42 +75,56 @@ if __name__ == "__main__":
     if args.real:
         verbose = True
 
-        parrot_gen = lambda : ParrotModel.from_config("tmp/model_config.json", 'tmp/xalanc/250000.ckpt')
+        parrot_gen = lambda : ParrotModel.from_config("tmp/model_config.json", f'tmp/{args.dataset}/best.ckpt')
 
         online_types.extend([
-            # predictive_algorithm_generator(PredictAlgorithm, 'PARROT', parrot_gen()),
-            # predictive_algorithm_generator(partial(GuardAlgorithm, follow_if_guarded=False, relax_times=0, relax_prob=0), 'PARROT', parrot_gen()),
-            # predictive_algorithm_generator(partial(GuardAlgorithm, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PARROT', parrot_gen()),
-            PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'PLECO'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'PLECO'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'PLECO'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(FollowerRobust, 'PLECO-State', associativity=associativity),
-            PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'PLECO'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PLECO'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'POPU'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'POPU'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'POPU'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(FollowerRobust, 'POPU-State', associativity=associativity),
-            PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'POPU'),
-            PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'POPU'),
+            PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()),
+            PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'Parrot', shared_model=parrot_gen()),
+            PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'Parrot', shared_model=parrot_gen()),
+            PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'Parrot', shared_model=parrot_gen()),
+            PredictAlgorithmFactory.generate_predictive_algorithm(FollowerRobust, 'Parrot-State', associativity=associativity, shared_model=parrot_gen()),
+            PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'Parrot', shared_model=parrot_gen()),
+            PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'Parrot', shared_model=parrot_gen()),
+            
+            # PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'PLECO'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'PLECO'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'PLECO'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(FollowerRobust, 'PLECO-State', associativity=associativity),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'PLECO'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PLECO'),
+
+            # PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'POPU'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'POPU'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'POPU'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(FollowerRobust, 'POPU-State', associativity=associativity),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'POPU'),
+            # PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'POPU'),
         ])
 
         for online_type in online_types:
             register_func(online_type, 0)
 
         oracle_types = [
-            (PredictAlgorithm, "OracleDis")
+            # (PredictAlgorithm, "OracleDis")
         ]
 
         for oracle_type, pred_type_str in oracle_types:
             register_func(PredictAlgorithmFactory.generate_predictive_algorithm(oracle_type, pred_type_str), 0)
 
         combiner_types = [
-            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [predictive_algorithm_generator(PredictAlgorithm, 'PARROT', parrot_gen()), MarkerAlgorithm]),
-            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), MarkerAlgorithm]),
-            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), MarkerAlgorithm]),
+            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), LRUAlgorithm]),
+            (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), LRUAlgorithm]),
+
+            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), LRUAlgorithm]),
+            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), LRUAlgorithm]),
+            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), LRUAlgorithm]),
+            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), LRUAlgorithm]),
+
+
+            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), MarkerAlgorithm]),
+            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), MarkerAlgorithm]),
         ]
 
         for combiner, algs in combiner_types:
@@ -124,7 +139,8 @@ if __name__ == "__main__":
         for online_type in online_types:
             register_func(online_type, 0)
 
-        oracle_dis_noise_mask = [0, 10, 20, 50, 100, 1000, 10000, 100000]
+        oracle_logdis_noise_mask = [0, 10, 20, 50, 100]
+        oracle_dis_noise_mask = [0, 100, 200, 500, 1000, 2000, 5000, 10000]
         oracle_bin_noise_mask = [0, 0.1, 0.2, 0.5, 0.8, 1]
 
         oracle_types = [
@@ -136,10 +152,10 @@ if __name__ == "__main__":
             (LNonMarker, 'OracleDis'),
             (Mark0, 'OracleBin'),
             (MarkAndPredict, 'OraclePhase'),
-            # (FollowerRobust, 'OracleState'),
+            (FollowerRobust, 'OracleState'),
 
-            (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleDis'),
-            (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleDis'),
+            # (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleDis'),
+            # (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleDis'),
             (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleBin'),
             (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleBin'),
         ]
@@ -149,7 +165,7 @@ if __name__ == "__main__":
                 for noise in oracle_dis_noise_mask:
                     register_func(PredictAlgorithmFactory.generate_predictive_algorithm(oracle_type, pred_type_str, reuse_dis_noise_sigma=noise, lognormal=False, associativity=associativity), noise)
             elif noise_type == 'logdis':
-                for noise in oracle_dis_noise_mask:
+                for noise in oracle_logdis_noise_mask:
                     register_func(PredictAlgorithmFactory.generate_predictive_algorithm(oracle_type, pred_type_str, reuse_dis_noise_sigma=noise, lognormal=True, associativity=associativity), noise)
             elif noise_type == 'bin':
                 if pred_type_str == 'OracleBin' or pred_type_str == 'OraclePhase':
@@ -159,14 +175,14 @@ if __name__ == "__main__":
                 raise ValueError('Invalid noise type')
 
         combiner_types = [
-            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictiveMarker, 'OracleDis'), LRUAlgorithm]),
-            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
-            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictiveMarker, 'OracleDis'), MarkerAlgorithm]),
-            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), MarkerAlgorithm]),
-            (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictiveMarker, 'OracleDis'), LRUAlgorithm]),
-            (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
-            (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictiveMarker, 'OracleDis'), MarkerAlgorithm]),
-            (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), MarkerAlgorithm]),
+            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), LRUAlgorithm]),
+            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
+            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), MarkerAlgorithm]),
+            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), MarkerAlgorithm]),
+            (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), LRUAlgorithm]),
+            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
+            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), MarkerAlgorithm]),
+            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), MarkerAlgorithm]),
         ]
 
         def mask_combiner(noise):
@@ -195,9 +211,14 @@ if __name__ == "__main__":
         if noise_type == 'bin':
             for noise in oracle_bin_noise_mask:
                 mask_combiner(noise)
-        else:
+        elif noise_type == 'logdis':
+            for noise in oracle_logdis_noise_mask:
+                mask_combiner(noise)
+        elif noise_type == 'dis':
             for noise in oracle_dis_noise_mask:
                 mask_combiner(noise)
+        else:
+            raise ValueError('Invalid noise type')
 
 ###############################################################
     cache_dict = {}
@@ -243,7 +264,7 @@ if __name__ == "__main__":
         if noise_type == 'dis':
             table.field_names = ["Name"] + [f'Dis-{noise}' for noise in oracle_dis_noise_mask]
         elif noise_type == 'logdis':
-            table.field_names = ["Name"] + [f'LogDis-{noise}' for noise in oracle_dis_noise_mask]
+            table.field_names = ["Name"] + [f'LogDis-{noise}' for noise in oracle_logdis_noise_mask]
         elif noise_type == 'bin':
             table.field_names = ["Name"] + [f'Bin-{noise}' for noise in oracle_bin_noise_mask]
         for pretty_name in cache_dict:
@@ -261,7 +282,7 @@ if __name__ == "__main__":
     res_dir = os.path.join(args.output_root_dir, args.dataset)
     if not os.path.exists(res_dir):
         os.makedirs(res_dir)
-    if args.noise_type is None:
+    if args.real:
         with open(os.path.join(res_dir, "real.csv"), "w", encoding="utf-8") as file:
             file.write(table.get_csv_string())
     else:
