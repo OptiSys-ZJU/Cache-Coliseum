@@ -5,3 +5,4 @@ a.txt
 *.ckpt
 *.gz
 res*/
+final/

@@ -686,6 +686,7 @@ class CombineRandomAlgorithm(CombineAlgorithm):
         self.beta = beta
         self.n = len(self.candidate_algs)
         self.weights = [1] * self.n
+        self.probs = [1/self.n] * self.n
     
     def __trigger_miss__(self, i, key):
         self.weights[i] *= self.beta
@@ -693,9 +694,22 @@ class CombineRandomAlgorithm(CombineAlgorithm):
     def __trigger_elect_center__(self):
         W = sum(self.weights)
         threshold = self.alpha * W / self.n
-        valid_index, valid_weights = zip(*[(i, weight) for i, weight in enumerate(self.weights) if weight > threshold])
-        if valid_weights:
-            self.center = random.choices(valid_index, weights=valid_weights)[0]
+        new_probs = [w / W for w in self.weights]
+        if new_probs[self.center] < self.probs[self.center]:
+            threshold = 1 - new_probs[self.center] / self.probs[self.center]
+            if random.random() > threshold:
+                self.center = self.center
+            else:
+                index = list(range(self.n))
+                index.remove(self.center)
+                probs = copy.deepcopy(new_probs)
+                probs.pop(self.center)
+                self.center = random.choices(index, weights=probs)[0]
+        self.probs = new_probs
+
+        # valid_index, valid_weights = zip(*[(i, weight) for i, weight in enumerate(self.weights) if weight > threshold])
+        # if valid_weights:
+        #     self.center = random.choices(valid_index, weights=valid_weights)[0]
 
 class CombineWeightsAlgorithm(CombineAlgorithm):
     """
@@ -798,6 +812,7 @@ class PredictAlgorithmFactory:
         "POPU": (MaxEvictor, POPUPredictor),
         "POPU-State": (DummyEvictor, POPUStatePredictor),
         "Parrot": (MaxEvictor, ParrotPredictor),
+        "Parrot-State": (DummyEvictor, ParrotStatePredictor),
         "OracleDis": (ReuseDistanceEvictor, OracleReuseDistancePredictor),
         "OracleBin": (BinaryEvictor, OracleBinaryPredictor),
         "OraclePhase": (BinaryEvictor, OraclePhasePredictor),
@@ -810,11 +825,18 @@ class PredictAlgorithmFactory:
         
         evictor_partial = evictor_type
         predictor_partial = predictor_type
-        if pred_type_str == 'Parrot':
+        if pred_type_str == 'Parrot' or pred_type_str == 'Parrot-State':
             # shared_model
             if 'shared_model' not in kwargs:
                 raise ValueError('PredictAlgorithmFactory: Parrot need [shared_model]')
-            predictor_partial = partial(predictor_type, shared_model=kwargs['shared_model'])
+            
+            if pred_type_str == 'Parrot-State':
+                if 'associativity' not in kwargs:
+                    raise ValueError(f'PredictAlgorithmFactory: {pred_type_str} need [associativity]')
+                associativity = kwargs['associativity']
+                predictor_partial = partial(predictor_type, shared_model=kwargs['shared_model'], associativity=associativity)
+            else:
+                predictor_partial = partial(predictor_type, shared_model=kwargs['shared_model']) 
         elif pred_type_str.startswith('Oracle'):
             reuse_dis_noise_sigma = 0
             lognormal = True

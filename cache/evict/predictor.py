@@ -207,8 +207,24 @@ class SimulateCache:
         # Evict max reuse dis
         self.sim_evictor = MaxEvictor()
         self.sim_scores = [np.inf] * associativity
+        self.timestamp = 0
+    
+    def snapshot(self):
+        return (list(zip(self.sim_cache, self.sim_pcs)), self.sim_scores)
+    
+    def before_pred(self, pc, address):
+        preds = self.reuse_dis_predictor.refresh_scores(self.timestamp, pc, address, self.snapshot()[0])
+        if preds is not None:
+            self.sim_scores = preds
+    
+    def after_pred(self, pc ,address, target_index):
+        pred = self.reuse_dis_predictor.predict_score(self.timestamp, pc, address, self.snapshot()[0])
+        if pred is not None:
+            self.sim_scores[target_index] = pred
+        self.timestamp += 1
     
     def access(self, pc, address):
+        self.before_pred(pc, address)
         if address in self.sim_cache:
             target_index = self.sim_cache.index(address)
         elif None in self.sim_cache:
@@ -216,6 +232,7 @@ class SimulateCache:
         else:
             target_index = self.sim_evictor.evict(list(enumerate(self.sim_scores)))
         self.sim_cache[target_index], self.sim_pcs[target_index] = address, pc
+        self.after_pred(pc, address, target_index)
 
 class HybridStatePredictor(SimulateCache, StatePredictor):
     def __init__(self, associativity, reuse_dis_predictor):
@@ -229,6 +246,9 @@ class ParrotPredictor(ReuseDistancePredictor):
     def __init__(self, shared_model):
         self._model = shared_model
 
+    def predict_score(self, ts, pc, address, cache_state):
+        return None
+
     def refresh_scores(self, ts, pc, address, cache_state: Tuple[List, List]) -> List[Union[int, float, str]]:
         cache_access = SimpleNamespace()
         cache_access.pc = pc
@@ -236,6 +256,10 @@ class ParrotPredictor(ReuseDistancePredictor):
         cache_access.cache_lines = cache_state
         scores = self._model(cache_access)
         return [scores[0, i].item() for i in range(len(cache_state))]
+
+class ParrotStatePredictor(HybridStatePredictor):
+    def __init__(self, associativity, shared_model):
+        super().__init__(associativity, ParrotPredictor(shared_model))
 
 class PLECOPredictor(ReuseDistancePredictor):
     def __init__(self):
