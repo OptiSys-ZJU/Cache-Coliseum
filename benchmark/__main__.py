@@ -1,8 +1,8 @@
 from data_trace.data_trace import DataTrace
-from model.models import ParrotModel
+from model.models import ParrotModel, LightGBMModel
 from model import device_manager
 from utils.aligner import ShiftAligner, NormalAligner
-from cache.cache import Cache
+from cache.cache import Cache, BoostCache
 from cache.evict import *
 from cache.hash import ShiftHashFunction, BrightKiteHashFunction, CitiHashFunction
 from functools import partial
@@ -12,21 +12,39 @@ import tqdm
 import copy
 import argparse
 import os
+import pickle
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default='xalanc')
+    parser.add_argument("--test_all", action='store_true')
+
     parser.add_argument("--device", type=str, default='cpu')
 
     mode_group = parser.add_mutually_exclusive_group(required=True)
     mode_group.add_argument('--oracle', action='store_true')
     mode_group.add_argument('--real', action='store_true')
-    # mode_group.add_argument('--boost', action='store_true')
+
+    parser.add_argument('--pred', nargs='+', default='none', choices=['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm', 'oracle_bin', 'oracle_dis'])
 
     parser.add_argument("--noise_type", type=str, default='logdis', choices=['dis', 'bin', 'logdis'])
+
+    parser.add_argument("--dump_file", action='store_true')
     parser.add_argument("--output_root_dir", type=str, default='res')
+
+    parser.add_argument("--boost", action='store_true')
+    parser.add_argument("--boost_fr", action='store_true')
+    parser.add_argument("--boost_preds_dir", type=str, default='boost_traces')
+
+    parser.add_argument("--model_fraction", type=str, default='1')
+    parser.add_argument("--checkpoints_root_dir", type=str, default='checkpoints')
+    parser.add_argument("--parrot_config_path", type=str, default='checkpoints/parrot/model_config.json')
+
     args = parser.parse_args()
-    file_path = f'traces/{args.dataset}_test.csv'
+    file_path = f'traces/{args.dataset}/{args.dataset}_test.csv'
+    if args.test_all:
+        if args.dataset == 'brightkite' or args.dataset == 'citi':
+            file_path = f'traces/{args.dataset}/{args.dataset}_all.csv'
     if args.dataset == 'brightkite':
         cache_line_size = 1
         capacity = 1000
@@ -46,7 +64,62 @@ if __name__ == "__main__":
         align_type = ShiftAligner
         hash_type = ShiftHashFunction
 
-    print('Use Trace:', file_path)
+
+    this_preds = []
+    real_predictors_type = ['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm']
+    oracle_predictors_type = ['oracle_bin', 'oracle_dis']
+    input_preds = args.pred
+    if 'none' in input_preds:
+        if args.real:
+            this_preds = real_predictors_type
+        else:
+            this_preds = oracle_predictors_type
+    else:
+        this_preds = input_preds
+    
+    ###########################################################
+    parrot_gen = gbm_gen = None
+    ckpt_root_dir = args.checkpoints_root_dir
+    if 'parrot' in this_preds:
+        this_dir = os.path.join(ckpt_root_dir, 'parrot', args.dataset, args.model_fraction)
+        if not os.path.exists(this_dir):
+            raise ValueError(f'Benchmark: {this_dir} not found checkpoints')
+        this_ckpt_path = os.path.join(this_dir, f'{args.dataset}_{args.model_fraction}.ckpt')
+        if not os.path.exists(this_ckpt_path):
+            raise ValueError(f'Benchmark: {this_ckpt_path} not found checkpoints')
+        print('Parrot Model Checkpoint:', this_ckpt_path)
+        print('Parrot Model Fraction:', args.model_fraction)
+        print('Parrot Model Config Path:', args.parrot_config_path)
+        parrot_gen = lambda : ParrotModel.from_config(args.parrot_config_path, this_ckpt_path)
+    if 'gbm' in this_preds:
+        this_dir = os.path.join(ckpt_root_dir, 'lightgbm', args.dataset, args.model_fraction)
+        if not os.path.exists(this_dir):
+            raise ValueError(f'Benchmark: {this_dir} not found checkpoints')
+        this_ckpt_path = os.path.join(this_dir, f'{args.dataset}_{args.model_fraction}.txt')
+        if not os.path.exists(this_ckpt_path):
+            raise ValueError(f'Benchmark: {this_ckpt_path} not found checkpoints')
+        print('LightGBM Model Checkpoint:', this_ckpt_path)
+        print('LightGBM Model Fraction:', args.model_fraction)
+
+        threshold = 0.5
+        threshold_path = os.path.join(this_dir, 'threshold')
+        if os.path.exists(threshold_path):
+            with open(threshold_path, "r") as file:
+                content = file.read().strip()
+                threshold = float(content)
+        print('LightGBM Model Threshold:', threshold)
+        gbm_gen = lambda : LightGBMModel.from_config(this_ckpt_path, threshold)
+    
+    print("Benchmark: Use Predictor:", this_preds)
+    print('Benchmark: Use Trace:', file_path)
+    if args.dump_file:
+        print('Benchmark: Output Path:', args.output_root_dir)
+    else:
+        print('Benchmark: Only print')
+    if args.boost:
+        print('Benchmark: Use Boost Prediction')
+    if args.boost_fr:
+        print('Benchmark: Enable F&R Boost')
     device = args.device
     device_manager.set_device(device)
 
@@ -72,37 +145,139 @@ if __name__ == "__main__":
     
     register_func(PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'OracleDis'), 0, True)
 
+    combiner_types = []
+
+    boost_preds_dict = {}
+
+    if not os.path.exists(args.boost_preds_dir):
+        os.makedirs(args.boost_preds_dir)
+    def boost_generate_prediction(pred_type, **kwargs):
+        pred_algorithm = PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, pred_type, **kwargs)
+
+        if args.test_all and (args.dataset == 'brightkite' or args.dataset == 'citi'):
+            pred_pickle_path = os.path.join(args.boost_preds_dir, f'{args.dataset}_all_{pred_type}_{args.model_fraction}.pkl')
+        else:
+            pred_pickle_path = os.path.join(args.boost_preds_dir, f'{args.dataset}_{pred_type}_{args.model_fraction}.pkl')
+        if not os.path.exists(pred_pickle_path):
+            print(f'Boost Prediction: Generating Prediction for {pred_type}, Path: {pred_pickle_path}')
+            if pred_type.endswith('State'):
+                is_state = True
+            else:
+                is_state = False
+            boost_cache = BoostCache(is_state, file_path, align_type, pred_algorithm, hash_type, cache_line_size, capacity, associativity)
+            with DataTrace(file_path) as trace:
+                with tqdm.tqdm(desc="Producing cache on Boost Prediction") as pbar:
+                    while not trace.done():
+                        pc, address = trace.next()
+                        boost_cache.simulate(pc, address)
+                        pbar.update(1) 
+            lst = boost_cache.get_boost_preds()
+            with open(pred_pickle_path, 'wb') as f:
+                pickle.dump(lst, f)
+            return lst
+        else:
+            print(f'Boost Prediction: Find boost prediction for {pred_type}, Path: {pred_pickle_path}')
+            with open(pred_pickle_path, 'rb') as f:
+                lst = pickle.load(f)
+                return lst
+
     if args.real:
         verbose = True
 
-        parrot_gen = lambda : ParrotModel.from_config("tmp/model_config.json", f'tmp/{args.dataset}/best.ckpt')
+        ##########################################
+        if 'parrot' in this_preds:
+            if args.boost:
+                boost_preds_dict['Parrot'] = boost_generate_prediction('Parrot', shared_model=parrot_gen())
+                boost_preds_dict['Parrot-State'] = boost_generate_prediction('Parrot-State', associativity=associativity, shared_model=parrot_gen())
 
-        online_types.extend([
-            PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()),
-            PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'Parrot', shared_model=parrot_gen()),
-            PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'Parrot', shared_model=parrot_gen()),
-            PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'Parrot', shared_model=parrot_gen()),
-            PredictAlgorithmFactory.generate_predictive_algorithm(FollowerRobust, 'Parrot-State', associativity=associativity, shared_model=parrot_gen()),
-            PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'Parrot', shared_model=parrot_gen()),
-            PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'Parrot', shared_model=parrot_gen()),
-            
-            # PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'PLECO'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'PLECO'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'PLECO'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(FollowerRobust, 'PLECO-State', associativity=associativity),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'PLECO'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PLECO'),
+            online_types.extend([
+                PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()),
+                PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'Parrot', shared_model=parrot_gen()),
+                PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'Parrot', shared_model=parrot_gen()),
+                PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'Parrot', shared_model=parrot_gen()),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(FollowerRobust, boost=args.boost_fr), 'Parrot-State', associativity=associativity, shared_model=parrot_gen()),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'Parrot', shared_model=parrot_gen()),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'Parrot', shared_model=parrot_gen()),
+            ])
+            combiner_types.extend([
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), LRUAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), LRUAlgorithm]),
+            ])
 
-            # PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'POPU'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'POPU'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'POPU'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(FollowerRobust, 'POPU-State', associativity=associativity),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'POPU'),
-            # PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'POPU'),
-        ])
 
+        ##########################################
+        if 'pleco' in this_preds:
+            if args.boost:
+                boost_preds_dict['PLECO'] = boost_generate_prediction('PLECO')
+                boost_preds_dict['PLECO-State'] = boost_generate_prediction('PLECO-State', associativity=associativity)
+
+            online_types.extend([
+                PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'PLECO'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'PLECO'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'PLECO'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(FollowerRobust, boost=args.boost_fr), 'PLECO-State', associativity=associativity),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'PLECO'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PLECO'),
+            ])
+            combiner_types.extend([
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), LRUAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), LRUAlgorithm]),
+            ])
+
+        ##########################################
+        if 'popu' in this_preds:
+            if args.boost:
+                boost_preds_dict['POPU'] = boost_generate_prediction('POPU')
+                boost_preds_dict['POPU-State'] = boost_generate_prediction('POPU-State', associativity=associativity)
+
+            online_types.extend([
+                PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(PredictiveMarker, 'POPU'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(LMarker, 'POPU'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'POPU'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(FollowerRobust, boost=args.boost_fr), 'POPU-State', associativity=associativity),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'POPU'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'POPU'),
+            ])
+            combiner_types.extend([
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), LRUAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), LRUAlgorithm]),
+            ])
+        
+        ##########################################
+        if 'pleco-bin' in this_preds:
+            if args.boost:
+                boost_preds_dict['PLECO-Bin'] = boost_generate_prediction('PLECO-Bin', threshold=0.5)
+
+            online_types.extend([
+                PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO-Bin', threshold=0.5),
+                PredictAlgorithmFactory.generate_predictive_algorithm(Mark0, 'PLECO-Bin', threshold=0.5),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'PLECO-Bin', threshold=0.5),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PLECO-Bin', threshold=0.5),
+            ])
+            combiner_types.extend([
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO-Bin', threshold=0.5), LRUAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO-Bin', threshold=0.5), LRUAlgorithm]),
+            ])
+
+        ##########################################
+        if 'gbm' in this_preds:
+            if args.boost:
+                boost_preds_dict['GBM'] = boost_generate_prediction('GBM', shared_model=gbm_gen())
+
+            online_types.extend([
+                PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()),
+                PredictAlgorithmFactory.generate_predictive_algorithm(Mark0, 'GBM', shared_model=gbm_gen()),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'GBM', shared_model=gbm_gen()),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'GBM', shared_model=gbm_gen()),
+            ])
+            combiner_types.extend([
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), LRUAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), LRUAlgorithm]),
+            ])
+
+        ########################################################
         for online_type in online_types:
             register_func(online_type, 0)
 
@@ -113,20 +288,6 @@ if __name__ == "__main__":
         for oracle_type, pred_type_str in oracle_types:
             register_func(PredictAlgorithmFactory.generate_predictive_algorithm(oracle_type, pred_type_str), 0)
 
-        combiner_types = [
-            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), LRUAlgorithm]),
-            (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), LRUAlgorithm]),
-
-            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), LRUAlgorithm]),
-            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), LRUAlgorithm]),
-            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), LRUAlgorithm]),
-            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), LRUAlgorithm]),
-
-
-            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), MarkerAlgorithm]),
-            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), MarkerAlgorithm]),
-        ]
-
         for combiner, algs in combiner_types:
             if len(algs) > 1:
                 this_partial = copy.deepcopy(combiner)
@@ -135,31 +296,46 @@ if __name__ == "__main__":
     else:
         verbose = False
         noise_type = args.noise_type
+        oracle_types = []
+        combiner_types = []
 
         for online_type in online_types:
             register_func(online_type, 0)
 
         oracle_logdis_noise_mask = [0, 10, 20, 50, 100]
         oracle_dis_noise_mask = [0, 100, 200, 500, 1000, 2000, 5000, 10000]
-        oracle_bin_noise_mask = [0, 0.1, 0.2, 0.5, 0.8, 1]
+        oracle_bin_noise_mask = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
 
-        oracle_types = [
-            (PredictAlgorithm, 'OracleDis'),
-            (PredictAlgorithm, 'OracleBin'),
+        if 'oracle_dis' in this_preds:
+            oracle_types.extend([
+                (PredictAlgorithm, 'OracleDis'),
+                (PredictiveMarker, 'OracleDis'),
+                (LMarker, 'OracleDis'),
+                (LNonMarker, 'OracleDis'),
+                (FollowerRobust, 'OracleState'),
+                (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleDis'),
+                (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleDis'),
+            ])
+            combiner_types.extend([
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), LRUAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), LRUAlgorithm]),
+            ])
 
-            (PredictiveMarker, 'OracleDis'),
-            (LMarker, 'OracleDis'),
-            (LNonMarker, 'OracleDis'),
-            (Mark0, 'OracleBin'),
-            (MarkAndPredict, 'OraclePhase'),
-            (FollowerRobust, 'OracleState'),
+        #####################################################
+        if 'oracle_bin' in this_preds:
+            oracle_types.extend([
+                (PredictAlgorithm, 'OracleBin'),
+                (Mark0, 'OracleBin'),
+                (MarkAndPredict, 'OraclePhase'),
+                (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleBin'),
+                (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleBin'),
+            ])
+            combiner_types.extend([
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
+            ])
 
-            # (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleDis'),
-            # (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleDis'),
-            (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleBin'),
-            (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleBin'),
-        ]
-
+        #####################################################
         for oracle_type, pred_type_str in oracle_types:
             if noise_type == 'dis':
                 for noise in oracle_dis_noise_mask:
@@ -173,17 +349,6 @@ if __name__ == "__main__":
                         register_func(PredictAlgorithmFactory.generate_predictive_algorithm(oracle_type, pred_type_str, bin_noise_prob=noise, associativity=associativity), noise)
             else:
                 raise ValueError('Invalid noise type')
-
-        combiner_types = [
-            (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), LRUAlgorithm]),
-            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
-            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), MarkerAlgorithm]),
-            # (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), MarkerAlgorithm]),
-            (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), LRUAlgorithm]),
-            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
-            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), MarkerAlgorithm]),
-            # (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), MarkerAlgorithm]),
-        ]
 
         def mask_combiner(noise):
             for combiner, algs in combiner_types:
@@ -225,17 +390,53 @@ if __name__ == "__main__":
     caches = []
     funcs = [(outer_key, inner_key, value) for outer_key, inner_dict in func_dict.items() for inner_key, value in inner_dict.items()]
 
+    boost_cls_list = {}
+    for name, lst, in boost_preds_dict.items():
+        if name in PredictAlgorithmFactory.predictor_evict_dict:
+            this_cls = PredictAlgorithmFactory.predictor_evict_dict[name][1]
+            boost_cls_list[this_cls] = lst
+
     with tqdm.tqdm(desc="Init caches for benchmark", total=len(funcs)) as pbar:
         def register_cache(pretty_name, noise, cache):
             if pretty_name not in cache_dict:
                 cache_dict[pretty_name] = {}
             cache_dict[pretty_name][noise] = cache
-        
+
+        def judge_pred_type(this_partial):
+            if hasattr(this_partial, 'keywords'):
+                kw = this_partial.keywords
+                if 'predictor_type' in kw:
+                    predictor_type = kw['predictor_type']
+                    pred_cls_type = predictor_type.func if hasattr(predictor_type, 'func') else predictor_type
+                    return pred_cls_type
+            
+            return None
+
+
         for pretty_name, noise, this_partial in funcs:
             cache = Cache(file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
+            if args.boost:
+                pred_cls_type = judge_pred_type(this_partial)
+                if pred_cls_type is not None:
+                    if pred_cls_type in boost_cls_list:
+                        tqdm.tqdm.write(f"Enbale Boost for {pretty_name} --> {pred_cls_type.__name__}")
+                        cache = BoostCache(False, file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
+                        cache.set_boost_preds(copy.deepcopy(boost_cls_list[pred_cls_type]))
+
+                if hasattr(this_partial, 'keywords'):
+                    kw = this_partial.keywords
+                    if 'candidate_algorithms' in kw:
+                        algs = kw['candidate_algorithms']
+                        for alg in algs:
+                            pred_cls_type = judge_pred_type(alg)
+                            if pred_cls_type in boost_cls_list:
+                                tqdm.tqdm.write(f"Enbale Boost for {pretty_name} --> {pred_cls_type.__name__}")
+                                cache = BoostCache(False, file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
+                                cache.set_boost_preds(copy.deepcopy(boost_cls_list[pred_cls_type]))
+                                break
             register_cache(pretty_name, noise, cache)
             caches.append(cache)
-            pbar.update(1)   
+            pbar.update(1)
 
     # np.random.seed(42)
     with DataTrace(file_path) as trace:
@@ -279,14 +480,15 @@ if __name__ == "__main__":
             table.add_row(lst)
 
 
-    res_dir = os.path.join(args.output_root_dir, args.dataset)
-    if not os.path.exists(res_dir):
-        os.makedirs(res_dir)
-    if args.real:
-        with open(os.path.join(res_dir, "real.csv"), "w", encoding="utf-8") as file:
-            file.write(table.get_csv_string())
-    else:
-        with open(os.path.join(res_dir, f"{args.noise_type}.csv"), "w", encoding="utf-8") as file:
-            file.write(table.get_csv_string())
+    if args.dump_file:
+        res_dir = os.path.join(args.output_root_dir, args.dataset, args.model_fraction)
+        if not os.path.exists(res_dir):
+            os.makedirs(res_dir)
+        if args.real:
+            with open(os.path.join(res_dir, f"{'_'.join(this_preds)}.csv"), "w", encoding="utf-8") as file:
+                file.write(table.get_csv_string())
+        else:
+            with open(os.path.join(res_dir, f"{args.noise_type}.csv"), "w", encoding="utf-8") as file:
+                file.write(table.get_csv_string())
     print(table)
             

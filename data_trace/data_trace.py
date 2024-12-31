@@ -23,6 +23,7 @@ import os
 import numpy as np
 import six
 import tqdm
+import hashlib
 
 from utils.aligner import Aligner
 
@@ -94,8 +95,10 @@ class DataTrace(object):
         self._file = open(self._filename, "r")
         filename = os.path.basename(self._filename)
         _, extension = os.path.splitext(self._filename)
-        if filename.startswith('brightkite') or filename.startswith('citi'):
-            self._reader = CSVStringReader(self._file)
+        if filename.startswith('brightkite'):
+            self._reader = CSVHashReader(self._file)
+        elif filename.startswith('citi'):
+            self._reader = CSVIntReader(self._file)
         elif extension == ".csv":
             self._reader = CSVReader(self._file)
         elif extension == ".txt":
@@ -112,7 +115,6 @@ class DataTrace(object):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._file.close()
-
 
 class OracleDataTrace(object):
     """Represents the ordered load calls for some program with a cursor.
@@ -149,6 +151,19 @@ class OracleDataTrace(object):
         # times.
         self._reader_exhausted = False
 
+        basename = os.path.basename(self._filename)
+        if basename.startswith('brightkite') or basename.startswith('citi'):
+            self.enable_pc_align = True
+            print(f"OracleDataTrace: Enable PC align for [{basename}]")
+        else:
+            self.enable_pc_align = False
+
+    def get_key(self, pc, address):
+        if self.enable_pc_align:
+            return f'{pc}_{self._aligner.get_aligned_addr(address)}'
+        else:
+            return self._aligner.get_aligned_addr(address)
+
     def _read_next(self):
         """Adds the next row in the CSV memory trace to the look-ahead buffer.
 
@@ -160,9 +175,8 @@ class OracleDataTrace(object):
         try:
             pc, address = self._reader.next()
             self._look_ahead_buffer.append((pc, address))
-            # Align to cache line
-            self._access_times[self._aligner.get_aligned_addr(address)].append(
-                len(self._look_ahead_buffer) + self._num_next_calls)
+            # Align to cache line            
+            self._access_times[self.get_key(pc, address)].append(len(self._look_ahead_buffer) + self._num_next_calls)
         except StopIteration:
             self._reader_exhausted = True
 
@@ -175,12 +189,12 @@ class OracleDataTrace(object):
         self._num_next_calls += 1
         pc, address = self._look_ahead_buffer.popleft()
         # Align to cache line
-        aligned_address = self._aligner.get_aligned_addr(address)
-        self._access_times[aligned_address].popleft()
+        key = self.get_key(pc, address)
+        self._access_times[key].popleft()
 
         # Memory optimization: discard keys that have no current access times.
-        if not self._access_times[aligned_address]:
-            del self._access_times[aligned_address]
+        if not self._access_times[key]:
+            del self._access_times[key]
 
         self._read_next()
         return pc, address
@@ -189,7 +203,7 @@ class OracleDataTrace(object):
         """True if the cursor points to the end of the trace."""
         return not self._look_ahead_buffer
 
-    def next_abs_access_time_by_aligned_address(self, aligned_address):
+    def next_abs_access_time_by_aligned_address(self, pc, aligned_address):
         """Returns number of accesses from cursor of next access of address.
 
         Args:
@@ -198,12 +212,13 @@ class OracleDataTrace(object):
         Returns:
         access_time (int): np.inf if not accessed within max_look_ahead accesses.
         """
-        accesses = self._access_times[aligned_address]
+        key = self.get_key(pc, aligned_address)
+        accesses = self._access_times[key]
         if not accesses:
             return np.inf
         return accesses[0] - self._num_next_calls
     
-    def next_access_time_by_aligned_address(self, aligned_address):
+    def next_access_time_by_aligned_address(self, pc, aligned_address):
         """Returns number of accesses from cursor of next access of address.
 
         Args:
@@ -212,7 +227,8 @@ class OracleDataTrace(object):
         Returns:
         access_time (int): np.inf if not accessed within max_look_ahead accesses.
         """
-        accesses = self._access_times[aligned_address]
+        key = self.get_key(pc, aligned_address)
+        accesses = self._access_times[key]
         if not accesses:
             return np.inf
 
@@ -222,8 +238,10 @@ class OracleDataTrace(object):
         self._file = open(self._filename, "r")
         filename = os.path.basename(self._filename)
         _, extension = os.path.splitext(self._filename)
-        if filename.startswith('brightkite') or filename.startswith('citi'):
-            self._reader = CSVStringReader(self._file)
+        if filename.startswith('brightkite'):
+            self._reader = CSVHashReader(self._file)
+        elif filename.startswith('citi'):
+            self._reader = CSVIntReader(self._file)
         elif extension == ".csv":
             self._reader = CSVReader(self._file)
         elif extension == ".txt":
@@ -289,15 +307,25 @@ class CSVReader(MemoryTraceReader):
         # Convert hex string to int
         return int(pc, 16), int(address, 16)
 
-class CSVStringReader(MemoryTraceReader):
+class CSVHashReader(MemoryTraceReader):
     def __init__(self, f):
-        super(CSVStringReader, self).__init__(f)
+        super(CSVHashReader, self).__init__(f)
         self._csv_reader = csv.reader(f)
 
     def next(self):
         # Raises StopIteration when CSV reader is eof
         pc, address = next(self._csv_reader)
-        return pc, address.lstrip()
+        return int(pc), int(hashlib.sha256(address.lstrip().encode()).hexdigest(), 16)
+
+class CSVIntReader(MemoryTraceReader):
+    def __init__(self, f):
+        super(CSVIntReader, self).__init__(f)
+        self._csv_reader = csv.reader(f)
+
+    def next(self):
+        # Raises StopIteration when CSV reader is eof
+        pc, address = next(self._csv_reader)
+        return int(pc), int(address)
 
 class TxtReader(MemoryTraceReader):
     """Reads .txt extension memory traces.
@@ -313,7 +341,6 @@ class TxtReader(MemoryTraceReader):
         _, pc, address = line.split()
         # Already in decimal
         return int(pc), int(address)
-
 
 class MemoryTraceWriter(object):
     """Writes a memory trace to file."""

@@ -18,11 +18,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default='xalanc')
     parser.add_argument("--device", type=str, default='cpu')
+    parser.add_argument("--num", type=str, default='1')
     parser.add_argument("--eval", action='store_true')
     args = parser.parse_args()
     device_manager.set_device(args.device)
 
-    train_file_path = f'traces/{args.dataset}_train.csv'
+    train_file_path = f'traces/{args.dataset}_train_{args.num}.csv'
     valid_file_path = f'traces/{args.dataset}_valid.csv'
     test_file_path = f'traces/{args.dataset}_test.csv'
 
@@ -48,7 +49,7 @@ if __name__ == '__main__':
     eval_freq = 5000
     save_freq = 5000
 
-    res_dir = os.path.join(exp_root_dir, args.dataset)
+    res_dir = os.path.join(exp_root_dir, args.dataset, args.num)
     if not os.path.exists(res_dir):
         os.makedirs(res_dir)
 

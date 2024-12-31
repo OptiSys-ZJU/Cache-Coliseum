@@ -6,3 +6,6 @@ a.txt
 *.gz
 res*/
 final/
+boost_traces/
+checkpoints/
+logs/
