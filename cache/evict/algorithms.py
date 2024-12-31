@@ -25,6 +25,9 @@ class EvictAlgorithm(ABC):
     def access(self, pc, address) -> bool:
         pass
 
+    def boost_access(self, pc, address, boost_pred) -> bool:
+        return self.access(pc, address)
+
 class PredictAlgorithm(EvictAlgorithm):
     def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial]) -> None:
         super().__init__(associativity)
@@ -37,6 +40,8 @@ class PredictAlgorithm(EvictAlgorithm):
             self.preds = [0] * associativity
         elif issubclass(cls_type, PhasePredictor):
             self.preds = [1] * associativity
+        elif issubclass(cls_type, StatePredictor):
+            self.preds = [None] * associativity
         else:
             self.preds = None
         
@@ -47,20 +52,38 @@ class PredictAlgorithm(EvictAlgorithm):
         
         self.evictor = evictor_type()
         self.predictor = predictor_type()
-    
+
+        self.cur_boost_pred = None
+        self.cur_boost_type = None
+
     def snapshot(self):
         return (list(zip(self.cache, self.pcs)), self.preds)
     
     def before_pred(self, pc, address):
-        preds = self.predictor.refresh_scores(self.timestamp, pc, address, self.snapshot()[0])
-        if preds is not None:
-            self.preds = preds
+        if self.cur_boost_type is not None and self.cur_boost_type == 'before':
+            self.preds = self.cur_boost_pred
+        else:
+            preds = self.predictor.refresh_scores(self.timestamp, pc, address, self.snapshot()[0])
+            if preds is not None:
+                self.preds = preds
     
     def after_pred(self, pc ,address, target_index):
-        pred = self.predictor.predict_score(self.timestamp, pc, address, self.snapshot()[0])
-        if pred is not None:
-            self.preds[target_index] = pred
+        if self.cur_boost_type is not None and self.cur_boost_type == 'after':
+            self.preds[target_index] = self.cur_boost_pred
+        else:
+            pred = self.predictor.predict_score(self.timestamp, pc, address, self.snapshot()[0])
+            if pred is not None:
+                self.preds[target_index] = pred
         self.timestamp += 1
+    
+    def boost_access(self, pc, address, boost_pred):
+        self.cur_boost_pred = boost_pred
+        if self.cur_boost_type is None:
+            if isinstance(boost_pred, list):
+                self.cur_boost_type = 'before'
+            else:
+                self.cur_boost_type = 'after'
+        return self.access(pc, address)
 
     def access(self, pc, address):
         target_index = -1
@@ -353,6 +376,27 @@ class FollowerRobust(PredictAlgorithm):
         if not isinstance(self.predictor, StatePredictor):
             raise ValueError('FollowerRobust: predictor must be a StatePredictor')
 
+        if 'boost' in kwargs:
+            self.boost = kwargs['boost']
+        else:
+            self.boost = False
+        self.boost_beladys = []
+        self.online_belady_cache = [None] * associativity
+        self.online_belady_dis = [np.inf] * associativity
+        if self.boost:
+            def oracle_access(self, pc, address, next_access_time):
+                if address in self.online_belady_cache:
+                    target_index = self.online_belady_cache.index(address)
+                elif None in self.online_belady_cache:
+                    target_index = self.online_belady_cache.index(None)
+                else:
+                    target_index = self.online_belady_dis.index(max(self.online_belady_dis))
+                
+                self.online_belady_cache[target_index] = address
+                self.online_belady_dis[target_index] = next_access_time
+                self.boost_beladys.append(copy.deepcopy(self.online_belady_cache))
+            self.oracle_access = types.MethodType(oracle_access, self)
+
         if 'a' in kwargs:
             self.a = kwargs['a']
         else:
@@ -365,7 +409,6 @@ class FollowerRobust(PredictAlgorithm):
         else:
             self.lazy_evictor = LRUEvictor()
         self.key_scores = {} if self.lazy_evictor is not None else None
-        self.timestamp = 0
 
         self.remaining_robust_step = 0
         self.follower_cost = 0
@@ -388,24 +431,30 @@ class FollowerRobust(PredictAlgorithm):
             self.S, self.W, self.F = FollowerRobust.create_windows(self.S, self.W, self.F, self.associativity, self.a)
 
     def online_belady(self):
-        cache = []
-        for i, current in enumerate(self.traces):
-            if current in cache:
-                continue
-            if len(cache) < self.associativity:
-                cache.append(current)
-            else:
-                future_uses = {item: self.traces[i + 1:].index(item) if item in self.traces[i + 1:] else float('inf') for item in cache}
-                to_remove = max(future_uses, key=future_uses.get)
-                cache.remove(to_remove)
-                cache.append(current)
-        
-        return cache
+        if self.boost:
+            return self.boost_beladys[self.timestamp]
+        else:
+            cache = []
+            for i, current in enumerate(self.traces):
+                if current in cache:
+                    continue
+                if len(cache) < self.associativity:
+                    cache.append(current)
+                else:
+                    future_uses = {item: self.traces[i + 1:].index(item) if item in self.traces[i + 1:] else float('inf') for item in cache}
+                    to_remove = max(future_uses, key=future_uses.get)
+                    cache.remove(to_remove)
+                    cache.append(current)
+            
+            return cache
     
     def follow_robust(self, pc, address):
         target_index = -1
         # get next state
-        preds = self.predictor.refresh_scores(self.timestamp, pc, address, self.snapshot()[0])
+        if self.cur_boost_type is not None and self.cur_boost_type == 'before':
+            preds = self.cur_boost_pred
+        else:
+            preds = self.predictor.refresh_scores(self.timestamp, pc, address, self.snapshot()[0])
         assert(preds is not None)
         if address in self.sim_cache:
             target_index = self.sim_cache.index(address)
@@ -474,15 +523,19 @@ class FollowerRobust(PredictAlgorithm):
                     target_index = random.choice(unmarked_slots)
         
         self.sim_cache[target_index], self.sim_pcs[target_index] = address, pc
-        self.after_pred(pc, address, target_index)
+
+        if self.cur_boost_type is not None:
+            assert self.cur_boost_type == 'before'
+        else:
+            pred = self.predictor.predict_score(self.timestamp, pc, address, self.snapshot()[0])
+            assert pred is None
+        self.timestamp += 1
         self.pred_gap -= 1
         self.traces.append(address)
     
     def access(self, pc, address):
         if self.key_scores is not None:
             self.key_scores[address] = self.timestamp
-        self.timestamp += 1
-
         self.follow_robust(pc, address)
 
         ## Lazy
@@ -593,6 +646,7 @@ class CombineAlgorithm(EvictAlgorithm):
         
         super().__init__(associativity)
         self.oracle_algs = []
+        self.boost_algs = []
         self.candidate_algs = []
         self.center = 0
         self.timestamp = 0
@@ -604,6 +658,8 @@ class CombineAlgorithm(EvictAlgorithm):
             self.candidate_algs.append([alg_instance, 0])
             if hasattr(alg_instance, 'oracle_access'):
                 self.oracle_algs.append(alg_instance)
+            if hasattr(alg_instance, 'boost_access'):
+                self.boost_algs.append(alg_instance)
 
         if len(self.oracle_algs) != 0:
             def oracle_access(self, pc, address, next_access_time):
@@ -624,6 +680,19 @@ class CombineAlgorithm(EvictAlgorithm):
             self.key_scores[address] = self.timestamp
         self.timestamp += 1
     
+    def __push_candidates_boost__(self, pc, address, boost_pred):
+        for i, (alg, _) in enumerate(self.candidate_algs):
+            if alg in self.boost_algs:
+                hit = alg.boost_access(pc, address, boost_pred)
+            else:
+                hit = alg.access(pc, address)
+            if not hit:
+                self.candidate_algs[i][1] += 1
+                self.__trigger_miss__(i, address)
+        if self.key_scores is not None:
+            self.key_scores[address] = self.timestamp
+        self.timestamp += 1
+    
     def __trigger_miss__(self, i, address):
         pass
 
@@ -631,9 +700,7 @@ class CombineAlgorithm(EvictAlgorithm):
     def __trigger_elect_center__(self):
         pass
 
-    def access(self, pc, address):
-        self.__push_candidates__(pc, address)
-
+    def __process__(self, pc, address):
         target_index = -1
         hit = False
         if address in self.cache:
@@ -655,6 +722,14 @@ class CombineAlgorithm(EvictAlgorithm):
         self.cache[target_index] = address
         self.pcs[target_index] = pc
         return hit
+
+    def boost_access(self, pc, address, boost_pred):
+        self.__push_candidates_boost__(pc, address, boost_pred)
+        return self.__process__(pc, address)
+
+    def access(self, pc, address):
+        self.__push_candidates__(pc, address)
+        return self.__process__(pc, address)
 
 class CombineDeterministicAlgorithm(CombineAlgorithm):
     """
@@ -809,6 +884,8 @@ class PredictAlgorithmFactory:
     predictor_evict_dict = {
         "PLECO": (MaxEvictor, PLECOPredictor),
         "PLECO-State": (DummyEvictor, PLECOStatePredictor),
+        "PLECO-Bin": (BinaryEvictor, PLECOBinPredictor),
+        "GBM": (BinaryEvictor, GBMBinPredictor),
         "POPU": (MaxEvictor, POPUPredictor),
         "POPU-State": (DummyEvictor, POPUStatePredictor),
         "Parrot": (MaxEvictor, ParrotPredictor),
@@ -825,7 +902,7 @@ class PredictAlgorithmFactory:
         
         evictor_partial = evictor_type
         predictor_partial = predictor_type
-        if pred_type_str == 'Parrot' or pred_type_str == 'Parrot-State':
+        if pred_type_str == 'Parrot' or pred_type_str == 'Parrot-State' or pred_type_str == 'GBM':
             # shared_model
             if 'shared_model' not in kwargs:
                 raise ValueError('PredictAlgorithmFactory: Parrot need [shared_model]')
@@ -863,6 +940,11 @@ class PredictAlgorithmFactory:
                 raise ValueError(f'PredictAlgorithmFactory: {pred_type_str} need [associativity]')
             associativity = kwargs['associativity']
             predictor_partial = partial(predictor_type, associativity=associativity)
+        elif pred_type_str == 'PLECO-Bin':
+            if 'threshold' not in kwargs:
+                raise ValueError(f'PredictAlgorithmFactory: {pred_type_str} need [threshold]')
+            threshold = kwargs['threshold']
+            predictor_partial = partial(predictor_type, threshold=threshold)
 
         if isinstance(alg_type, partial):
             this_partial = copy.deepcopy(alg_type)

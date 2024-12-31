@@ -283,6 +283,30 @@ class PLECOPredictor(ReuseDistancePredictor):
 
         return pred
 
+class PLECOBinPredictor(BinaryPredictor):
+    def __init__(self, threshold):
+        super().__init__()
+        self.timestamp = 1
+        self.weights = []
+        self.sum_weights = 0
+        self.prev_occs = {}
+        self.p = False
+        self.threshold = threshold
+    
+    def predict_score(self, ts, pc, address, cache_state):
+        this_weight = (self.timestamp + 10) ** (-1.8) * np.exp(-self.timestamp / 670)
+        self.weights.append(this_weight)
+        self.sum_weights += this_weight
+        if address not in self.prev_occs:
+            self.prev_occs[address] = []
+        self.prev_occs[address].append(self.timestamp)
+        prob = sum(self.weights[self.timestamp - i] for i in self.prev_occs[address]) / self.sum_weights
+        
+        if prob > self.threshold:
+            return 0
+        else:
+            return 1
+
 class PLECOStatePredictor(HybridStatePredictor):
     def __init__(self, associativity):
         super().__init__(associativity, PLECOPredictor())
@@ -305,3 +329,11 @@ class POPUPredictor(ReuseDistancePredictor):
 class POPUStatePredictor(HybridStatePredictor):
     def __init__(self, associativity):
         super().__init__(associativity, POPUPredictor())
+
+class GBMBinPredictor(BinaryPredictor):
+    def __init__(self, shared_model):
+        super().__init__()
+        self._model = shared_model
+    
+    def predict_score(self, ts, pc, address, cache_state):
+        return self._model(pc, address)

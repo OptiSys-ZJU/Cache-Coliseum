@@ -6,12 +6,10 @@ from data_trace.data_trace import OracleDataTrace
 from utils.aligner import Aligner
 from typing import Type
 from types import SimpleNamespace
+import copy
 
 class Cache:
-    def __init__(self, trace_path, aligner_type: Type[Aligner], evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_line_size, cache_capacity, associativity=16):
-        def is_pow_of_two(x):
-            return (x & (x - 1)) == 0
-        
+    def __init__(self, trace_path, aligner_type: Type[Aligner], evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_line_size, cache_capacity, associativity):        
         self.evict_algs = None
         self.hits = 0
         self.miss = 0
@@ -49,12 +47,12 @@ class Cache:
             while not sim_trace.done():
                 pc, address = sim_trace.next()
                 aligned_address = self._aligner.get_aligned_addr(address)
-                self.evict_algs[self.hash_func.get_bucket_index(aligned_address)].oracle_access(pc, aligned_address, sim_trace.next_access_time_by_aligned_address(aligned_address))
+                self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].oracle_access(pc, aligned_address, sim_trace.next_access_time_by_aligned_address(pc, aligned_address))
                 # pbar.update(1)
 
     def access(self, pc, address):
         aligned_address = self._aligner.get_aligned_addr(address)
-        hit = self.evict_algs[self.hash_func.get_bucket_index(aligned_address)].access(pc, aligned_address)
+        hit = self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].access(pc, aligned_address)
         
         if hit:
             self.hits += 1
@@ -65,15 +63,59 @@ class Cache:
     def stat(self):
         return (self.hits, self.miss, self.counts, round(self.hits / self.counts, 4))
 
+class BoostCache(Cache):
+    def __init__(self, is_state, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity):
+        super().__init__(trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity)
+        self.boost_preds = []
+        self.ts = 0
+        self.is_state = is_state
+
+    def get_boost_preds(self):
+        return self.boost_preds
+    
+    def set_boost_preds(self, lst):
+        self.boost_preds = lst
+
+    def access(self, pc, address):
+        pred = self.boost_preds[self.ts]
+        aligned_address = self._aligner.get_aligned_addr(address)
+        hit = self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].boost_access(pc, aligned_address, pred)
+        
+        self.ts += 1
+        if hit:
+            self.hits += 1
+        else:
+            self.miss += 1
+        self.counts += 1
+    
+    def simulate(self, pc, address):
+        aligned_address = self._aligner.get_aligned_addr(address)
+        idx = self.hash_func.get_bucket_index(aligned_address, pc)
+        
+        self.evict_algs[idx].access(pc, aligned_address)
+        this_preds = copy.deepcopy(self.evict_algs[idx].preds)
+        if not self.is_state:
+            target_index = self.evict_algs[idx].cache.index(aligned_address)
+            self.boost_preds.append(this_preds[target_index])
+        else:
+            self.boost_preds.append(copy.deepcopy(this_preds))
 
 
 class TrainingCache(Cache):
-    def __init__(self, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity=16):
+    def __init__(self, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity):
         super().__init__(trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity)
 
     def reset(self, model_prob):
         for alg in self.evict_algs:
             alg.reset([1-model_prob, model_prob])
+    
+    def collect(self, pc, address):
+        aligned_address = self._aligner.get_aligned_addr(address)
+        idx = self.hash_func.get_bucket_index(aligned_address, pc)
+        
+        self.evict_algs[idx].access(pc, aligned_address)
+        target_index = self.evict_algs[idx].cache.index(aligned_address)
+        return self.evict_algs[idx].preds[target_index]
 
     def snapshot(self, pc, address):
         snapshot = SimpleNamespace()
@@ -81,7 +123,7 @@ class TrainingCache(Cache):
         snapshot.address = address
 
         aligned_address = self._aligner.get_aligned_addr(address)
-        idx = self.hash_func.get_bucket_index(aligned_address)
+        idx = self.hash_func.get_bucket_index(aligned_address, pc)
         alg = self.evict_algs[idx]
 
         cache_lines, scores = alg.snapshot()
