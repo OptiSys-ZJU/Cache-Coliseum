@@ -1,9 +1,9 @@
 from data_trace.data_trace import DataTrace
 from model.parrot import utils
-from model.models import ParrotModel
+from model.models import ParrotModel, get_fraction_train_file
 from model import device_manager
-from utils.aligner import ShiftAligner
-from cache.hash import ShiftHashFunction
+from utils.aligner import NormalAligner, ShiftAligner
+from cache.hash import BrightKiteHashFunction, CitiHashFunction, ShiftHashFunction
 from cache.cache import TrainingCache
 from cache.evict import *
 from typing import Callable
@@ -18,41 +18,56 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default='xalanc')
     parser.add_argument("--device", type=str, default='cpu')
-    parser.add_argument("--num", type=str, default='1')
-    parser.add_argument("--eval", action='store_true')
+    parser.add_argument("-f", "--model_fraction", type=str, default='1')
+    parser.add_argument("--checkpoints_root_dir", type=str, default='checkpoints')
+    parser.add_argument("--traces_root_dir", type=str, default='traces')
+    parser.add_argument("--real_test", action='store_true')
     args = parser.parse_args()
     device_manager.set_device(args.device)
 
-    train_file_path = f'traces/{args.dataset}_train_{args.num}.csv'
-    valid_file_path = f'traces/{args.dataset}_valid.csv'
-    test_file_path = f'traces/{args.dataset}_test.csv'
+    traces_dir = os.path.join(args.traces_root_dir, args.dataset)
+    if not os.path.exists(traces_dir):
+        raise ValueError(f'Parrot: {traces_dir} not found')
 
-    cache_line_size = 64
-    capacity = 2097152
-    associativity = 16
-    align_type = ShiftAligner
-    hash_type = ShiftHashFunction
+    train_file_path = get_fraction_train_file(args.traces_root_dir, args.dataset, args.model_fraction)
+    if args.real_test:
+        eval_file_path = os.path.join(traces_dir, f'{args.dataset}_test.csv')
+    else:
+        eval_file_path = os.path.join(traces_dir, f'{args.dataset}_valid.csv')
+
+    if args.dataset == 'brightkite':
+        cache_line_size = 1
+        capacity = 1000
+        associativity = 10
+        align_type = NormalAligner
+        hash_type = BrightKiteHashFunction
+    elif args.dataset == 'citi':
+        cache_line_size = 1
+        capacity = 1200
+        associativity = 100
+        align_type = NormalAligner
+        hash_type = CitiHashFunction
+    else:
+        cache_line_size = 64
+        capacity = 2097152
+        associativity = 16
+        align_type = ShiftAligner
+        hash_type = ShiftHashFunction
 #################################################################################################
-    total_steps = 120000
-
+    total_steps = 20000
     lr = 0.001
-
     batch_size = 32
     collection_multiplier = 5
-    
     dagger_init = 1
     dagger_final = 1
     dagger_steps = 200000
     dagger_update_freq = 50000
-    
-    exp_root_dir = 'tmp'
     eval_freq = 5000
     save_freq = 5000
 
-    res_dir = os.path.join(exp_root_dir, args.dataset, args.num)
-    if not os.path.exists(res_dir):
-        os.makedirs(res_dir)
-
+    checkpoint_dir = os.path.join(args.checkpoints_root_dir, 'parrot', args.dataset, args.model_fraction)
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
 
     # total_steps = 1000
     # batch_size = 8
@@ -61,7 +76,7 @@ if __name__ == '__main__':
     # dagger_update_freq = 5
     # save_freq = 200
 #################################################################################################
-    model_config_path = os.path.join(exp_root_dir, "model_config.json")
+    model_config_path = os.path.join(args.checkpoints_root_dir, 'parrot', "model_config.json")
     with open(model_config_path, "r") as f:
         model_config = json.load(f)
     parrot_model = ParrotModel.from_config(model_config_path, None)
@@ -105,7 +120,7 @@ if __name__ == '__main__':
                         hit_rate = hit_cnt / total_cnt
                     yield data, hit_rate
 
-    oracle_data, oracle_hit_rate = next(generate_snapshots(valid_file_path))
+    oracle_data, oracle_hit_rate = next(generate_snapshots(eval_file_path))
     print('oracle hit rate: ', oracle_hit_rate, flush=True)
 
     step = 0
@@ -126,11 +141,11 @@ if __name__ == '__main__':
                 postfix_dict['train_hit_rate'] = train_hit_rate
                 for batch_num, batch in enumerate(utils.as_batches([train_data], batch_size, model_config.get("sequence_length"))):
                     if step % eval_freq == 0 and step != 0:
-                        eval_data, eval_hit_rate = next(generate_snapshots(valid_file_path, None, lambda:1))
+                        eval_data, eval_hit_rate = next(generate_snapshots(eval_file_path, None, lambda:1))
                         postfix_dict['eval_now_hit_rate'] = eval_hit_rate
                     
                     if step % save_freq == 0 and step != 0:
-                        save_path = os.path.join(res_dir, f"{step}_{eval_hit_rate}.ckpt")
+                        save_path = os.path.join(checkpoint_dir, f"{step}_{eval_hit_rate}.ckpt")
                         with open(save_path, "wb") as save_file:
                             checkpoint_buffer = io.BytesIO()
                             torch.save(parrot_model._model.state_dict(), checkpoint_buffer)

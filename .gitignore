@@ -9,3 +9,4 @@ final/
 boost_traces/
 checkpoints/
 logs/
+stat/

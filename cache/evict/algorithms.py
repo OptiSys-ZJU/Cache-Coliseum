@@ -383,6 +383,7 @@ class FollowerRobust(PredictAlgorithm):
         self.boost_beladys = []
         self.online_belady_cache = [None] * associativity
         self.online_belady_dis = [np.inf] * associativity
+        self.boost_beladys.append(copy.deepcopy(self.online_belady_cache))
         if self.boost:
             def oracle_access(self, pc, address, next_access_time):
                 if address in self.online_belady_cache:
@@ -395,6 +396,8 @@ class FollowerRobust(PredictAlgorithm):
                 self.online_belady_cache[target_index] = address
                 self.online_belady_dis[target_index] = next_access_time
                 self.boost_beladys.append(copy.deepcopy(self.online_belady_cache))
+                if hasattr(self.predictor, 'oracle_access'):
+                    self.predictor.oracle_access(pc, address, next_access_time)
             self.oracle_access = types.MethodType(oracle_access, self)
 
         if 'a' in kwargs:
@@ -445,7 +448,6 @@ class FollowerRobust(PredictAlgorithm):
                     to_remove = max(future_uses, key=future_uses.get)
                     cache.remove(to_remove)
                     cache.append(current)
-            
             return cache
     
     def follow_robust(self, pc, address):
@@ -465,6 +467,7 @@ class FollowerRobust(PredictAlgorithm):
             if self.remaining_robust_step == 0:
                 # follower
                 self.follower_cost += 1
+                aaa = self.online_belady()
                 if address not in self.online_belady():
                     self.belady_cost += 1
 

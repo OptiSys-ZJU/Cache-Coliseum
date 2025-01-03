@@ -7,6 +7,7 @@ from utils.aligner import Aligner
 from typing import Type
 from types import SimpleNamespace
 import copy
+import numpy as np
 
 class Cache:
     def __init__(self, trace_path, aligner_type: Type[Aligner], evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_line_size, cache_capacity, associativity):        
@@ -47,7 +48,7 @@ class Cache:
             while not sim_trace.done():
                 pc, address = sim_trace.next()
                 aligned_address = self._aligner.get_aligned_addr(address)
-                self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].oracle_access(pc, aligned_address, sim_trace.next_access_time_by_aligned_address(pc, aligned_address))
+                self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].oracle_access(pc, aligned_address, sim_trace.next_access_time_by_address(pc, address))
                 # pbar.update(1)
 
     def access(self, pc, address):
@@ -102,8 +103,14 @@ class BoostCache(Cache):
 
 
 class TrainingCache(Cache):
-    def __init__(self, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity):
+    def __init__(self, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity, delta_nums=1, edc_nums=1):
         super().__init__(trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity)
+        self.deltas = [{} for _ in range(delta_nums)]
+        self.edcs = [{} for _ in range(edc_nums)]
+        self.delta_nums = delta_nums
+        self.edc_nums = edc_nums
+        self.access_time_dict = {}
+        self.access_ts = [0] * self.hash_func._num_buckets
 
     def reset(self, model_prob):
         for alg in self.evict_algs:
@@ -112,10 +119,37 @@ class TrainingCache(Cache):
     def collect(self, pc, address):
         aligned_address = self._aligner.get_aligned_addr(address)
         idx = self.hash_func.get_bucket_index(aligned_address, pc)
+
+        key = f'{idx}_{aligned_address}'
+
+        if key not in self.access_time_dict:
+            self.access_time_dict[key] = []
+        self.access_time_dict[key].append(self.access_ts[idx])
         
+        # delta
+        for i in range(1, self.delta_nums + 1):
+            this_access_list = self.access_time_dict[key]
+            this_delta = self.deltas[i-1]
+            if len(this_access_list) > i:
+                delta_i = this_access_list[-i] - this_access_list[-i-1]
+                this_delta[key] = delta_i
+            else:
+                this_delta[key] = np.inf
+
+        delta1 = self.deltas[0][key]
+
+        for i in range(1, self.edc_nums + 1):
+            this_edc = self.edcs[i-1]
+            if key not in this_edc:
+                this_edc[key] = 0
+            this_edc[key] = 1 + this_edc[key] * 2 ** (-delta1 / (2 ** (9 + i)))
+
         self.evict_algs[idx].access(pc, aligned_address)
         target_index = self.evict_algs[idx].cache.index(aligned_address)
-        return self.evict_algs[idx].preds[target_index]
+        bin_label = self.evict_algs[idx].preds[target_index]
+
+        self.access_ts[idx] += 1
+        return (pc, aligned_address, *[self.deltas[i][key] for i in range(self.delta_nums)], *[self.edcs[i][key] for i in range(self.edc_nums)], bin_label)
 
     def snapshot(self, pc, address):
         snapshot = SimpleNamespace()
