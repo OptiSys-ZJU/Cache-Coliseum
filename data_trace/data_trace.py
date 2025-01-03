@@ -154,7 +154,6 @@ class OracleDataTrace(object):
         basename = os.path.basename(self._filename)
         if basename.startswith('brightkite') or basename.startswith('citi'):
             self.enable_pc_align = True
-            print(f"OracleDataTrace: Enable PC align for [{basename}]")
         else:
             self.enable_pc_align = False
 
@@ -202,23 +201,8 @@ class OracleDataTrace(object):
     def done(self):
         """True if the cursor points to the end of the trace."""
         return not self._look_ahead_buffer
-
-    def next_abs_access_time_by_aligned_address(self, pc, aligned_address):
-        """Returns number of accesses from cursor of next access of address.
-
-        Args:
-        address (int): cache-line aligned memory address (missing offset bits).
-
-        Returns:
-        access_time (int): np.inf if not accessed within max_look_ahead accesses.
-        """
-        key = self.get_key(pc, aligned_address)
-        accesses = self._access_times[key]
-        if not accesses:
-            return np.inf
-        return accesses[0] - self._num_next_calls
     
-    def next_access_time_by_aligned_address(self, pc, aligned_address):
+    def next_access_time_by_address(self, pc, address):
         """Returns number of accesses from cursor of next access of address.
 
         Args:
@@ -227,7 +211,7 @@ class OracleDataTrace(object):
         Returns:
         access_time (int): np.inf if not accessed within max_look_ahead accesses.
         """
-        key = self.get_key(pc, aligned_address)
+        key = self.get_key(pc, address)
         accesses = self._access_times[key]
         if not accesses:
             return np.inf

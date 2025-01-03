@@ -13,6 +13,7 @@ import copy
 import argparse
 import os
 import pickle
+import json
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -32,6 +33,8 @@ if __name__ == "__main__":
     parser.add_argument("--dump_file", action='store_true')
     parser.add_argument("--output_root_dir", type=str, default='res')
 
+    parser.add_argument("--verbose", action='store_true')
+
     parser.add_argument("--boost", action='store_true')
     parser.add_argument("--boost_fr", action='store_true')
     parser.add_argument("--boost_preds_dir", type=str, default='boost_traces')
@@ -39,6 +42,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_fraction", type=str, default='1')
     parser.add_argument("--checkpoints_root_dir", type=str, default='checkpoints')
     parser.add_argument("--parrot_config_path", type=str, default='checkpoints/parrot/model_config.json')
+    parser.add_argument("--lightgbm_config_path", type=str, default='checkpoints/lightgbm/model_config.json')
 
     args = parser.parse_args()
     file_path = f'traces/{args.dataset}/{args.dataset}_test.csv'
@@ -92,14 +96,17 @@ if __name__ == "__main__":
         print('Parrot Model Config Path:', args.parrot_config_path)
         parrot_gen = lambda : ParrotModel.from_config(args.parrot_config_path, this_ckpt_path)
     if 'gbm' in this_preds:
+        with open(args.lightgbm_config_path, "r") as f:
+            model_config = json.load(f)
+            deltanums = model_config['delta_nums']
+            edcnums = model_config['edc_nums']
+
         this_dir = os.path.join(ckpt_root_dir, 'lightgbm', args.dataset, args.model_fraction)
         if not os.path.exists(this_dir):
             raise ValueError(f'Benchmark: {this_dir} not found checkpoints')
-        this_ckpt_path = os.path.join(this_dir, f'{args.dataset}_{args.model_fraction}.txt')
+        this_ckpt_path = os.path.join(this_dir, f'{args.dataset}_{args.model_fraction}_{deltanums}_{edcnums}.txt')
         if not os.path.exists(this_ckpt_path):
             raise ValueError(f'Benchmark: {this_ckpt_path} not found checkpoints')
-        print('LightGBM Model Checkpoint:', this_ckpt_path)
-        print('LightGBM Model Fraction:', args.model_fraction)
 
         threshold = 0.5
         threshold_path = os.path.join(this_dir, 'threshold')
@@ -107,8 +114,8 @@ if __name__ == "__main__":
             with open(threshold_path, "r") as file:
                 content = file.read().strip()
                 threshold = float(content)
-        print('LightGBM Model Threshold:', threshold)
-        gbm_gen = lambda : LightGBMModel.from_config(this_ckpt_path, threshold)
+        print(f'LightGBM: Fraction [{args.model_fraction}], Threshold [{threshold}], Model Checkpoint[{this_ckpt_path}], Delta[{deltanums}], EDC[{edcnums}]')
+        gbm_gen = lambda : LightGBMModel.from_config(args.lightgbm_config_path, this_ckpt_path, threshold)
     
     print("Benchmark: Use Predictor:", this_preds)
     print('Benchmark: Use Trace:', file_path)
@@ -130,7 +137,7 @@ if __name__ == "__main__":
     ]
 
     sorted = False
-    verbose = False
+    verbose = args.verbose
 
     func_dict = {}
     def register_func(this_partial, noise, baseline=False):
@@ -200,8 +207,8 @@ if __name__ == "__main__":
                 PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'Parrot', shared_model=parrot_gen()),
             ])
             combiner_types.extend([
-                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), LRUAlgorithm]),
-                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), LRUAlgorithm]),
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), MarkerAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'Parrot', shared_model=parrot_gen()), MarkerAlgorithm]),
             ])
 
 
@@ -221,8 +228,8 @@ if __name__ == "__main__":
                 PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PLECO'),
             ])
             combiner_types.extend([
-                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), LRUAlgorithm]),
-                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), LRUAlgorithm]),
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), MarkerAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), MarkerAlgorithm]),
             ])
 
         ##########################################
@@ -241,8 +248,8 @@ if __name__ == "__main__":
                 PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'POPU'),
             ])
             combiner_types.extend([
-                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), LRUAlgorithm]),
-                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), LRUAlgorithm]),
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), MarkerAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), MarkerAlgorithm]),
             ])
         
         ##########################################
@@ -257,8 +264,8 @@ if __name__ == "__main__":
                 PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PLECO-Bin', threshold=0.5),
             ])
             combiner_types.extend([
-                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO-Bin', threshold=0.5), LRUAlgorithm]),
-                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO-Bin', threshold=0.5), LRUAlgorithm]),
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO-Bin', threshold=0.5), MarkerAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO-Bin', threshold=0.5), MarkerAlgorithm]),
             ])
 
         ##########################################
@@ -273,8 +280,8 @@ if __name__ == "__main__":
                 PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'GBM', shared_model=gbm_gen()),
             ])
             combiner_types.extend([
-                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), LRUAlgorithm]),
-                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), LRUAlgorithm]),
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), MarkerAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), MarkerAlgorithm]),
             ])
 
         ########################################################
@@ -294,7 +301,6 @@ if __name__ == "__main__":
                 this_partial.keywords['candidate_algorithms'] = algs
                 register_func(this_partial, 0)
     else:
-        verbose = False
         noise_type = args.noise_type
         oracle_types = []
         combiner_types = []
@@ -312,13 +318,13 @@ if __name__ == "__main__":
                 (PredictiveMarker, 'OracleDis'),
                 (LMarker, 'OracleDis'),
                 (LNonMarker, 'OracleDis'),
-                (FollowerRobust, 'OracleState'),
+                (partial(FollowerRobust, boost=args.boost_fr), 'OracleState'),
                 (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleDis'),
                 (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleDis'),
             ])
             combiner_types.extend([
-                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), LRUAlgorithm]),
-                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), LRUAlgorithm]),
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), MarkerAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), MarkerAlgorithm]),
             ])
 
         #####################################################
@@ -331,8 +337,8 @@ if __name__ == "__main__":
                 (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleBin'),
             ])
             combiner_types.extend([
-                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
-                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), LRUAlgorithm]),
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), MarkerAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), MarkerAlgorithm]),
             ])
 
         #####################################################

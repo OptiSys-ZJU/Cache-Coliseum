@@ -1,5 +1,7 @@
 #!/bin/bash
-model=$1
+# datasets=("brightkite" "citi" "astar" "bwaves" "bzip" "cactusadm" "gems" "lbm" "leslie3d" "libq" "mcf" "milc" "omnetpp" "sphinx3" "xalanc")
+# datasets=("astar")
+# fractions=("1" "0.01" "0.00475" "0.001")
 
 declare -A gbm_dict
 
@@ -14,14 +16,11 @@ gbm_dict["omnetpp"]="0.01 0.02 0.05 1"
 gbm_dict["sphinx3"]="0.01 0.12 0.14 1"
 gbm_dict["xalanc"]="0.01 0.07 0.1 1"
 
-# datasets=("brightkite" "citi" "astar" "bwaves" "bzip" "cactusadm" "gems" "lbm" "leslie3d" "libq" "mcf" "milc" "omnetpp" "sphinx3" "xalanc")
-# fractions=("1" "0.1" "0.01" "0.001")
-
-mkdir -p logs/$model
+mkdir -p logs/benchmark/gbm
 for dataset in "${!gbm_dict[@]}"; do
     fractions=(${gbm_dict[$dataset]})
     for fraction in "${fractions[@]}"; do
-        echo "Running $model with dataset=$dataset with fraction $fraction"
-        nohup python -m model.$model --dataset "$dataset" --model_delta_nums 10 --model_edc_nums 10 --real_test -f $fraction -i > "logs/$model/${dataset}_${fraction}.log" 2>&1 &
+        echo "Running $pred with dataset=$dataset with fraction $fraction"
+        nohup python -m benchmark --boost --boost_fr --dataset "$dataset" --real --pred gbm --model_fraction $fraction --dump_file --output_root_dir stat > "logs/benchmark/gbm/${dataset}_${fraction}.log" 2>&1 &
     done
 done

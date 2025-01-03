@@ -334,6 +334,40 @@ class GBMBinPredictor(BinaryPredictor):
     def __init__(self, shared_model):
         super().__init__()
         self._model = shared_model
+        self.delta_nums = self._model.deltanums
+        self.edc_nums = self._model.edcnums
+        self.deltas = [{} for _ in range(self.delta_nums)]
+        self.edcs = [{} for _ in range(self.edc_nums)]
+        self.access_time_dict = {}
+        self.access_ts = 0
     
     def predict_score(self, ts, pc, address, cache_state):
-        return self._model(pc, address)
+        if address not in self.access_time_dict:
+            self.access_time_dict[address] = collections.deque()
+        
+        this_access_list = self.access_time_dict[address]
+        if len(this_access_list) == self.delta_nums + 1:
+            this_access_list.popleft()
+            this_access_list.append(self.access_ts)
+        else:
+            this_access_list.append(self.access_ts)
+        
+        # delta
+        for i in range(1, self.delta_nums + 1):
+            this_delta = self.deltas[i-1]
+            if len(this_access_list) > i:
+                delta_i = this_access_list[-i] - this_access_list[-i-1]
+                this_delta[address] = delta_i
+            else:
+                this_delta[address] = np.inf
+
+        delta1 = self.deltas[0][address]
+
+        for i in range(1, self.edc_nums + 1):
+            this_edc = self.edcs[i-1]
+            if address not in this_edc:
+                this_edc[address] = 0
+            this_edc[address] = 1 + this_edc[address] * 2 ** (-delta1 / (2 ** (9 + i)))
+
+        self.access_ts += 1
+        return self._model((pc, address, *[self.deltas[i][address] for i in range(self.delta_nums)], *[self.edcs[i][address] for i in range(self.edc_nums)]))

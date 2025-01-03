@@ -1,5 +1,6 @@
 import torch
 import json
+import os
 import numpy as np
 import lightgbm as lgb
 from model.parrot.model import EvictionPolicyModel as BasedParrotModel
@@ -28,22 +29,53 @@ class ParrotModel:
         scores, _, self._hidden_state, _ = self._model([cache_access], self._hidden_state, inference=True)
         return scores
 
-
 class LightGBMModel:
     @classmethod
-    def from_config(cls, model_file, threshold):
-        return cls(model_file, threshold)
+    def from_config(cls, config_path, model_file, threshold):
+        return cls(config_path, model_file, threshold)
 
-    def __init__(self, model_file, threshold=0.5):        
+    def __init__(self, config_path, model_file, threshold=0.5):        
         self.model_ = lgb.Booster(model_file=model_file)
         self.threshold = threshold
+        with open(config_path, "r") as f:
+            model_config = json.load(f)
+            self.deltanums = model_config['delta_nums']
+            self.edcnums = model_config['edc_nums']
     
-    def __call__(self, pc, address):
-        return self.forward(pc, address)
+    def __call__(self, features):
+        return self.forward(features)
 
-    def forward(self, pc, address):
-        ypred = self.model_.predict(np.array([[pc, address]], dtype=np.float64))
+    def forward(self, features):
+        ypred = self.model_.predict(np.array([features], dtype=np.float64))
         if ypred > self.threshold:
             return 1
         else:
             return 0
+
+def get_fraction_train_file(traces_root_dir, dataset, fraction):
+    traces_dir = os.path.join(traces_root_dir, dataset)
+    if fraction == '1':
+        # all
+        train_file_path = os.path.join(traces_dir, f'{dataset}_train.csv')
+        if not os.path.exists(train_file_path):
+            raise ValueError(f'Model: {train_file_path} not found')
+    else:
+        train_file_path = os.path.join(traces_dir, f'{dataset}_train_{fraction}.csv')
+        if not os.path.exists(train_file_path):
+            print(f'Model: {fraction} Train File not found, try to generate')
+            train_all_file_path = os.path.join(traces_dir, f'{dataset}_train.csv')
+            if not os.path.exists(train_all_file_path):
+                raise ValueError(f'Model: {train_all_file_path} not found')
+            with open(train_all_file_path, "r") as infile:
+                lines = infile.readlines()
+            total_lines = len(lines)
+            num_lines_to_write = int(total_lines * float(fraction))
+            with open(train_file_path, "w") as outfile:
+                outfile.writelines(lines[:num_lines_to_write])
+            print(f"Generate Fraction File: Written {num_lines_to_write} out of {total_lines} lines to {train_file_path}.")
+            if not os.path.exists(train_file_path):
+                raise ValueError(f'LightGBM: {train_file_path} not found, generate failed')
+    
+    return train_file_path
+    
+        
