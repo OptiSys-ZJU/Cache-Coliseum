@@ -7,6 +7,8 @@ bayesian-optimization==1.4.3
 scipy==1.10.1
 pandas==2.0.3
 six==1.17.0
+dill==0.3.9
+pathos==0.3.3
 tensorflow==2.13.1
 torch==1.12.1+cu113
 -f https://download.pytorch.org/whl/torch_stable.html
