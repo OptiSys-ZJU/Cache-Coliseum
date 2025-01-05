@@ -411,27 +411,26 @@ class FollowerRobust(PredictAlgorithm):
                 self.lazy_evictor = kwargs['lazy_evictor_type']()
         else:
             self.lazy_evictor = LRUEvictor()
-        self.key_scores = {} if self.lazy_evictor is not None else None
-
-        self.remaining_robust_step = 0
-        self.follower_cost = 0
-        self.belady_cost = 0
-        self.pred_gap = 0
-
+        self.key_scores = [np.inf] * self.associativity if self.lazy_evictor is not None else None
         self.sim_cache = [None] * associativity
         self.sim_pcs = [None] * associativity
         self.traces = []
         
-        self.old = []
-        self.unmarked = []
-        self.unmarked_for_reload = []
-        self.marked = []
-        self.clean = []
         self.S = []
         self.W = []
         self.F = []
         if (self.a == 1):
             self.S, self.W, self.F = FollowerRobust.create_windows(self.S, self.W, self.F, self.associativity, self.a)
+        self.skip = 0
+        self.pred_gap = 0
+        self.follow_cost = 0
+        self.belady_cost = 0
+        self.marked = []
+        self.old = []
+        self.unmarked = []
+        self.unmarked_for_reload = []
+        self.clean = []
+        self.prediction = [None] * self.associativity
 
     def online_belady(self):
         if self.boost:
@@ -458,87 +457,105 @@ class FollowerRobust(PredictAlgorithm):
         else:
             preds = self.predictor.refresh_scores(self.timestamp, pc, address, self.snapshot()[0])
         assert(preds is not None)
+        f = copy.deepcopy(self.online_belady())
         if address in self.sim_cache:
             target_index = self.sim_cache.index(address)
+            self.sim_cache[target_index] = address
         elif None in self.sim_cache:
-            target_index = self.sim_cache.index(None)
-            self.preds = preds
-        else:
-            if self.remaining_robust_step == 0:
-                # follower
-                self.follower_cost += 1
-                aaa = self.online_belady()
-                if address not in self.online_belady():
-                    self.belady_cost += 1
-
-                if address not in self.preds and (self.follower_cost <= self.belady_cost):
+            index_to_evict = self.sim_cache.index(None)
+            self.sim_cache[index_to_evict] = address
+            self.prediction = copy.deepcopy(preds)
+        if address not in self.sim_cache:
+            target_index = None
+            if self.skip == 0:
+                self.follow_cost += 1
+                if address not in f:
+                    self.belady_cost +=1
+                if address not in self.prediction and (self.follow_cost <= self.belady_cost):
                     if self.pred_gap <= 0:
-                        self.preds = preds
+                        self.prediction = preds
                         self.pred_gap = self.a
-                        dd = FollowerRobust.differ(self.cache, self.preds)
+                        dd = self.differ(self.sim_cache, self.prediction)
                         target_index = self.sim_cache.index(random.choice(dd))
+                        assert(self.sim_cache[target_index] not in self.prediction)
+                        self.sim_cache[target_index] = address
                     else:
                         target_index = random.choice(range(self.associativity))
-                elif address in self.preds:
-                    dd = FollowerRobust.differ(self.cache, self.preds)
+                        self.sim_cache[target_index] = address
+                elif address in self.prediction:
+                    dd = self.differ(self.sim_cache, self.prediction)
                     target_index = self.sim_cache.index(random.choice(dd))
+                    self.sim_cache[target_index] = address
                 else:
-                    self.follower_cost = 0
+                    self.follow_cost = 0
                     self.belady_cost = 0
-                    self.remaining_robust_step = self.associativity
-
-                    self.old = copy.deepcopy(self.sim_cache)
-                    self.unmarked = copy.deepcopy(self.sim_cache)
+                    self.skip = self.associativity
+                    self.old = []
+                    for req in self.traces[self.timestamp-1::-1]:
+                        if (req not in self.old) and (req != address):
+                            self.old.append(req)
+                        if len(self.old) >= self.associativity:
+                            break
+                    assert(len(self.old)==self.associativity)
+                    self.unmarked = self.old.copy()
+                    self.sim_cache = self.old.copy()
+                    assert(address not in self.sim_cache)
                     self.marked = []
                     self.unmarked_for_reload = []
                     self.clean = []
-                                    
-            if self.remaining_robust_step != 0:
+            if self.skip != 0:
+                assert(address not in self.sim_cache)
                 if address not in self.marked:
-                    self.remaining_robust_step -= 1
-                    this_arrival_index = self.associativity - self.remaining_robust_step
+                    self.skip -= 1
+                    arrival_no = self.associativity-self.skip
                     if address in self.unmarked:
                         self.unmarked.remove(address)
                     if address not in self.marked:
                         self.marked.append(address)
+                    assert(len(self.marked) == arrival_no)
                     if address not in self.old:
                         self.clean.append(address)
-                    if ((self.a==1) and (this_arrival_index in self.F)) or ((self.a > 1) and (self.pred_gap <= 0)):
+                    assert(len(self.unmarked) == self.associativity - (arrival_no - len(self.clean)))
+                    if ((self.a==1) and (arrival_no in self.F)) or ((self.a > 1) and (self.pred_gap <= 0)):
                         self.pred_gap = self.a
-                        self.preds = preds
-                    if this_arrival_index in self.S:
+                        self.prediction = copy.deepcopy(preds)
+                    if arrival_no in self.S:
                         self.unmarked_for_reload = []
                         for p in self.unmarked:
-                            if (p in self.preds) and (p not in self.sim_cache):
+                            if (p in self.prediction) and (p not in self.sim_cache):
                                 self.unmarked_for_reload.append(p)
                     if address in self.unmarked_for_reload:
-                        dd = FollowerRobust.differ(self.cache, self.preds)
+                        # Lazy sync with predictor
+                        assert(address not in self.sim_cache)
+                        dd = self.differ(self.sim_cache, self.prediction)
                         target_index = self.sim_cache.index(random.choice(dd))
-                    if address in self.clean:
-                        dd = FollowerRobust.differ(self.cache, self.preds)
-                        target_index = self.sim_cache.index(random.choice(dd))
-                if target_index == -1:
-                    # random select unmark
+                        self.sim_cache[target_index] = address
+                    if address in self.clean: # Clean arrival
+                            assert(address not in self.sim_cache)
+                            dd = self.differ(self.sim_cache, self.prediction)
+                            target_index = self.sim_cache.index(random.choice(dd))
+                            self.sim_cache[target_index] = address
+                if address not in self.sim_cache:
+                    index_to_evict = None
                     unmarked_slots = []
                     for page in self.sim_cache:
                         if page in self.unmarked:
                             unmarked_slots.append(self.sim_cache.index(page))
                     target_index = random.choice(unmarked_slots)
-        
-        self.sim_cache[target_index], self.sim_pcs[target_index] = address, pc
-
+                    assert(address not in self.sim_cache)
+                    self.sim_cache[target_index] = address
+                if self.skip == 0:
+                    assert(len(self.marked) == self.associativity)
+                    assert(len(self.unmarked) == len(self.clean))
         if self.cur_boost_type is not None:
             assert self.cur_boost_type == 'before'
         else:
             pred = self.predictor.predict_score(self.timestamp, pc, address, self.snapshot()[0])
             assert pred is None
-        self.timestamp += 1
         self.pred_gap -= 1
         self.traces.append(address)
     
     def access(self, pc, address):
-        if self.key_scores is not None:
-            self.key_scores[address] = self.timestamp
         self.follow_robust(pc, address)
 
         ## Lazy
@@ -550,16 +567,17 @@ class FollowerRobust(PredictAlgorithm):
         elif None in self.cache:
             target_index = self.cache.index(None)
         else:
-            center_cache = self.sim_cache
             if self.lazy_evictor is None:
-                self.cache = copy.deepcopy(center_cache)
+                self.cache = copy.deepcopy(self.sim_cache)
                 self.pcs = copy.deepcopy(self.sim_pcs)
                 target_index = self.cache.index(address)
             else:
-                diff_keys = set(center_cache) - set(self.cache)
-                target_index = self.lazy_evictor.evict([(center_cache.index(k), self.key_scores[k] if self.key_scores is not None else 0) for k in diff_keys])
+                diff_keys = set(self.cache) - set(self.sim_cache)
+                target_index = self.lazy_evictor.evict([(self.cache.index(k), self.key_scores[self.cache.index(k)] if self.key_scores is not None else 0) for k in diff_keys])
         
+        self.key_scores[target_index] = self.timestamp
         self.cache[target_index], self.pcs[target_index] = address, pc
+        self.timestamp += 1
         return hit
 
 class Guard(PredictAlgorithm):
@@ -654,7 +672,8 @@ class CombineAlgorithm(EvictAlgorithm):
         self.center = 0
         self.timestamp = 0
         self.lazy_evictor = lazy_evictor_type() if lazy_evictor_type is not None else None
-        self.key_scores = {} if lazy_evictor_type == LRUEvictor else None
+        # self.key_scores = {} if lazy_evictor_type == LRUEvictor else None
+        self.key_scores = [np.inf] * associativity if lazy_evictor_type == LRUEvictor else None
 
         for alg_type in candidate_algorithms:
             alg_instance = alg_type(associativity)
@@ -678,10 +697,6 @@ class CombineAlgorithm(EvictAlgorithm):
             if not alg.access(pc, address):
                 self.candidate_algs[i][1] += 1
                 self.__trigger_miss__(i, address)
-        
-        if self.key_scores is not None:
-            self.key_scores[address] = self.timestamp
-        self.timestamp += 1
     
     def __push_candidates_boost__(self, pc, address, boost_pred):
         for i, (alg, _) in enumerate(self.candidate_algs):
@@ -692,9 +707,6 @@ class CombineAlgorithm(EvictAlgorithm):
             if not hit:
                 self.candidate_algs[i][1] += 1
                 self.__trigger_miss__(i, address)
-        if self.key_scores is not None:
-            self.key_scores[address] = self.timestamp
-        self.timestamp += 1
     
     def __trigger_miss__(self, i, address):
         pass
@@ -719,11 +731,11 @@ class CombineAlgorithm(EvictAlgorithm):
                 self.pcs = copy.deepcopy(self.candidate_algs[self.center][0].pcs)
                 target_index = self.cache.index(address)
             else:
-                diff_keys = set(center_cache) - set(self.cache)
-                target_index = self.lazy_evictor.evict([(center_cache.index(k), self.key_scores[k] if self.key_scores is not None else 0) for k in diff_keys])
-        
-        self.cache[target_index] = address
-        self.pcs[target_index] = pc
+                diff_keys = set(self.cache) - set(center_cache)
+                target_index = self.lazy_evictor.evict([(self.cache.index(k), self.key_scores[self.cache.index(k)] if self.key_scores is not None else 0) for k in diff_keys])
+        self.key_scores[target_index] = self.timestamp
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.timestamp += 1
         return hit
 
     def boost_access(self, pc, address, boost_pred):

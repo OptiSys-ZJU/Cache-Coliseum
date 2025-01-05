@@ -451,7 +451,7 @@ if __name__ == "__main__":
                 pc, address = trace.next()
                 for cache in caches:
                     cache.access(pc, address)
-                pbar.update(1)     
+                pbar.update(1)
 
     table = PrettyTable() 
 
