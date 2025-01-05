@@ -31,16 +31,14 @@ class ParrotModel:
 
 class LightGBMModel:
     @classmethod
-    def from_config(cls, config_path, model_file, threshold):
-        return cls(config_path, model_file, threshold)
+    def from_config(cls, deltanums, edcnums, model_file, threshold):
+        return cls(deltanums, edcnums, model_file, threshold)
 
-    def __init__(self, config_path, model_file, threshold=0.5):        
+    def __init__(self, deltanums, edcnums, model_file, threshold=0.5):        
         self.model_ = lgb.Booster(model_file=model_file)
         self.threshold = threshold
-        with open(config_path, "r") as f:
-            model_config = json.load(f)
-            self.deltanums = model_config['delta_nums']
-            self.edcnums = model_config['edc_nums']
+        self.deltanums = deltanums
+        self.edcnums = edcnums
     
     def __call__(self, features):
         return self.forward(features)
