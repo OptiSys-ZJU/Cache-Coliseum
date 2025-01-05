@@ -115,7 +115,7 @@ if __name__ == "__main__":
                 content = file.read().strip()
                 threshold = float(content)
         print(f'LightGBM: Fraction [{args.model_fraction}], Threshold [{threshold}], Model Checkpoint[{this_ckpt_path}], Delta[{deltanums}], EDC[{edcnums}]')
-        gbm_gen = lambda : LightGBMModel.from_config(args.lightgbm_config_path, this_ckpt_path, threshold)
+        gbm_gen = lambda : LightGBMModel.from_config(deltanums, edcnums, this_ckpt_path, threshold)
     
     print("Benchmark: Use Predictor:", this_preds)
     print('Benchmark: Use Trace:', file_path)

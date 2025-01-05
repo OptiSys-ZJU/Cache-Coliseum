@@ -9,7 +9,7 @@ from prettytable import PrettyTable
 import tqdm
 from cache.evict.algorithms import PredictAlgorithm, PredictAlgorithmFactory
 from data_trace.data_trace import DataTrace
-from model.models import get_fraction_train_file
+from model.models import LightGBMModel, get_fraction_train_file
 from utils.aligner import ShiftAligner
 from cache.hash import ShiftHashFunction
 from cache.cache import BoostCache, TrainingCache
@@ -163,7 +163,9 @@ if __name__ == '__main__':
     checkpoint_dir = os.path.join(args.checkpoints_root_dir, 'lightgbm', args.dataset, args.model_fraction)
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
-    bst.save_model(os.path.join(checkpoint_dir, f'{args.dataset}_{args.model_fraction}_{args.model_delta_nums}_{args.model_edc_nums}.txt'))
+    
+    this_ckpt_path = os.path.join(checkpoint_dir, f'{args.dataset}_{args.model_fraction}_{args.model_delta_nums}_{args.model_edc_nums}.txt')
+    bst.save_model(this_ckpt_path)
     
     with open(os.path.join(checkpoint_dir, 'threshold'), 'w') as f:
         f.write(str(best_threshold))
@@ -173,7 +175,7 @@ if __name__ == '__main__':
 
     #########################################
     if args.real_test:
-        gbm_gen = lambda : None
+        gbm_gen = lambda : LightGBMModel.from_config(args.model_delta_nums, args.model_edc_nums, this_ckpt_path, best_threshold)
         oracle_predicitons = test_data.label
 
         bench_cache = BoostCache(False, test_file_path, align_type, PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), hash_type, cache_line_size, capacity, associativity)
