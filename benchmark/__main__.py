@@ -14,6 +14,14 @@ import argparse
 import os
 import pickle
 import json
+from pathos.multiprocessing import ProcessingPool as Pool
+
+def process_cache(cache):
+    with DataTrace(file_path) as trace:
+        while not trace.done():
+            pc, address = trace.next()
+            cache.access(pc, address)
+        return cache.stat()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -36,6 +44,7 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action='store_true')
 
     parser.add_argument("--boost", action='store_true')
+    parser.add_argument("--num_workers", type=int, default=-1)
     parser.add_argument("--boost_fr", action='store_true')
     parser.add_argument("--boost_preds_dir", type=str, default='boost_traces')
 
@@ -67,7 +76,6 @@ if __name__ == "__main__":
         associativity = 16
         align_type = ShiftAligner
         hash_type = ShiftHashFunction
-
 
     this_preds = []
     real_predictors_type = ['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm']
@@ -124,7 +132,10 @@ if __name__ == "__main__":
     else:
         print('Benchmark: Only print')
     if args.boost:
-        print('Benchmark: Use Boost Prediction')
+        if args.real:
+            print('Benchmark: Use Boost Trace Prediction')
+        else:
+            print('Benchmark: Use MultiProcess Boost')
     if args.boost_fr:
         print('Benchmark: Enable F&R Boost')
     device = args.device
@@ -415,43 +426,61 @@ if __name__ == "__main__":
                     predictor_type = kw['predictor_type']
                     pred_cls_type = predictor_type.func if hasattr(predictor_type, 'func') else predictor_type
                     return pred_cls_type
-            
             return None
 
-
         for pretty_name, noise, this_partial in funcs:
-            cache = Cache(file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
-            if args.boost:
-                pred_cls_type = judge_pred_type(this_partial)
-                if pred_cls_type is not None:
-                    if pred_cls_type in boost_cls_list:
-                        tqdm.tqdm.write(f"Enbale Boost for {pretty_name} --> {pred_cls_type.__name__}")
-                        cache = BoostCache(False, file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
-                        cache.set_boost_preds(copy.deepcopy(boost_cls_list[pred_cls_type]))
+            if args.oracle:
+                if args.boost:
+                    # todo
+                    cache = Cache(file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
+                else:
+                    cache = Cache(file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
+            elif args.real:
+                cache = None
+                if args.boost:
+                    pred_cls_type = judge_pred_type(this_partial)
+                    if pred_cls_type is not None:
+                        if pred_cls_type in boost_cls_list:
+                            tqdm.tqdm.write(f"Enbale Boost for {pretty_name} --> {pred_cls_type.__name__}")
+                            cache = BoostCache(False, file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
+                            cache.set_boost_preds(copy.deepcopy(boost_cls_list[pred_cls_type]))
 
-                if hasattr(this_partial, 'keywords'):
-                    kw = this_partial.keywords
-                    if 'candidate_algorithms' in kw:
-                        algs = kw['candidate_algorithms']
-                        for alg in algs:
-                            pred_cls_type = judge_pred_type(alg)
-                            if pred_cls_type in boost_cls_list:
-                                tqdm.tqdm.write(f"Enbale Boost for {pretty_name} --> {pred_cls_type.__name__}")
-                                cache = BoostCache(False, file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
-                                cache.set_boost_preds(copy.deepcopy(boost_cls_list[pred_cls_type]))
-                                break
+                    if hasattr(this_partial, 'keywords'):
+                        kw = this_partial.keywords
+                        if 'candidate_algorithms' in kw:
+                            algs = kw['candidate_algorithms']
+                            for alg in algs:
+                                pred_cls_type = judge_pred_type(alg)
+                                if pred_cls_type in boost_cls_list:
+                                    tqdm.tqdm.write(f"Enbale Boost for {pretty_name} --> {pred_cls_type.__name__}")
+                                    cache = BoostCache(False, file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
+                                    cache.set_boost_preds(copy.deepcopy(boost_cls_list[pred_cls_type]))
+                                    break
+                if cache is None:
+                    cache = Cache(file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
             register_cache(pretty_name, noise, cache)
             caches.append(cache)
             pbar.update(1)
 
-    # np.random.seed(42)
-    with DataTrace(file_path) as trace:
-        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
-            while not trace.done():
-                pc, address = trace.next()
-                for cache in caches:
-                    cache.access(pc, address)
-                pbar.update(1)
+    if args.boost and args.oracle:
+        num_workers = args.num_workers
+        if num_workers == -1:
+            num_workers = os.cpu_count()
+        
+        print(f'Benchmark: Workers[{num_workers}]')
+        with Pool(processes=num_workers) as pool:
+            stats = list(tqdm.tqdm(pool.map(process_cache, caches), total=len(caches)))
+        for i, stat in enumerate(stats):
+            caches[i].set_stat(stats[i][0], stats[i][1], stats[i][2])
+
+    else:
+        with DataTrace(file_path) as trace:
+            with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
+                while not trace.done():
+                    pc, address = trace.next()
+                    for cache in caches:
+                        cache.access(pc, address)
+                    pbar.update(1)
 
     table = PrettyTable() 
 
@@ -484,7 +513,6 @@ if __name__ == "__main__":
             if len(lst) == 2:
                 lst.extend([lst[-1]] * (len(table.field_names) - 2))
             table.add_row(lst)
-
 
     if args.dump_file:
         res_dir = os.path.join(args.output_root_dir, args.dataset, args.model_fraction)

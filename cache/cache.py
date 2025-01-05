@@ -63,6 +63,12 @@ class Cache:
     
     def stat(self):
         return (self.hits, self.miss, self.counts, round(self.hits / self.counts, 4))
+    
+    # todo
+    def set_stat(self, hits, miss, counts):
+        self.hits = hits
+        self.miss = miss
+        self.counts = counts
 
 class BoostCache(Cache):
     def __init__(self, is_state, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity):
