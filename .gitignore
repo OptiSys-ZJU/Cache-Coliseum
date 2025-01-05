@@ -1,7 +1,7 @@
 traces/
 __pycache__
 .vscode/
-a.txt
+*.txt
 *.ckpt
 *.gz
 res*/
@@ -9,4 +9,4 @@ final/
 boost_traces/
 checkpoints/
 logs/
-stat/
+stat*/

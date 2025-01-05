@@ -1,8 +1,4 @@
 #!/bin/bash
-# datasets=("brightkite" "citi" "astar" "bwaves" "bzip" "cactusadm" "gems" "lbm" "leslie3d" "libq" "mcf" "milc" "omnetpp" "sphinx3" "xalanc")
-# datasets=("astar")
-# fractions=("1" "0.01" "0.00475" "0.001")
-
 declare -A gbm_dict
 
 gbm_dict["astar"]="0.001 0.00475 0.01 1"
