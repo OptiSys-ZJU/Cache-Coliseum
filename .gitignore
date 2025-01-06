@@ -1,3 +1,12 @@
 traces/
 __pycache__
 .vscode/
+*.txt
+*.ckpt
+*.gz
+res*/
+final/
+boost_traces/
+checkpoints/
+logs/
+stat*/
