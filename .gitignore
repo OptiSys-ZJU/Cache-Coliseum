@@ -10,3 +10,4 @@ boost_traces/
 checkpoints/
 logs/
 stat*/
+plot_res/
