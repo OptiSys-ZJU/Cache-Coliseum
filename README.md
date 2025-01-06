@@ -107,18 +107,32 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
   We implemented most of real algorithms in our benchmark, you can also implement and test your own algorithm in the benchmark
 
-  | Algorithm | Parrot | PLECO | POPU | Pleco-Bin | GBM | Oracle-Dis | Oracle-Bin |
-  |:----------|:------:|:-----:|:----:|:---------:|-----|:----------:|:----------:|
-  | Rand      | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
-  | LRU       | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
-  | Marker    | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  #### Algorithms and Predcitors compatibility
 
-`RandAlgorithm`: randomized algorithm
+  | Algorithm | Parrot | PLECO | POPU | Pleco-Bin | GBM | Oracle-Dis (Belady) | Oracle-Bin (FBP) |
+  |:----------|:------:|:-----:|:----:|:---------:|:---:|:----------:|:----------:|
+  | Rand                 | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | LRU                  | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | Marker               | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | Predict              | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | PredictiveMarker     | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | LMarker              | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | LNonMarker           | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | Follower&Robust      | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | Mark0                | &#10060; | &#10060; | &#10060; | &#10004; | &#10004; | &#10060; | &#10004; |
+  | Mark&Predict         | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10004; |
+  | CombineDeterministic | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | CombineRandom        | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | Guard                | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
 
-`LRUAlgorithm`: Least Recently Used
+- Predictor
 
-`MarkerAlgorithm`
-
-
+  + `parrot`: A Parrot Imitation Model, gives a page's score when predicting (regarded as reuse distance)
+  + `pleco`: A PLECO Model, gives a page's next arrival time (reuse distance) when predicting.
+  + `popu`: A Popularity Model, gives a page's next arrival time (reuse distance) when predicting.
+  + `pleco-bin`: A PLECO Binary Model based on PLECO, gives a page's **belady's label** when predicting
+  + `gbm`: A Grandient Boosting Machine based on Delta and EDC features, gives a page's **belady's label** when predicting
+  + `oracle_bin`: An offline predictor that gives the predicted next arrival time (reuse distance) of a page during prediction, potentially affected by noise (logdis or dis).
+  + `oracle_dis`: An offline predictor that gives  a page's **belady's label**, potentially affected by noise (logdis, dis or bin).
 
 ### Model Training
