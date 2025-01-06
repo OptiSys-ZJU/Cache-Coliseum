@@ -4,7 +4,7 @@ from model.models import ParrotModel, get_fraction_train_file
 from model import device_manager
 from utils.aligner import NormalAligner, ShiftAligner
 from cache.hash import BrightKiteHashFunction, CitiHashFunction, ShiftHashFunction
-from cache.cache import TrainingCache
+from cache.cache import ParrotTrainingCache
 from cache.evict import *
 from typing import Callable
 import os
@@ -95,7 +95,7 @@ if __name__ == '__main__':
     def generate_snapshots(file_path: str, max_examples=None, model_prob_gen=lambda:0):
         if max_examples is None:
             max_examples = np.inf
-        cache = TrainingCache(file_path, align_type, evict_type, hash_type, cache_line_size, capacity, associativity)
+        cache = ParrotTrainingCache(file_path, align_type, evict_type, hash_type, cache_line_size, capacity, associativity)
         with DataTrace(file_path) as trace:
             with tqdm.tqdm(desc=f'Collecting data on DataTrace [{file_path}]') as pbar:
                 while not trace.done():
@@ -107,7 +107,7 @@ if __name__ == '__main__':
                     hit_cnt = 0
                     while len(data) < max_examples and not trace.done():
                         pc, address = trace.next()
-                        snapshot, hit = cache.snapshot(pc, address)
+                        snapshot, hit = cache.collect(pc, address)
                         if hit:
                             hit_cnt += 1
                         total_cnt += 1

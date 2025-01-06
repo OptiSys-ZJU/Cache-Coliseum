@@ -70,31 +70,18 @@ class Cache:
         self.miss = miss
         self.counts = counts
 
-class BoostCache(Cache):
+class DumpCache(Cache):
     def __init__(self, is_state, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity):
         super().__init__(trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity)
-        self.boost_preds = []
-        self.ts = 0
         self.is_state = is_state
-
-    def get_boost_preds(self):
-        return self.boost_preds
+        self.boost_preds = []
     
-    def set_boost_preds(self, lst):
-        self.boost_preds = lst
-
     def access(self, pc, address):
-        pred = self.boost_preds[self.ts]
-        aligned_address = self._aligner.get_aligned_addr(address)
-        hit = self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].boost_access(pc, aligned_address, pred)
-        
-        self.ts += 1
-        if hit:
-            self.hits += 1
-        else:
-            self.miss += 1
-        self.counts += 1
+        raise NotImplementedError('DumpCache: access not work')
     
+    def dump(self):
+        return self.boost_preds
+
     def simulate(self, pc, address):
         aligned_address = self._aligner.get_aligned_addr(address)
         idx = self.hash_func.get_bucket_index(aligned_address, pc)
@@ -107,8 +94,54 @@ class BoostCache(Cache):
         else:
             self.boost_preds.append(copy.deepcopy(this_preds))
 
+class BoostCache(Cache):
+    def __init__(self, boost_preds, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity):
+        super().__init__(trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity)
+        self.boost_preds = boost_preds
+        self.ts = 0
+
+    def access(self, pc, address):
+        pred = self.boost_preds[self.ts]
+        aligned_address = self._aligner.get_aligned_addr(address)
+        hit = self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].boost_access(pc, aligned_address, pred)
+        
+        self.ts += 1
+        if hit:
+            self.hits += 1
+        else:
+            self.miss += 1
+        self.counts += 1
 
 class TrainingCache(Cache):
+    def __init__(self, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity):
+        super().__init__(trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity)
+    
+    def collect(self, pc, address):
+        raise NotImplementedError("TrainingCache: 'collect' need override")
+
+class ParrotTrainingCache(TrainingCache):
+    def __init__(self, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity):
+        super().__init__(trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity)
+    
+    def reset(self, model_prob):
+        for alg in self.evict_algs:
+            alg.reset([1-model_prob, model_prob])
+    
+    def collect(self, pc, address):
+        snapshot = SimpleNamespace()
+        snapshot.pc = pc
+        snapshot.address = address
+
+        aligned_address = self._aligner.get_aligned_addr(address)
+        idx = self.hash_func.get_bucket_index(aligned_address, pc)
+        alg = self.evict_algs[idx]
+        cache_lines, scores = alg.snapshot()
+        snapshot.cache_lines = cache_lines
+        snapshot.cache_line_scores = scores
+        hit = alg.access(pc, aligned_address)
+        return snapshot, hit
+
+class LightGBMTrainingCache(TrainingCache):
     def __init__(self, trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity, delta_nums=1, edc_nums=1):
         super().__init__(trace_path, aligner_type, evict_type, hash_type, cache_line_size, cache_capacity, associativity)
         self.deltas = [{} for _ in range(delta_nums)]
@@ -117,21 +150,15 @@ class TrainingCache(Cache):
         self.edc_nums = edc_nums
         self.access_time_dict = {}
         self.access_ts = [0] * self.hash_func._num_buckets
-
-    def reset(self, model_prob):
-        for alg in self.evict_algs:
-            alg.reset([1-model_prob, model_prob])
     
     def collect(self, pc, address):
         aligned_address = self._aligner.get_aligned_addr(address)
         idx = self.hash_func.get_bucket_index(aligned_address, pc)
 
         key = f'{idx}_{aligned_address}'
-
         if key not in self.access_time_dict:
             self.access_time_dict[key] = []
         self.access_time_dict[key].append(self.access_ts[idx])
-        
         # delta
         for i in range(1, self.delta_nums + 1):
             this_access_list = self.access_time_dict[key]
@@ -141,33 +168,14 @@ class TrainingCache(Cache):
                 this_delta[key] = delta_i
             else:
                 this_delta[key] = np.inf
-
         delta1 = self.deltas[0][key]
-
         for i in range(1, self.edc_nums + 1):
             this_edc = self.edcs[i-1]
             if key not in this_edc:
                 this_edc[key] = 0
             this_edc[key] = 1 + this_edc[key] * 2 ** (-delta1 / (2 ** (9 + i)))
-
         self.evict_algs[idx].access(pc, aligned_address)
         target_index = self.evict_algs[idx].cache.index(aligned_address)
         bin_label = self.evict_algs[idx].preds[target_index]
-
         self.access_ts[idx] += 1
         return (pc, aligned_address, *[self.deltas[i][key] for i in range(self.delta_nums)], *[self.edcs[i][key] for i in range(self.edc_nums)], bin_label)
-
-    def snapshot(self, pc, address):
-        snapshot = SimpleNamespace()
-        snapshot.pc = pc
-        snapshot.address = address
-
-        aligned_address = self._aligner.get_aligned_addr(address)
-        idx = self.hash_func.get_bucket_index(aligned_address, pc)
-        alg = self.evict_algs[idx]
-
-        cache_lines, scores = alg.snapshot()
-        snapshot.cache_lines = cache_lines
-        snapshot.cache_line_scores = scores
-        hit = alg.access(pc, aligned_address)
-        return snapshot, hit

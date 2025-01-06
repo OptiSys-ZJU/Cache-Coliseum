@@ -2,7 +2,7 @@ from data_trace.data_trace import DataTrace
 from model.models import ParrotModel, LightGBMModel
 from model import device_manager
 from utils.aligner import ShiftAligner, NormalAligner
-from cache.cache import Cache, BoostCache
+from cache.cache import Cache, BoostCache, DumpCache
 from cache.evict import *
 from cache.hash import ShiftHashFunction, BrightKiteHashFunction, CitiHashFunction
 from functools import partial
@@ -182,14 +182,14 @@ if __name__ == "__main__":
                 is_state = True
             else:
                 is_state = False
-            boost_cache = BoostCache(is_state, file_path, align_type, pred_algorithm, hash_type, cache_line_size, capacity, associativity)
+            dump_cache = DumpCache(is_state, file_path, align_type, pred_algorithm, hash_type, cache_line_size, capacity, associativity)
             with DataTrace(file_path) as trace:
                 with tqdm.tqdm(desc="Producing cache on Boost Prediction") as pbar:
                     while not trace.done():
                         pc, address = trace.next()
-                        boost_cache.simulate(pc, address)
+                        dump_cache.simulate(pc, address)
                         pbar.update(1) 
-            lst = boost_cache.get_boost_preds()
+            lst = dump_cache.dump()
             with open(pred_pickle_path, 'wb') as f:
                 pickle.dump(lst, f)
             return lst
@@ -442,8 +442,7 @@ if __name__ == "__main__":
                     if pred_cls_type is not None:
                         if pred_cls_type in boost_cls_list:
                             tqdm.tqdm.write(f"Enbale Boost for {pretty_name} --> {pred_cls_type.__name__}")
-                            cache = BoostCache(False, file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
-                            cache.set_boost_preds(copy.deepcopy(boost_cls_list[pred_cls_type]))
+                            cache = BoostCache(copy.deepcopy(boost_cls_list[pred_cls_type]), file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
 
                     if hasattr(this_partial, 'keywords'):
                         kw = this_partial.keywords
@@ -453,8 +452,7 @@ if __name__ == "__main__":
                                 pred_cls_type = judge_pred_type(alg)
                                 if pred_cls_type in boost_cls_list:
                                     tqdm.tqdm.write(f"Enbale Boost for {pretty_name} --> {pred_cls_type.__name__}")
-                                    cache = BoostCache(False, file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
-                                    cache.set_boost_preds(copy.deepcopy(boost_cls_list[pred_cls_type]))
+                                    cache = BoostCache(copy.deepcopy(boost_cls_list[pred_cls_type]), file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
                                     break
                 if cache is None:
                     cache = Cache(file_path, align_type, this_partial, hash_type, cache_line_size, capacity, associativity)
@@ -472,7 +470,6 @@ if __name__ == "__main__":
             stats = list(tqdm.tqdm(pool.map(process_cache, caches), total=len(caches)))
         for i, stat in enumerate(stats):
             caches[i].set_stat(stats[i][0], stats[i][1], stats[i][2])
-
     else:
         with DataTrace(file_path) as trace:
             with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:

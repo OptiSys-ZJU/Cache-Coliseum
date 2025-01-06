@@ -12,7 +12,7 @@ from data_trace.data_trace import DataTrace
 from model.models import LightGBMModel, get_fraction_train_file
 from utils.aligner import ShiftAligner
 from cache.hash import ShiftHashFunction
-from cache.cache import BoostCache, TrainingCache
+from cache.cache import BoostCache, LightGBMTrainingCache
 from utils.aligner import ShiftAligner, NormalAligner
 from cache.hash import ShiftHashFunction, BrightKiteHashFunction, CitiHashFunction
 from model import device_manager
@@ -64,7 +64,7 @@ if __name__ == '__main__':
     def generate_feature_path(trace_path, label_path):
         features = []
         evict_type = PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'OracleBin', associativity=associativity)
-        cache = TrainingCache(trace_path, align_type, evict_type, hash_type, cache_line_size, capacity, associativity, args.model_delta_nums, args.model_edc_nums)
+        cache = LightGBMTrainingCache(trace_path, align_type, evict_type, hash_type, cache_line_size, capacity, associativity, args.model_delta_nums, args.model_edc_nums)
         with DataTrace(trace_path) as trace:
             with tqdm.tqdm(desc="Collecting bin labels on DataTrace") as pbar:
                 while not trace.done():
