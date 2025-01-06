@@ -37,5 +37,88 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
                    [--parrot_config_path PARROT_CONFIG_PATH] [--lightgbm_config_path LIGHTGBM_CONFIG_PATH]
 ```
 
+- Dataset
+
+  `--dataset`: Benchmark source dataset name, supported name:
+    + `brightkite`
+    + `citi`
+    + `astar`
+    + `bwaves`
+    + `bzip`
+    + `cactusadm`
+    + `gems`
+    + `lbm`
+    + `leslie3d`
+    + `libq`
+    + `mcf`
+    + `milc`
+    + `omnetpp`
+    + `sphinx3`
+    + `xalanc`
+    
+    You can also support your own dataset.
+
+  `--test_all`: This option only works for `brightkite` and `citi` datasets, meaning the entire traces will be used in these datasets. It cannot be used with `parrot` or `gbm` predictors as they require a training set.
+- Device
+
+  `--device`: Model target device, like `cpu`, `cuda:0` and `cuda:1`...
+
+  This option only works for the `parrot` predcitor, in other cases we only use CPU.
+  
+- Mode
+
+  `real` and `oracle`: You must specify one of them in command.
+
+  - Real Mode
+
+    Supported Predictors:
+
+    + `parrot`
+    + `pleco`
+    + `popu`
+    + `pleco-bin`
+    + `gbm`
+
+    `verbose` default to True
+
+    `boost` will use pickle traces (`num_workers` doesn't work)
+
+    `noise_type` don't work
+    
+  - Oracle Mode
+
+    Supported Predictors:
+
+    + `oracle_dis`
+    + `oracle_bin`
+ 
+    `verbose` default to False
+
+    `boost` will use multiprocess pool (`num_workers` works)
+
+    `boost_preds_dir` `model_fraction` `checkpoints_root_dir` `parrot_config_path` `lightgbm_config_path` don't work
+
+- Noise Type
+  + `logdis`: Log Normal Noise on Next Arrival Time (Reuse Distance)
+  + `dis`: Normal Noise on Next Arrival Time (Reuse Distance)
+  + `bin`: Binary Flipping Noise on Belady's label (FBP label)
+  
+- Algorithm
+
+  We implemented most of real algorithms in our benchmark, you can also implement and test your own algorithm in the benchmark
+
+  | Algorithm | Parrot | PLECO | POPU | Pleco-Bin | GBM | Oracle-Dis | Oracle-Bin |
+  |:----------|:------:|:-----:|:----:|:---------:|-----|:----------:|:----------:|
+  | Rand      | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | LRU       | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | Marker    | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+
+`RandAlgorithm`: randomized algorithm
+
+`LRUAlgorithm`: Least Recently Used
+
+`MarkerAlgorithm`
+
+
 
 ### Model Training
