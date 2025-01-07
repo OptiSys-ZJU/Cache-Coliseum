@@ -121,7 +121,7 @@ if __name__ == '__main__':
                     yield data, hit_rate
 
     oracle_data, oracle_hit_rate = next(generate_snapshots(eval_file_path))
-    print('oracle hit rate: ', oracle_hit_rate, flush=True)
+    print('oracle hit rate:', oracle_hit_rate, flush=True)
 
     step = 0
     get_step = lambda: step
