@@ -1,4 +1,5 @@
 import copy
+import json
 import lightgbm as lgb
 import argparse
 import numpy as np
@@ -22,8 +23,7 @@ if __name__ == '__main__':
     parser.add_argument("--dataset", type=str, default='xalanc')
     parser.add_argument("--device", type=str, default='cpu')
     parser.add_argument("-f", "--model_fraction", type=str, default='1')
-    parser.add_argument("-d", "--model_delta_nums", type=int, default=1)
-    parser.add_argument("-e", "--model_edc_nums", type=int, default=1)
+    parser.add_argument("-p", "--model_config_path", type=str, default='checkpoints/lightgbm/model_config.json')
     parser.add_argument("-c", "--checkpoints_root_dir", type=str, default='checkpoints')
     parser.add_argument("-t", "--traces_root_dir", type=str, default='traces')
 
@@ -35,8 +35,16 @@ if __name__ == '__main__':
     traces_dir = os.path.join(args.traces_root_dir, args.dataset)
     if not os.path.exists(traces_dir):
         raise ValueError(f'LightGBM: {traces_dir} not found')
+    
+    if not os.path.exists(args.model_config_path):
+        raise ValueError(f'LightGBM: {args.model_config_path} not found')
+    with open(args.model_config_path, "r") as f:
+        model_config = json.load(f)
+        deltanums = model_config['delta_nums']
+        edcnums = model_config['edc_nums']
+        training_config = model_config['training']
 
-    print(f'LightGBM: Hyper Params Train Fraction[{args.model_fraction}], Delta[{args.model_delta_nums}], EDC[{args.model_edc_nums}]')
+    print(f'LightGBM: Hyper Params Train Fraction[{args.model_fraction}], Delta[{deltanums}], EDC[{edcnums}]')
 
     if args.dataset == 'brightkite':
         cache_line_size = 1
@@ -64,7 +72,7 @@ if __name__ == '__main__':
     def generate_feature_path(trace_path, label_path):
         features = []
         evict_type = PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'OracleBin', associativity=associativity)
-        cache = LightGBMTrainingCache(trace_path, align_type, evict_type, hash_type, cache_line_size, capacity, associativity, args.model_delta_nums, args.model_edc_nums)
+        cache = LightGBMTrainingCache(trace_path, align_type, evict_type, hash_type, cache_line_size, capacity, associativity, deltanums, edcnums)
         with DataTrace(trace_path) as trace:
             with tqdm.tqdm(desc="Collecting bin labels on DataTrace") as pbar:
                 while not trace.done():
@@ -82,22 +90,22 @@ if __name__ == '__main__':
     if not os.path.exists(bin_label_dir):
         os.makedirs(bin_label_dir)
     
-    valid_bin_file_path = os.path.join(bin_label_dir, f'valid_{args.model_delta_nums}_{args.model_edc_nums}.csv')
+    valid_bin_file_path = os.path.join(bin_label_dir, f'valid_{deltanums}_{edcnums}.csv')
     if not os.path.exists(valid_bin_file_path):
         generate_feature_path(valid_file_path, valid_bin_file_path)
     if not os.path.exists(valid_bin_file_path):
         raise ValueError(f'LightGBM: {valid_bin_file_path} not found, generate failed')
     
-    test_bin_file_path = os.path.join(bin_label_dir, f'test_{args.model_delta_nums}_{args.model_edc_nums}.csv')
+    test_bin_file_path = os.path.join(bin_label_dir, f'test_{deltanums}_{edcnums}.csv')
     if not os.path.exists(test_bin_file_path):
         generate_feature_path(test_file_path, test_bin_file_path)
     if not os.path.exists(test_bin_file_path):
         raise ValueError(f'LightGBM: {test_bin_file_path} not found, generate failed')
 
     if args.model_fraction == '1':
-        train_bin_file_path = os.path.join(bin_label_dir, f'train_{args.model_delta_nums}_{args.model_edc_nums}.csv')
+        train_bin_file_path = os.path.join(bin_label_dir, f'train_{deltanums}_{edcnums}.csv')
     else:
-        train_bin_file_path = os.path.join(bin_label_dir, f'train_{args.model_fraction}_{args.model_delta_nums}_{args.model_edc_nums}.csv')
+        train_bin_file_path = os.path.join(bin_label_dir, f'train_{args.model_fraction}_{deltanums}_{edcnums}.csv')
     if not os.path.exists(train_bin_file_path):
         generate_feature_path(train_file_path, train_bin_file_path)
     if not os.path.exists(train_bin_file_path):
@@ -119,19 +127,7 @@ if __name__ == '__main__':
     test_data = load_dataset(test_bin_file_path)
 
     #####################################################
-    param = {
-        'boosting_type': 'gbdt', 
-        'objective': 'binary', 
-        'metric': 'l2',
-        'learning_rate': 0.01,
-        'num_boost_round': 8000,
-        'num_leaves': 31, 
-        'max_depth': 6,
-        'subsample': 0.8, 
-        'colsample_bytree': 0.8,
-    }
-
-    bst = lgb.train(param, train_data, valid_sets=[valid_data], callbacks=[
+    bst = lgb.train(training_config, train_data, valid_sets=[valid_data], callbacks=[
         lgb.early_stopping(stopping_rounds=50),
     ])
     ypred = bst.predict(test_data.data)
@@ -164,7 +160,7 @@ if __name__ == '__main__':
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
     
-    this_ckpt_path = os.path.join(checkpoint_dir, f'{args.dataset}_{args.model_fraction}_{args.model_delta_nums}_{args.model_edc_nums}.txt')
+    this_ckpt_path = os.path.join(checkpoint_dir, f'{args.dataset}_{args.model_fraction}_{deltanums}_{edcnums}.txt')
     bst.save_model(this_ckpt_path)
     
     with open(os.path.join(checkpoint_dir, 'threshold'), 'w') as f:
@@ -175,14 +171,11 @@ if __name__ == '__main__':
 
     #########################################
     if args.real_test:
-        gbm_gen = lambda : LightGBMModel.from_config(args.model_delta_nums, args.model_edc_nums, this_ckpt_path, best_threshold)
+        gbm_gen = lambda : LightGBMModel.from_config(deltanums, edcnums, this_ckpt_path, best_threshold)
         oracle_predicitons = test_data.label
 
-        bench_cache = BoostCache(False, test_file_path, align_type, PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), hash_type, cache_line_size, capacity, associativity)
-        bench_cache.set_boost_preds(copy.deepcopy(bench_predicitons.tolist()))
-
-        oracle_cache = BoostCache(False, test_file_path, align_type, PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), hash_type, cache_line_size, capacity, associativity)
-        oracle_cache.set_boost_preds(copy.deepcopy(oracle_predicitons.tolist()))
+        bench_cache = BoostCache(copy.deepcopy(bench_predicitons.tolist()), test_file_path, align_type, PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), hash_type, cache_line_size, capacity, associativity)
+        oracle_cache = BoostCache(copy.deepcopy(oracle_predicitons.tolist()), test_file_path, align_type, PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), hash_type, cache_line_size, capacity, associativity)
 
         with DataTrace(test_file_path) as trace:
             with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
