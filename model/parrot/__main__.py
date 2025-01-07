@@ -19,6 +19,7 @@ if __name__ == '__main__':
     parser.add_argument("--dataset", type=str, default='xalanc')
     parser.add_argument("--device", type=str, default='cpu')
     parser.add_argument("-f", "--model_fraction", type=str, default='1')
+    parser.add_argument("-p", "--model_config_path", type=str, default='checkpoints/parrot/model_config.json')
     parser.add_argument("--checkpoints_root_dir", type=str, default='checkpoints')
     parser.add_argument("--traces_root_dir", type=str, default='traces')
     parser.add_argument("--real_test", action='store_true')
@@ -54,32 +55,31 @@ if __name__ == '__main__':
         align_type = ShiftAligner
         hash_type = ShiftHashFunction
 #################################################################################################
-    total_steps = 20000
-    lr = 0.001
-    batch_size = 32
-    collection_multiplier = 5
-    dagger_init = 1
-    dagger_final = 1
-    dagger_steps = 200000
-    dagger_update_freq = 50000
-    eval_freq = 5000
-    save_freq = 5000
+    if not os.path.exists(args.model_config_path):
+        raise ValueError(f'Parrot: {args.model_config_path} not found')
+    with open(args.model_config_path, "r") as f:
+        model_config = json.load(f)
 
+    lr = model_config['lr']
+    total_steps = model_config['total_steps']
+    eval_freq = model_config['eval_freq']
+    save_freq = model_config['save_freq']
+    batch_size = model_config['batch_size']
+
+    print(f'Parrot: lr[{lr}], total_steps[{total_steps}], eval_freq[{eval_freq}], save_freq[{save_freq}], batch_size[{batch_size}]')
+
+    collection_multiplier = model_config['collection_multiplier']
+    dagger_init = model_config['dagger_init']
+    dagger_final = model_config['dagger_final']
+    dagger_steps = model_config['dagger_steps']
+    dagger_update_freq = model_config['dagger_update_freq']
+    print(f'Parrot: Dagger collection_multiplier[{collection_multiplier}], dagger_init[{dagger_init}], dagger_final[{dagger_final}], dagger_steps[{dagger_steps}], dagger_update_freq[{dagger_update_freq}]')
+    
     checkpoint_dir = os.path.join(args.checkpoints_root_dir, 'parrot', args.dataset, args.model_fraction)
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
-    # total_steps = 1000
-    # batch_size = 8
-    # collection_multiplier = 2
-    # dagger_steps = 800
-    # dagger_update_freq = 5
-    # save_freq = 200
-#################################################################################################
-    model_config_path = os.path.join(args.checkpoints_root_dir, 'parrot', "model_config.json")
-    with open(model_config_path, "r") as f:
-        model_config = json.load(f)
-    parrot_model = ParrotModel.from_config(model_config_path, None)
+    parrot_model = ParrotModel.from_config(args.model_config_path, None)
     optimizer = torch.optim.Adam(parrot_model._model.parameters(), lr=lr)
 #################################################################################################
     evict_type = partial(CombineWeightsAlgorithm, 

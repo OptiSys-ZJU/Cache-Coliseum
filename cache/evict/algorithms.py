@@ -733,7 +733,8 @@ class CombineAlgorithm(EvictAlgorithm):
             else:
                 diff_keys = set(self.cache) - set(center_cache)
                 target_index = self.lazy_evictor.evict([(self.cache.index(k), self.key_scores[self.cache.index(k)] if self.key_scores is not None else 0) for k in diff_keys])
-        self.key_scores[target_index] = self.timestamp
+        if self.key_scores is not None:
+            self.key_scores[target_index] = self.timestamp
         self.cache[target_index], self.pcs[target_index] = address, pc
         self.timestamp += 1
         return hit
