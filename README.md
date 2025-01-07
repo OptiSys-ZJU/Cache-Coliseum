@@ -135,4 +135,28 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
   + `oracle_bin`: An offline predictor that gives the predicted next arrival time (reuse distance) of a page during prediction, potentially affected by noise (logdis or dis).
   + `oracle_dis`: An offline predictor that gives  a page's **belady's label**, potentially affected by noise (logdis, dis or bin).
 
+- Dump and Verbose
+
+  `dump_file`: Enables result dumping, saving test results in the format `$output_root_dir/$dataset/$fraction/$predictor.csv`.
+
+  `verbose`: Enables detailed output. When enabled, all statistical data (hits, misses, hit rates, and competitive ratios) will be displayed; otherwise, only hit_rate and competitive ratio will be shown.
+  
+- Boost
+  
+  In `real` mode, `boost` uses a pickle file from `boost_preds_dir` (creating it if it doesn't exist) to accelerate testing.
+
+  In `oracle` mode, boost utilizes a multiprocessing pool to handle all test tasks concurrently.
+
+  We also provide the `boost_fr` parameter, which enables the `Follow&Robust` algorithm to use the Belady trace for calculating the Belady cost within this algorithm. Without this optimization, the entire test process would be significantly slower.
+  
+- Model Config
+
+  To use the Parrot or GBM predictors, you must specify the following parameters (or use the defaults):
+
+  + `model_fraction` (default to 1): Specifies the fraction of the training set to be used for training. (In benchmarking, you must select a fraction corresponding to an existing pre-trained model.)
+  + `checkpoints_root_dir`: Checkpoints dir.
+  + `parrot_config_path`: The `parrot` predictor's config file.
+  + `lightgbm_config_path`: The `gbm` predictor's config file.
+
+
 ### Model Training
