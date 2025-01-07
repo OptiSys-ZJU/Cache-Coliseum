@@ -1,6 +1,6 @@
-# cache_alps
+# cache-coliseum
 
-A benchmark about Cache Algorithms and Predictor training with Parrot and LightGBM
+A benchmark for evaluating cache algorithms and predictor training, featuring Parrot and LightGBM implementations.
 
 ## Trace
 
