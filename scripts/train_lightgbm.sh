@@ -22,6 +22,6 @@ for dataset in "${!gbm_dict[@]}"; do
     fractions=(${gbm_dict[$dataset]})
     for fraction in "${fractions[@]}"; do
         echo "Running lightgbm with dataset=$dataset with fraction $fraction"
-        nohup python -m model.lightgbm --dataset "$dataset" --model_delta_nums 10 --model_edc_nums 10 --real_test -f $fraction -i > "logs/lightgbm/${dataset}_${fraction}.log" 2>&1 &
+        nohup python -m model.lightgbm --dataset "$dataset" --real_test -f $fraction -i > "logs/lightgbm/${dataset}_${fraction}.log" 2>&1 &
     done
 done
