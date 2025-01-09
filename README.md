@@ -4,7 +4,7 @@ A benchmark for evaluating cache algorithms and predictor training, featuring Pa
 
 ## Trace
 
-Based on xxx's work, we have reorganized the Brightkite and Cite datasets to conform to a unified format.
+Based on [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>, we have reorganized the Brightkite and Cite datasets to conform to a unified format.
 
 You can easily download all traces file, boost traces pickle and GBM Model Checkpoints from the Releases page.
 
@@ -111,19 +111,19 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
   | Algorithm | Parrot | PLECO | POPU | Pleco-Bin | GBM | Oracle-Dis (Belady) | Oracle-Bin (FBP) |
   |:----------|:------:|:-----:|:----:|:---------:|:---:|:----------:|:----------:|
-  | Rand                 | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
-  | LRU                  | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
-  | Marker               | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
-  | Predict              | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
-  | PredictiveMarker     | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
-  | LMarker              | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
-  | LNonMarker           | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
-  | Follower&Robust      | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
-  | Mark0                | &#10060; | &#10060; | &#10060; | &#10004; | &#10004; | &#10060; | &#10004; |
-  | Mark&Predict         | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10004; |
-  | CombineDeterministic | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
-  | CombineRandom        | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
-  | Guard                | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | Rand                               | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | LRU                                | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | Marker                             | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | Predict                            | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | PredictiveMarker<sup>[2]</sup>     | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | LMarker<sup>[3]</sup>              | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | LNonMarker<sup>[3]</sup>           | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | Follower&Robust<sup>[4]</sup>      | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | Mark0<sup>[5]</sup>                | &#10060; | &#10060; | &#10060; | &#10004; | &#10004; | &#10060; | &#10004; |
+  | Mark&Predict<sup>[5]</sup>         | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10004; |
+  | CombineDeterministic<sup>[6]</sup> | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | CombineRandom<sup>[6]</sup>        | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | Guard                              | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
 
 - Predictor
 
@@ -160,3 +160,122 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
 
 ### Model Training
+
+#### GBM Model
+
+```python
+python -m model.lightgbm [--dataset DATASET] [--device DEVICE]
+                    [--model_fraction MODEL_FRACTION] [--model_config_path MODEL_CONFIG_PATH]
+                    [--checkpoints_root_dir CHECKPOINTS_ROOT_DIR] [--traces_root_dir TRACES_ROOT_DIR]
+                    [--iter_threshold] [--real_test]
+```
+
+You can use our GBM training tool to generate and test cache model.
+
+- Params:
+  + `dataset`: Source dataset
+  + `device`: Model load device (in GBM, only `cpu` can work)
+  + `model_fraction`: The proportion of the training set used for training. The default value is 1, indicating that the entire training set will be used.
+  + `model_config_path`: Model's config
+  + `checkpoints_root_dir`: The directory where the checkpoint files are saved after training is completed.
+  + `traces_root_dir`: The directory where the datasets are stored.
+  + `iter_threshold`: When enabled, this iteratively adjusts the binary splitting threshold from 0 to 1 to determine the optimal threshold for binary classification. If disabled, the threshold defaults to 0.5.
+  + `real_test`: After training is completed, the test set will be loaded to evaluate the model's performance.
+
+- Config Example:
+  ```json
+  {
+      "delta_nums": 10,
+      "edc_nums": 10,
+      "training": {
+          "boosting_type": "gbdt", 
+          "objective": "binary", 
+          "metric": "l2",
+          "learning_rate": 0.01,
+          "num_boost_round": 8000,
+          "num_leaves": 31, 
+          "max_depth": 6,
+          "subsample": 0.8, 
+          "colsample_bytree": 0.8
+      }
+  }
+  ```
+
+  `delta_nums` and `edc_nums`: The dimensions of the **Delta** and **EDC** features, respectively. For more details, refer to [webcachesim2](https://github.com/sunnyszy/lrb) and [Learning relaxed Belady for content distribution network caching](https://dl.acm.org/doi/10.5555/3388242.3388281)<sup>[7]</sup>.
+
+  `training`: The training parameters that will be used by LightGBM.
+
+#### Parrot Model
+
+```python
+python -m model.parrot [--dataset DATASET] [--device DEVICE]
+                    [--model_fraction MODEL_FRACTION] [--model_config_path MODEL_CONFIG_PATH]
+                    [--checkpoints_root_dir CHECKPOINTS_ROOT_DIR] [--traces_root_dir TRACES_ROOT_DIR]
+```
+
+- Params:
+  + `dataset`: Source dataset
+  + `device`: Model load device (Parrot use `CUDA_VISIBLE_DEVICES` to set target device)
+  + `model_fraction`: The proportion of the training set used for training. The default value is 1, indicating that the entire training set will be used.
+  + `model_config_path`: Model's config
+  + `checkpoints_root_dir`: The directory where the checkpoint files are saved after training is completed.
+  + `traces_root_dir`: The directory where the datasets are stored.
+ 
+- Config Example:
+  ```json
+  {
+    "address_embedder": {
+        "embed_dim": 64,
+        "max_vocab_size": 5000,
+        "type": "dynamic-vocab"
+    },
+    "cache_line_embedder": "address_embedder",
+    "cache_pc_embedder": "none",
+    "loss": [
+        "ndcg",
+        "reuse_dist"
+    ],
+    "lstm_hidden_size": 128,
+    "max_attention_history": 30,
+    "pc_embedder": {
+        "embed_dim": 64,
+        "max_vocab_size": 5000,
+        "type": "dynamic-vocab"
+    },
+    "positional_embedder": {
+        "embed_dim": 128,
+        "type": "positional"
+    },
+    "sequence_length": 80,
+    "lr": 0.001,
+    "total_steps": 25000,
+    "eval_freq": 5000,
+    "save_freq": 5000,
+    "batch_size": 32,
+    "collection_multiplier": 5,
+    "dagger_init": 1,
+    "dagger_final": 1,
+    "dagger_steps": 200000,
+    "dagger_update_freq": 50000
+  }
+  ```
+  
+  You can find more details about Parrot and its training in [cache_replacement](https://github.com/google-research/google-research/tree/master/cache_replacement)<sup>[8]</sup>.
+
+## References
+
+[1] Chłędowski, Jakub Polak, Adam Szabucki, Bartosz Zolna, Konrad. 2021. Robust Learning-Augmented Caching: An Experimental Study. 10.48550/arXiv.2106.14693. 
+
+[2] Thodoris Lykouris and Sergei Vassilvitskii. 2021. Competitive Caching with Machine Learned Advice. J. ACM 68, 4, Article 24 (August 2021), 25 pages. https://doi.org/10.1145/3447579
+
+[3] Dhruv Rohatgi. 2020. Near-optimal bounds for online caching with machine learned advice. In Proceedings of the Thirty-First Annual ACM-SIAM Symposium on Discrete Algorithms (SODA '20). Society for Industrial and Applied Mathematics, USA, 1834–1845.
+
+[4] Sadek, K. A. and Elias, M. Algorithms for caching and mts with reduced number of predictions. arXiv preprint arXiv:2404.06280, 2024.
+
+[5] Antonios Antoniadis, Joan Boyar, Marek Eliáš, Lene M. Favrholdt, Ruben Hoeksma, Kim S. Larsen, Adam Polak, and Bertrand Simon. 2023. Paging with succinct predictions. In Proceedings of the 40th International Conference on Machine Learning (ICML'23), Vol. 202. JMLR.org, Article 39, 952–968.
+
+[6] Wei, A. Better and simpler learning-augmented online caching. arXiv preprint arXiv:2005.13716, 2020.
+
+[7] Zhenyu Song, Daniel S. Berger, Kai Li, and Wyatt Lloyd. 2020. Learning relaxed Belady for content distribution network caching. In Proceedings of the 17th Usenix Conference on Networked Systems Design and Implementation (NSDI'20). USENIX Association, USA, 529–544.
+
+[8] Evan Zheran Liu, Milad Hashemi, Kevin Swersky, Parthasarathy Ranganathan, and Junwhan Ahn. 2020. An imitation learning approach for cache replacement. In Proceedings of the 37th International Conference on Machine Learning (ICML'20), Vol. 119. JMLR.org, Article 579, 6237–6247.
