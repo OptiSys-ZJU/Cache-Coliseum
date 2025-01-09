@@ -40,6 +40,19 @@ if __name__ == '__main__':
             'Guard[FBP]-f-pred-relax-times-5': 'guardfbp5',
         },
 
+        'Parrot': {
+            'Marker': 'Marker',
+            'Predict[Parrot]': 'FTP',
+            'PredMark[Parrot]': 'PredMark',
+            'LMarker[Parrot]': 'LMarker',
+            'LNonMarker[Parrot]': 'LNonMarker',
+            'CombDet[Predict[Parrot], Marker]': 'BlindOracleD',
+            'CombineRandom[Predict[Parrot], Marker]': 'BlindOracleR',
+            'FollowerRobust[ParrotState]': 'F&R',
+            'Guard[Parrot]-f-pred-no-relax': 'Guard&FTP0',
+            'Guard[Parrot]-f-pred-relax-times-5': 'Guard&FTP5',
+        },
+
         'PLECO': {
             'Marker': 'Marker',
             'Predict[PLECO]': 'FTP',
@@ -87,7 +100,7 @@ if __name__ == '__main__':
         },
 
     }
-    mode = 'OracleDis'
+    mode = 'Parrot'
     root_dir_path = 'stat'
     res_csv_path = 'plot_res'
     res_dict = {}
@@ -193,7 +206,8 @@ if __name__ == '__main__':
                             print(f"Data has been written to {res_path}")
             else:
                 dir_path = os.path.join(full_path, '1')                
-                this_path = os.path.join(dir_path, 'pleco_popu_pleco-bin.csv')
+                # this_path = os.path.join(dir_path, 'pleco_popu_pleco-bin.csv')
+                this_path = os.path.join(dir_path, 'parrot.csv')
                 if os.path.exists(this_path):
                     df = pd.read_csv(this_path)
                     result_dict = df.set_index('Name').T.to_dict('dict')

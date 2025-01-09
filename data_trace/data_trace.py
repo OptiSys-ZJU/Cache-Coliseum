@@ -26,6 +26,7 @@ import tqdm
 import hashlib
 
 from utils.aligner import Aligner
+from cache.hash import HashFunction
 
 
 class DataTrace(object):
@@ -122,7 +123,7 @@ class OracleDataTrace(object):
     Should be used in a with block.
     """
 
-    def __init__(self, filename, aligner: Aligner, max_look_ahead=int(1e7)):
+    def __init__(self, filename, aligner: Aligner, hasher: HashFunction, scale_times=10000, offset=0, max_look_ahead=int(1e7)):
         """Constructs from a file containing the memory trace.
 
         Args:
@@ -143,8 +144,13 @@ class OracleDataTrace(object):
 
         # Maps address --> list of next access times in the look ahead buffer
         self._access_times = collections.defaultdict(collections.deque)
+        self._bucket_access_times = collections.defaultdict(collections.deque)
         self._look_ahead_buffer = collections.deque()
         self._aligner = aligner
+        self._hasher = hasher
+        self._bucket_counter = [0] * self._hasher._num_buckets
+        self._scale = scale_times
+        self._offset = offset
 
         # Optimization: only catch the StopIteration in _read_next once.
         # Without this optimization, the StopIteration is caught max_look_ahead
@@ -162,6 +168,9 @@ class OracleDataTrace(object):
             return f'{pc}_{self._aligner.get_aligned_addr(address)}'
         else:
             return self._aligner.get_aligned_addr(address)
+    
+    def get_bucket_idx(self, pc, address):
+        return self._hasher.get_bucket_index(self._aligner.get_aligned_addr(address), pc)
 
     def _read_next(self):
         """Adds the next row in the CSV memory trace to the look-ahead buffer.
@@ -176,6 +185,11 @@ class OracleDataTrace(object):
             self._look_ahead_buffer.append((pc, address))
             # Align to cache line            
             self._access_times[self.get_key(pc, address)].append(len(self._look_ahead_buffer) + self._num_next_calls)
+
+            this_bucket_idx = self.get_bucket_idx(pc, address)
+            self._bucket_access_times[self.get_key(pc, address)].append(self._bucket_counter[this_bucket_idx])
+            self._bucket_counter[this_bucket_idx] += 1
+
         except StopIteration:
             self._reader_exhausted = True
 
@@ -190,10 +204,13 @@ class OracleDataTrace(object):
         # Align to cache line
         key = self.get_key(pc, address)
         self._access_times[key].popleft()
+        self._bucket_access_times[key].popleft()
 
         # Memory optimization: discard keys that have no current access times.
         if not self._access_times[key]:
             del self._access_times[key]
+        if not self._bucket_access_times[key]:
+            del self._bucket_access_times[key]
 
         self._read_next()
         return pc, address
@@ -202,6 +219,15 @@ class OracleDataTrace(object):
         """True if the cursor points to the end of the trace."""
         return not self._look_ahead_buffer
     
+    def next_bucket_access_time_by_address(self, pc, address):
+        key = self.get_key(pc, address)
+        accesses = self._bucket_access_times[key]
+        if not accesses:
+            this_bucket_idx = self.get_bucket_idx(pc, address)
+            bucket_size = self._bucket_counter[this_bucket_idx]
+            return bucket_size * self._scale + self._offset
+        return accesses[0]
+
     def next_access_time_by_address(self, pc, address):
         """Returns number of accesses from cursor of next access of address.
 
@@ -214,7 +240,8 @@ class OracleDataTrace(object):
         key = self.get_key(pc, address)
         accesses = self._access_times[key]
         if not accesses:
-            return np.inf
+            total_size = len(self._look_ahead_buffer) + self._num_next_calls
+            return total_size * self._scale + self._offset
 
         return accesses[0]
 
