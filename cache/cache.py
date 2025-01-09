@@ -43,12 +43,14 @@ class Cache:
             self.__handle_oracle(trace_path)
 
     def __handle_oracle(self, trace_path):
-        with OracleDataTrace(trace_path, self._aligner) as sim_trace:
+        #with OracleDataTrace(trace_path, self._aligner, self.hash_func, scale_times=10000, offset=0) as sim_trace:
+        with OracleDataTrace(trace_path, self._aligner, self.hash_func, scale_times=1, offset=1) as sim_trace:
             # with tqdm.tqdm(desc="Oracle cache on MemoryTrace") as pbar:
             while not sim_trace.done():
                 pc, address = sim_trace.next()
                 aligned_address = self._aligner.get_aligned_addr(address)
-                self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].oracle_access(pc, aligned_address, sim_trace.next_access_time_by_address(pc, address))
+                self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].oracle_access(pc, aligned_address, sim_trace.next_bucket_access_time_by_address(pc, address))
+                # self.evict_algs[self.hash_func.get_bucket_index(aligned_address, pc)].oracle_access(pc, aligned_address, sim_trace.next_access_time_by_address(pc, address))
                 # pbar.update(1)
 
     def access(self, pc, address):

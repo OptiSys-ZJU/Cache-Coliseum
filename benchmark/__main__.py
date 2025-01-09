@@ -96,7 +96,7 @@ if __name__ == "__main__":
         this_dir = os.path.join(ckpt_root_dir, 'parrot', args.dataset, args.model_fraction)
         if not os.path.exists(this_dir):
             raise ValueError(f'Benchmark: {this_dir} not found checkpoints')
-        this_ckpt_path = os.path.join(this_dir, f'{args.dataset}_{args.model_fraction}.ckpt')
+        this_ckpt_path = os.path.join(this_dir, f'best.ckpt')
         if not os.path.exists(this_ckpt_path):
             raise ValueError(f'Benchmark: {this_ckpt_path} not found checkpoints')
         print('Parrot Model Checkpoint:', this_ckpt_path)
