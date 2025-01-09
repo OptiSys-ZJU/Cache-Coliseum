@@ -262,6 +262,10 @@ python -m model.parrot [--dataset DATASET] [--device DEVICE]
   
   You can find more details about Parrot and its training in [cache_replacement](https://github.com/google-research/google-research/tree/master/cache_replacement)<sup>[8]</sup>.
 
+### Script
+
+We also provide some scripts for training and testing, for reference purposes only. You can find them in the `scripts` folder.
+
 ## References
 
 [1] Chłędowski, Jakub Polak, Adam Szabucki, Bartosz Zolna, Konrad. 2021. Robust Learning-Augmented Caching: An Experimental Study. 10.48550/arXiv.2106.14693. 
