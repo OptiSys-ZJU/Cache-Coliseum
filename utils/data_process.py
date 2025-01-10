@@ -100,9 +100,9 @@ if __name__ == '__main__':
         },
 
     }
-    mode = 'Parrot'
+    mode = 'OracleLogDis'
     root_dir_path = 'stat'
-    res_csv_path = 'plot_res'
+    res_csv_path = 'plot_res-dis-1-1'
     res_dict = {}
     for dirpath in os.listdir(root_dir_path):
         dataset = dirpath
