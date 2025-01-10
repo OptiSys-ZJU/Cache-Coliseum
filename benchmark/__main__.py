@@ -319,8 +319,8 @@ if __name__ == "__main__":
         for online_type in online_types:
             register_func(online_type, 0)
 
-        oracle_logdis_noise_mask = [0, 10, 20, 50, 100]
-        oracle_dis_noise_mask = [0, 100, 200, 500, 1000, 2000, 5000, 10000]
+        oracle_logdis_noise_mask = [0, 5, 10, 20, 30, 40, 50]
+        oracle_dis_noise_mask = [0, 50, 100, 200, 500, 1000, 1500, 2000, 2500, 3000]
         oracle_bin_noise_mask = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
 
         if 'oracle_dis' in this_preds:
