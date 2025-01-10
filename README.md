@@ -105,7 +105,7 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
   
 - Algorithm
 
-  We implemented most of real algorithms in our benchmark, you can also implement and test your own algorithm in the benchmark
+  We implemented most of real algorithms in our benchmark, you can also implement and test your own algorithm in the benchmark.
 
   #### Algorithms and Predcitors compatibility
 
