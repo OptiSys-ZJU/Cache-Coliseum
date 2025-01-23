@@ -41,6 +41,7 @@ if __name__ == '__main__':
         },
 
         'Parrot': {
+            'LRU': 'LRU',
             'Marker': 'Marker',
             'Predict[Parrot]': 'FTP',
             'PredMark[Parrot]': 'PredMark',
@@ -54,6 +55,7 @@ if __name__ == '__main__':
         },
 
         'PLECO': {
+            'LRU': 'LRU',
             'Marker': 'Marker',
             'Predict[PLECO]': 'FTP',
             'PredMark[PLECO]': 'PredMark',
@@ -67,6 +69,7 @@ if __name__ == '__main__':
         },
 
         'POPU': {
+            'LRU': 'LRU',
             'Marker': 'Marker',
             'Predict[POPU]': 'FTP',
             'PredMark[POPU]': 'PredMark',
@@ -80,6 +83,7 @@ if __name__ == '__main__':
         },
 
         'PLECOBin': {
+            'LRU': 'LRU',
             'Marker': 'Marker',
             'Predict[PLECOBin]': 'FBP',
             'Mark0[PLECOBin]': 'Mark0',
@@ -90,6 +94,7 @@ if __name__ == '__main__':
         },
 
         'GBMBin': {
+            'LRU': 'LRU',
             'Marker': 'Marker',
             'Predict[GBMBin]': 'FBP',
             'Mark0[GBMBin]': 'Mark0',
@@ -100,129 +105,136 @@ if __name__ == '__main__':
         },
 
     }
-    mode = 'OracleLogDis'
-    root_dir_path = 'stat'
-    res_csv_path = 'plot_res-dis-1-1'
+
+    mode_enums = ['avg', 'bar', 'frac_bar', 'plot']
+
+    mode = 'plot'
+    predictor = 'OracleLogDis'
+    root_dir_path = 'dump/dis-1-1'
+    skip_bk_citi = True
+
+    if mode == 'plot':
+        skip_bk_citi = False
+        res_csv_path = 'plot_res'
+    
     res_dict = {}
     for dirpath in os.listdir(root_dir_path):
         dataset = dirpath
-        # if dataset == 'brightkite' or dataset == 'citi':
-        #     continue
+        if skip_bk_citi and (dataset == 'brightkite' or dataset == 'citi'):
+            continue
+
         full_path = os.path.join(root_dir_path, dirpath)
         if os.path.isdir(full_path):
-            if mode == 'GBMBin':
+            if mode == 'avg':
+                res_dict[dataset] = {}
+                if predictor == 'GBMBin':
+                    this_path = os.path.join(full_path, '1', 'gbm.csv')
+                elif predictor == 'PLECO' or predictor == 'POPU' or predictor == 'PLECOBin':
+                    this_path = os.path.join(full_path, '1', 'pleco_popu_pleco-bin.csv')
+                elif predictor == 'Parrot':
+                    this_path = os.path.join(full_path, '1', 'parrot.csv')
+                else:
+                    raise ValueError(f'no pred {predictor}')
+                
+                if os.path.exists(this_path):
+                    df = pd.read_csv(this_path)
+                    result_dict = df.set_index('Name').T.to_dict('dict')
+                    for name in result_dict:
+                        cr = result_dict[name]['Competitive Ratio']
+                        if name in name_dict[predictor]:
+                            res_name = name_dict[predictor][name]
+                            if res_name not in res_dict[dataset]:
+                                res_dict[dataset][res_name] = []
+                            res_dict[dataset][res_name].append(cr)
+            elif mode == 'frac_bar':
                 res_dict[dataset] = {}
                 for frac_path in os.listdir(full_path):
                     frac = float(frac_path)
-                    this_path = os.path.join(full_path, frac_path, 'gbm.csv')
+                    if predictor == 'GBMBin':
+                        this_path = os.path.join(full_path, frac_path, 'gbm.csv')
+                    else:
+                        raise ValueError(f'no pred {predictor}')
                     if os.path.exists(this_path):
                         df = pd.read_csv(this_path)
                         result_dict = df.set_index('Name').T.to_dict('dict')
-
                         lru = result_dict['LRU']['Competitive Ratio']
-
-                        for name in result_dict:
-                            cr = result_dict[name]['Competitive Ratio']
-                            res = (cr-1)/(lru-1)
-                            if name in name_dict[mode]:
-                                res_name = name_dict[mode][name]
-                                if res_name not in res_dict[dataset]:
-                                    res_dict[dataset][res_name] = []
-                                res_dict[dataset][res_name].append((frac, (cr-1)/(lru-1)))
-            elif mode == 'OracleLogDis':
-                this_dataset_plot_path = os.path.join(res_csv_path, dataset, 'logdis')
-                if not os.path.exists(this_dataset_plot_path):
-                    os.makedirs(this_dataset_plot_path)
-                dir_path = os.path.join(full_path, '1')                
-                this_path = os.path.join(dir_path, 'logdis.csv')
+                        if name in name_dict[predictor]:
+                            res_name = name_dict[predictor][name]
+                            if res_name not in res_dict[dataset]:
+                                res_dict[dataset][res_name] = []
+                            res_dict[dataset][res_name].append((frac, (cr-1)/(lru-1)))
+            elif mode == 'bar':         
+                if predictor == 'GBMBin':
+                    this_path = os.path.join(full_path, '1', 'gbm.csv')
+                elif predictor == 'PLECO' or predictor == 'POPU' or predictor == 'PLECOBin':
+                    this_path = os.path.join(full_path, '1', 'pleco_popu_pleco-bin.csv')
+                elif predictor == 'Parrot':
+                    this_path = os.path.join(full_path, '1', 'parrot.csv')
+                else:
+                    raise ValueError(f'no pred {predictor}')
                 if os.path.exists(this_path):
                     df = pd.read_csv(this_path)
                     result_dict = df.set_index('Name').T.to_dict('dict')
-                    for name in result_dict:
-                        if name in name_dict[mode]:
-                            alg_name = name_dict[mode][name]
-                            res_path = os.path.join(this_dataset_plot_path, f'{alg_name}.csv')
-                            tuple_list = []
-                            for noise, value in result_dict[name].items():
-                                if noise.startswith('LogDis-'):
-                                    this_x = noise.split('-')[1]
-                                    this_y = value.split('/')[1]
-                                    tuple_list.append((this_x, this_y))
-                            with open(res_path, mode='w', newline='') as file:
-                                writer = csv.writer(file)
-                                writer.writerow(['x', 'y'])
-                                for tup in tuple_list:
-                                    writer.writerow(tup)
-                            print(f"Data has been written to {res_path}")
-            elif mode == 'OracleDis':
-                this_dataset_plot_path = os.path.join(res_csv_path, dataset, 'dis')
-                if not os.path.exists(this_dataset_plot_path):
-                    os.makedirs(this_dataset_plot_path)
-                dir_path = os.path.join(full_path, '1')                
-                this_path = os.path.join(dir_path, 'dis.csv')
-                if os.path.exists(this_path):
-                    df = pd.read_csv(this_path)
-                    result_dict = df.set_index('Name').T.to_dict('dict')
-                    for name in result_dict:
-                        if name in name_dict[mode]:
-                            alg_name = name_dict[mode][name]
-                            res_path = os.path.join(this_dataset_plot_path, f'{alg_name}.csv')
-                            tuple_list = []
-                            for noise, value in result_dict[name].items():
-                                if noise.startswith('Dis-'):
-                                    this_x = noise.split('-')[1]
-                                    this_y = value.split('/')[1]
-                                    tuple_list.append((this_x, this_y))
-                            with open(res_path, mode='w', newline='') as file:
-                                writer = csv.writer(file)
-                                writer.writerow(['x', 'y'])
-                                for tup in tuple_list:
-                                    writer.writerow(tup)
-                            print(f"Data has been written to {res_path}")
-            elif mode == 'OracleBin':
-                this_dataset_plot_path = os.path.join(res_csv_path, dataset, 'bin')
-                if not os.path.exists(this_dataset_plot_path):
-                    os.makedirs(this_dataset_plot_path)
-                dir_path = os.path.join(full_path, '1')                
-                this_path = os.path.join(dir_path, 'bin.csv')
-                if os.path.exists(this_path):
-                    df = pd.read_csv(this_path)
-                    result_dict = df.set_index('Name').T.to_dict('dict')
-                    for name in result_dict:
-                        if name in name_dict[mode]:
-                            alg_name = name_dict[mode][name]
-                            res_path = os.path.join(this_dataset_plot_path, f'{alg_name}.csv')
-                            tuple_list = []
-                            for noise, value in result_dict[name].items():
-                                if noise.startswith('Bin-'):
-                                    this_x = noise.split('-')[1]
-                                    this_y = value.split('/')[1]
-                                    tuple_list.append((this_x, this_y))
-                            with open(res_path, mode='w', newline='') as file:
-                                writer = csv.writer(file)
-                                writer.writerow(['x', 'y'])
-                                for tup in tuple_list:
-                                    writer.writerow(tup)
-                            print(f"Data has been written to {res_path}")
-            else:
-                dir_path = os.path.join(full_path, '1')                
-                # this_path = os.path.join(dir_path, 'pleco_popu_pleco-bin.csv')
-                this_path = os.path.join(dir_path, 'parrot.csv')
-                if os.path.exists(this_path):
-                    df = pd.read_csv(this_path)
-                    result_dict = df.set_index('Name').T.to_dict('dict')
-
                     lru = result_dict['LRU']['Competitive Ratio']
-
                     for name in result_dict:
                         cr = result_dict[name]['Competitive Ratio']
-                        if name in name_dict[mode]:
-                            res_name = name_dict[mode][name]
+                        if name in name_dict[predictor]:
+                            res_name = name_dict[predictor][name]
                             if res_name not in res_dict:
                                 res_dict[res_name] = []
                             res_dict[res_name].append((dataset, (cr-1)/(lru-1)))
+            elif mode == 'plot':
+                if predictor == 'OracleBin':
+                    prefix = 'bin'
+                    start = 'Bin-'
+                elif predictor == 'OracleLogDis':
+                    prefix = 'logdis'
+                    start = 'LogDis-'
+                elif predictor == 'OracleDis':
+                    prefix = 'dis'
+                    start = 'Dis-'
 
-    if mode == 'GBMBin':
+                this_dataset_plot_path = os.path.join(res_csv_path, dataset, prefix)
+                if not os.path.exists(this_dataset_plot_path):
+                    os.makedirs(this_dataset_plot_path)
+                dir_path = os.path.join(full_path, '1')                
+                this_path = os.path.join(dir_path, f'{prefix}.csv')
+                if os.path.exists(this_path):
+                    df = pd.read_csv(this_path)
+                    result_dict = df.set_index('Name').T.to_dict('dict')
+                    for name in result_dict:
+                        if name in name_dict[predictor]:
+                            alg_name = name_dict[predictor][name]
+                            res_path = os.path.join(this_dataset_plot_path, f'{alg_name}.csv')
+                            tuple_list = []
+                            for noise, value in result_dict[name].items():
+                                if noise.startswith(start):
+                                    this_x = noise.split('-')[1]
+                                    this_y = value.split('/')[1]
+                                    tuple_list.append((this_x, this_y))
+                            with open(res_path, mode='w', newline='') as file:
+                                writer = csv.writer(file)
+                                writer.writerow(['x', 'y'])
+                                for tup in tuple_list:
+                                    writer.writerow(tup)
+                            print(f"Data has been written to {res_path}")
+    if mode == 'avg':
+        # avg
+        sum_d = {}
+        cnt_d = {}
+        for dataset, d in sorted(res_dict.items()):
+            for name, l in d.items():
+                if name not in sum_d:
+                    sum_d[name] = 0
+                    cnt_d[name] = 0
+                
+                sum_d[name] += l[0]
+                cnt_d[name] += 1
+
+        for name in sum_d.keys():
+            print(f'{name}: {sum_d[name]/cnt_d[name]}')
+
+    elif mode == 'frac_bar':
         for dataset, d in sorted(res_dict.items()):
             print(dataset)
             for name, l in d.items():
@@ -230,7 +242,7 @@ if __name__ == '__main__':
                 sorted_list = sorted(l, key=lambda x: x[0])
                 for t in sorted_list:
                     print(f'({t[0]},{t[1]})')
-    else:
+    elif mode == 'bar':
         for name, l in res_dict.items():
             sorted_list = sorted(l, key=lambda x: x[0])
             print(name)
