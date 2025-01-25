@@ -106,12 +106,14 @@ if __name__ == '__main__':
 
     }
 
-    mode_enums = ['avg', 'bar', 'frac_bar', 'plot']
+    mode_enums = ['avg', 'lru_avg', 'bar', 'frac_bar', 'plot']
 
-    mode = 'plot'
-    predictor = 'OracleLogDis'
-    root_dir_path = 'dump/dis-1-1'
+    mode = 'avg'
+    predictor = 'Parrot'
+    root_dir_path = 'dump/stat_parrot'
     skip_bk_citi = True
+    
+    print(mode)
 
     if mode == 'plot':
         skip_bk_citi = False
@@ -146,6 +148,28 @@ if __name__ == '__main__':
                             if res_name not in res_dict[dataset]:
                                 res_dict[dataset][res_name] = []
                             res_dict[dataset][res_name].append(cr)
+            elif mode == 'lru_avg':
+                res_dict[dataset] = {}
+                if predictor == 'GBMBin':
+                    this_path = os.path.join(full_path, '1', 'gbm.csv')
+                elif predictor == 'PLECO' or predictor == 'POPU' or predictor == 'PLECOBin':
+                    this_path = os.path.join(full_path, '1', 'pleco_popu_pleco-bin.csv')
+                elif predictor == 'Parrot':
+                    this_path = os.path.join(full_path, '1', 'parrot.csv')
+                else:
+                    raise ValueError(f'no pred {predictor}')
+                
+                if os.path.exists(this_path):
+                    df = pd.read_csv(this_path)
+                    result_dict = df.set_index('Name').T.to_dict('dict')
+                    lru = result_dict['LRU']['Competitive Ratio']
+                    for name in result_dict:
+                        cr = result_dict[name]['Competitive Ratio']
+                        if name in name_dict[predictor]:
+                            res_name = name_dict[predictor][name]
+                            if res_name not in res_dict[dataset]:
+                                res_dict[dataset][res_name] = []
+                            res_dict[dataset][res_name].append((cr-1)/(lru-1))
             elif mode == 'frac_bar':
                 res_dict[dataset] = {}
                 for frac_path in os.listdir(full_path):
@@ -218,7 +242,7 @@ if __name__ == '__main__':
                                 for tup in tuple_list:
                                     writer.writerow(tup)
                             print(f"Data has been written to {res_path}")
-    if mode == 'avg':
+    if mode == 'avg' or mode == 'lru_avg':
         # avg
         sum_d = {}
         cnt_d = {}
