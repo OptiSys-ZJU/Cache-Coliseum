@@ -99,8 +99,8 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
     `boost_preds_dir` `model_fraction` `checkpoints_root_dir` `parrot_config_path` `lightgbm_config_path` don't work
 
 - Noise Type
-  + `logdis`: Log Normal Noise on Next Arrival Time (Reuse Distance)
-  + `dis`: Normal Noise on Next Arrival Time (Reuse Distance)
+  + `logdis`: Log Normal Noise on Next Request Time (Reuse Distance)
+  + `dis`: Normal Noise on Next Request Time (Reuse Distance)
   + `bin`: Binary Flipping Noise on Belady's label (FBP label)
   
 - Algorithm
@@ -127,12 +127,12 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
 - Predictor
 
-  + `parrot`: A Parrot Imitation Model, gives a page's score when predicting (regarded as reuse distance)
-  + `pleco`: A PLECO Model, gives a page's next arrival time (reuse distance) when predicting.
-  + `popu`: A Popularity Model, gives a page's next arrival time (reuse distance) when predicting.
+  + `parrot`: A Parrot Imitation Model, gives each page a score when predicting (regarded as eviction priority)
+  + `pleco`: A PLECO Model, gives a page's next request time (reuse distance) when predicting.
+  + `popu`: A Popularity Model, gives a page's next request time (reuse distance) when predicting.
   + `pleco-bin`: A PLECO Binary Model based on PLECO, gives a page's **belady's label** when predicting
   + `gbm`: A Grandient Boosting Machine based on Delta and EDC features, gives a page's **belady's label** when predicting
-  + `oracle_bin`: An offline predictor that gives the predicted next arrival time (reuse distance) of a page during prediction, potentially affected by noise (logdis or dis).
+  + `oracle_bin`: An offline predictor that gives the predicted next request time (reuse distance) of a page during prediction, potentially affected by noise (logdis or dis).
   + `oracle_dis`: An offline predictor that gives  a page's **belady's label**, potentially affected by noise (logdis, dis or bin).
 
 - Dump and Verbose
