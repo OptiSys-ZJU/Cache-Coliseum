@@ -109,7 +109,7 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
   #### Algorithms and Predictors compatibility
 
-  | Algorithm | Parrot | PLECO | POPU | Pleco-Bin | GBM | Oracle-Dis (Belady) | Oracle-Bin (FBP) |
+  | Algorithm | PLECO | POPU | Parrot | Pleco-Bin | GBM | Oracle-Dis (Belady) | Oracle-Bin (FBP) |
   |:----------|:------:|:-----:|:----:|:---------:|:---:|:----------:|:----------:|
   | Rand                               | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
   | LRU                                | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
@@ -127,13 +127,13 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
 - Predictor
 
-  + `parrot`: A Parrot Imitation Model, gives each page a score when predicting (regarded as eviction priority)
-  + `pleco`: A PLECO Model, gives a page's next request time (reuse distance) when predicting.
-  + `popu`: A Popularity Model, gives a page's next request time (reuse distance) when predicting.
-  + `pleco-bin`: A PLECO Binary Model based on PLECO, gives a page's **belady's label** when predicting
-  + `gbm`: A Gradient Boosting Machine based on Delta and EDC features, gives a page's **belady's label** when predicting
+  + `parrot`: A Parrot Imitation Model that predicts eviction priority for each page.
+  + `pleco`: A PLECO Model that gives a page's next request time (reuse distance) when predicting.
+  + `popu`: A Popularity Model that gives a page's next request time (reuse distance) when predicting.
+  + `pleco-bin`: A PLECO Binary Model based on PLECO that gives a page's **belady's label** when predicting
+  + `gbm`: A Gradient Boosting Machine based on Delta and EDC features that gives a page's **belady's label** when predicting
   + `oracle_bin`: An offline predictor that gives the predicted next request time (reuse distance) of a page during prediction, potentially affected by noise (logdis or dis).
-  + `oracle_dis`: An offline predictor that gives  a page's **belady's label**, potentially affected by noise (logdis, dis or bin).
+  + `oracle_dis`: An offline predictor that gives a page's **belady's label**, potentially affected by noise (logdis, dis or bin).
 
 - Dump and Verbose
 
