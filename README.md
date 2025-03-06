@@ -6,15 +6,15 @@ A benchmark for evaluating cache algorithms and predictor training, featuring Pa
 
 Based on [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>, we have reorganized the Brightkite and Cite datasets to conform to a unified format.
 
-You can easily download all traces file, boost traces pickle and GBM Model Checkpoints from the Releases page.
+You can easily download all trace files, boost traces pickle and GBM Model Checkpoints from the Releases page.
 
 ## Environment
 
-We use a environment based on Python 3.10.16 with Anaconda3 (Anaconda3-2021.05-Linux-x86_64.sh), we strongly recommend using Anaconda for Python package management and virtual environment.
+We use an environment based on Python 3.10.16 with Anaconda3 (Anaconda3-2021.05-Linux-x86_64.sh), we strongly recommend using Anaconda for Python package management and virtual environment.
 
 You can also install your own environment based on another Python Version but only pay attention that:
-- If you want to use the `Parrot` Model, you should install your torch env(in our benchmark, we use CUDA 12.4 to enbale Torch GPU)
-- Because of different Python pickle rules, the released `boost-traces.zip` maybe doesn't work in your env, so you need to generate your own boost trace file.
+- If you want to use the `Parrot` Model, you should install your torch env(in our benchmark, we use CUDA 12.4 to enable Torch GPU)
+- Because of different Python pickle rules, the released `boost-traces.zip` may not work in your env, so you need to generate your own boost trace file.
 
 ## Usage
 
@@ -63,7 +63,7 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
   `--device`: Model target device, like `cpu`, `cuda:0` and `cuda:1`...
 
-  This option only works for the `parrot` predcitor, in other cases we only use CPU.
+  This option only works for the `parrot` predictor, in other cases we only use CPU.
   
 - Mode
 
@@ -83,7 +83,7 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
     `boost` will use pickle traces (`num_workers` doesn't work)
 
-    `noise_type` don't work
+    `noise_type` doesn't work
     
   - Oracle Mode
 
@@ -99,17 +99,17 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
     `boost_preds_dir` `model_fraction` `checkpoints_root_dir` `parrot_config_path` `lightgbm_config_path` don't work
 
 - Noise Type
-  + `logdis`: Log Normal Noise on Next Arrival Time (Reuse Distance)
-  + `dis`: Normal Noise on Next Arrival Time (Reuse Distance)
+  + `logdis`: Log Normal Noise on Next Request Time (Reuse Distance)
+  + `dis`: Normal Noise on Next Request Time (Reuse Distance)
   + `bin`: Binary Flipping Noise on Belady's label (FBP label)
   
 - Algorithm
 
-  We implemented most of real algorithms in our benchmark, you can also implement and test your own algorithm in the benchmark.
+  We implemented most of the existing algorithms in our benchmark, you can also implement and test your own algorithm in the benchmark.
 
-  #### Algorithms and Predcitors compatibility
+  #### Algorithms and Predictors compatibility
 
-  | Algorithm | Parrot | PLECO | POPU | Pleco-Bin | GBM | Oracle-Dis (Belady) | Oracle-Bin (FBP) |
+  | Algorithm | PLECO | POPU | Parrot | Pleco-Bin | GBM | Oracle-Dis (Belady) | Oracle-Bin (FBP) |
   |:----------|:------:|:-----:|:----:|:---------:|:---:|:----------:|:----------:|
   | Rand                               | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
   | LRU                                | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
@@ -127,19 +127,19 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
 - Predictor
 
-  + `parrot`: A Parrot Imitation Model, gives a page's score when predicting (regarded as reuse distance)
-  + `pleco`: A PLECO Model, gives a page's next arrival time (reuse distance) when predicting.
-  + `popu`: A Popularity Model, gives a page's next arrival time (reuse distance) when predicting.
-  + `pleco-bin`: A PLECO Binary Model based on PLECO, gives a page's **belady's label** when predicting
-  + `gbm`: A Grandient Boosting Machine based on Delta and EDC features, gives a page's **belady's label** when predicting
-  + `oracle_bin`: An offline predictor that gives the predicted next arrival time (reuse distance) of a page during prediction, potentially affected by noise (logdis or dis).
-  + `oracle_dis`: An offline predictor that gives  a page's **belady's label**, potentially affected by noise (logdis, dis or bin).
+  + `pleco`: A PLECO Model that gives a page's next request time (reuse distance) when predicting.
+  + `popu`: A Popularity Model that gives a page's next request time (reuse distance) when predicting.
+  + `parrot`: A Parrot Imitation Model that predicts eviction priority for each page.
+  + `pleco-bin`: A PLECO Binary Model based on PLECO that gives a page's **belady's label** when predicting
+  + `gbm`: A Gradient Boosting Machine based on Delta and EDC features that gives a page's **belady's label** when predicting
+  + `oracle_bin`: An offline predictor that gives the predicted next request time (reuse distance) of a page during prediction, potentially affected by noise (logdis or dis).
+  + `oracle_dis`: An offline predictor that gives a page's **belady's label**, potentially affected by noise (logdis, dis or bin).
 
 - Dump and Verbose
 
   `dump_file`: Enables result dumping, saving test results in the format `$output_root_dir/$dataset/$fraction/$predictor.csv`.
 
-  `verbose`: Enables detailed output. When enabled, all statistical data (hits, misses, hit rates, and competitive ratios) will be displayed; otherwise, only hit_rate and competitive ratio will be shown.
+  `verbose`: Enables detailed output. When enabled, all statistical data (hits, misses, hit rates, and competitive ratios) will be displayed; otherwise, only the hit rate and competitive ratio will be shown.
   
 - Boost
   
@@ -170,7 +170,7 @@ python -m model.lightgbm [--dataset DATASET] [--device DEVICE]
                     [--iter_threshold] [--real_test]
 ```
 
-You can use our GBM training tool to generate and test cache model.
+You can use our GBM training tool to generate and test the cache model.
 
 - Params:
   + `dataset`: Source dataset
@@ -272,7 +272,7 @@ We also provide some scripts for training and testing, for reference purposes on
 
 [2] Thodoris Lykouris and Sergei Vassilvitskii. 2021. Competitive Caching with Machine Learned Advice. J. ACM 68, 4, Article 24 (August 2021), 25 pages. https://doi.org/10.1145/3447579
 
-[3] Dhruv Rohatgi. 2020. Near-optimal bounds for online caching with machine learned advice. In Proceedings of the Thirty-First Annual ACM-SIAM Symposium on Discrete Algorithms (SODA '20). Society for Industrial and Applied Mathematics, USA, 1834–1845.
+[3] Dhruv Rohatgi. 2020. Near-optimal bounds for online caching with machine-learned advice. In Proceedings of the Thirty-First Annual ACM-SIAM Symposium on Discrete Algorithms (SODA '20). Society for Industrial and Applied Mathematics, USA, 1834–1845.
 
 [4] Sadek, K. A. and Elias, M. Algorithms for caching and mts with reduced number of predictions. arXiv preprint arXiv:2404.06280, 2024.
 
