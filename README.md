@@ -10,10 +10,10 @@ You can easily download all traces file, boost traces pickle and GBM Model Check
 
 ## Environment
 
-We use a environment based on Python 3.8.8 with Anaconda3 (Anaconda3-2021.05-Linux-x86_64.sh), we strongly recommend using Anaconda for Python package management and virtual environment.
+We use a environment based on Python 3.10.16 with Anaconda3 (Anaconda3-2021.05-Linux-x86_64.sh), we strongly recommend using Anaconda for Python package management and virtual environment.
 
 You can also install your own environment based on another Python Version but only pay attention that:
-- If you want to use the `Parrot` Model, you should install your torch env(in our benchmark, we use CUDA 11.4 to enbale Torch GPU)
+- If you want to use the `Parrot` Model, you should install your torch env(in our benchmark, we use CUDA 12.4 to enbale Torch GPU)
 - Because of different Python pickle rules, the released `boost-traces.zip` maybe doesn't work in your env, so you need to generate your own boost trace file.
 
 ## Usage
