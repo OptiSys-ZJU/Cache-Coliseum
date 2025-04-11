@@ -123,7 +123,7 @@ class OracleDataTrace(object):
     Should be used in a with block.
     """
 
-    def __init__(self, filename, aligner: Aligner, hasher: HashFunction, scale_times=10000, offset=0, max_look_ahead=int(1e7)):
+    def __init__(self, filename, aligner: Aligner, hasher: HashFunction, scale_times=1, offset=1, max_look_ahead=int(1e7)):
         """Constructs from a file containing the memory trace.
 
         Args:
@@ -317,6 +317,24 @@ class CSVReader(MemoryTraceReader):
         pc, address = next(self._csv_reader)
         # Convert hex string to int
         return int(pc, 16), int(address, 16)
+
+class CSVIntListReader(MemoryTraceReader):
+    """Reads CSV-formatted rows of integers.
+
+    Expects each line to be a comma-separated list of integers:
+        val1,val2,val3,...
+    
+    Returns:
+        A list of integers for each line.
+    """
+
+    def __init__(self, f):
+        super(CSVIntListReader, self).__init__(f)
+        self._csv_reader = csv.reader(f)
+
+    def next(self):
+        row = next(self._csv_reader)
+        return [int(x) for x in row]
 
 class CSVHashReader(MemoryTraceReader):
     def __init__(self, f):

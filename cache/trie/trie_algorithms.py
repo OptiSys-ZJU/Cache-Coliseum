@@ -1,8 +1,11 @@
-from collections import defaultdict
+from collections import defaultdict, deque
+from functools import partial
+import types
 from cache.evict.algorithms import BaseEvictAlgorithm
-from typing import List, Tuple, Type
+from typing import List, Tuple, Type, Union
 
-from cache.evict.evictor import LRUEvictor, RandEvictor
+from cache.evict.evictor import Evictor, LRUEvictor, RandEvictor
+from cache.evict.predictor import OraclePredictor, Predictor
 
 class TrieNode:
     def __init__(self):
@@ -73,6 +76,7 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
                 " " * current_indent,
                 len(current_node.key),
                 current_node.key[:10],
+                current_node.metadata if current_node.metadata is not None else '',
             )
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
@@ -86,6 +90,68 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
     def access(self, pc, aligned_address: List) -> Tuple:
         pass
 
+
+class TriePredictAlgorithm(TrieEvictAlgorithm):
+    def __init__(self, max_node_num, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial]):
+        super().__init__(max_node_num)
+
+        cls_type = predictor_type.func if hasattr(predictor_type, 'func') else predictor_type
+        if issubclass(cls_type, OraclePredictor):
+            def oracle_access(self, pc, address, next_access_time):
+                self.predictor.oracle_access(pc, address, next_access_time)
+            self.oracle_access = types.MethodType(oracle_access, self)
+
+        self.timestamp = 0
+        self.evictor = evictor_type()
+        self.predictor = predictor_type()
+
+        ### store preds per access
+        self.to_fill_nodes = deque()
+    
+    def __visit_node__(self, node: TrieNode):
+        self.to_fill_nodes.append(node)
+    
+    def __add_node__(self, node: TrieNode):
+        self.to_fill_nodes.append(node)
+    
+    def __evict__(self, evict_num):
+        leaves = self.__leaves__()
+        if leaves[0] == self.root_node:
+            raise ValueError("Can't evict root node")
+        
+        for i in range(evict_num):
+            a = list(enumerate([leaf.metadata for leaf in leaves]))
+            target_idx = self.evictor.evict(a)
+            target_leaf = leaves[target_idx]
+
+            target_parent = target_leaf.parent
+            del target_parent.children[target_leaf.key]
+            self.cur_node_num -= 1
+            if len(target_parent.children) == 0:
+                leaves.append(target_parent)
+            leaves.remove(target_leaf)
+    
+    def after_pred(self, pc ,address):
+        cur_preds = deque(self.predictor.predict_score(self.timestamp, pc, address, None))
+        assert len(self.to_fill_nodes) == len(cur_preds)
+        while cur_preds:
+            pred = cur_preds.popleft()
+            node = self.to_fill_nodes.popleft()
+            node.metadata = pred
+
+        self.timestamp += 1
+
+    def access(self, pc, aligned_address: List) -> Tuple:
+        this_node, insert_list = self.__match__(aligned_address)
+        self.__insert__(this_node, insert_list)
+
+        self.after_pred(pc, aligned_address)
+
+        assert len(self.to_fill_nodes) == 0
+
+        return (len(aligned_address), len(aligned_address) - len(insert_list), len(insert_list))
+
+#############################################
 class TrieRandAlgorithm(TrieEvictAlgorithm):
     def __init__(self, max_node_num):
         super().__init__(max_node_num)
@@ -110,7 +176,6 @@ class TrieRandAlgorithm(TrieEvictAlgorithm):
         this_node, insert_list = self.__match__(aligned_address)
         self.__insert__(this_node, insert_list)
         return (len(aligned_address), len(aligned_address) - len(insert_list), len(insert_list))
-    
 
 class TrieLRUAlgorithm(TrieEvictAlgorithm):
     def __init__(self, max_node_num):

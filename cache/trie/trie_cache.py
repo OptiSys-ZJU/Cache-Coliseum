@@ -1,9 +1,14 @@
-from collections import defaultdict
+from functools import partial
 from typing import List, Tuple, Type
 
+import tqdm
+
 from cache.cache import BaseCache
+from cache.evict.evictor import ReuseDistanceEvictor
+from cache.evict.predictor import OracleReuseDistancePredictor
 from cache.hash import HashFunction, OneHashFunction
-from cache.trie.trie_algorithms import TrieEvictAlgorithm, TrieLRUAlgorithm, TrieRandAlgorithm
+from cache.trie.trie_algorithms import TrieEvictAlgorithm, TrieLRUAlgorithm, TriePredictAlgorithm, TrieRandAlgorithm
+from data_trace.trie_data_trace import OracleTrieDataTrace, TrieDataTrace
 from utils.aligner import Aligner, ListAligner
 
 class TrieCache(BaseCache):
@@ -33,15 +38,29 @@ class TrieCache(BaseCache):
         assert hash_type == OneHashFunction
         self.hash_func = hash_type(num_sets)
         self.evict_algs = []
+        ###################################################################
+        oracle = False
         for _ in range(num_sets):
             evict_alg = evict_type(associativity)  
+            if hasattr(evict_alg, 'oracle_access'):
+                oracle = True
             self.evict_algs.append(evict_alg)
-
+        if oracle:
+            self.__handle_oracle(trace_path)
+    
     def pretty_print(self):
         for i, evict_alg in enumerate(self.evict_algs):
             print('---------------------------')
             print(f'Tree [{i}]')
             evict_alg.pretty_print()
+        print(f'[Total/Hit/Miss]: [{self.stat_info[0]}/{self.stat_info[1]}/{self.stat_info[2]}]')
+
+    def __handle_oracle(self, trace_path):
+        with OracleTrieDataTrace(trace_path, self._aligner, self.hash_func, scale_times=1, offset=1) as sim_trace:
+            while not sim_trace.done():
+                pc, address = sim_trace.next()
+                aligned_address = self._aligner.get_aligned_addr(address)
+                self.evict_algs[self.hash_func.get_bucket_index(aligned_address, TrieCache.dummy_pc)].oracle_access(TrieCache.dummy_pc, aligned_address, sim_trace.next_bucket_access_time_by_address(address))
 
     def access(self, pc, address: List):
         aligned_address = self._aligner.get_aligned_addr(address)
@@ -49,15 +68,24 @@ class TrieCache(BaseCache):
         self.stat_info = [x + y for x, y in zip(self.stat_info, stat)]
 
 if __name__ == "__main__":
-    # tree = TrieCache('', ListAligner, OneHashFunction, TrieLRUAlgorithm, 1, 5, 5)
-    tree = TrieCache('', ListAligner, OneHashFunction, TrieRandAlgorithm, 1, 5, 5)
-    tree.access(TrieCache.dummy_pc, [1,2,3,4])
-    tree.pretty_print()
-    tree.access(TrieCache.dummy_pc, [1,2,3,5])
-    tree.pretty_print()
-    tree.access(TrieCache.dummy_pc, [1,2,3,4])
-    tree.access(TrieCache.dummy_pc, [1,2,3,4])
-    tree.access(TrieCache.dummy_pc, [1,2,3,4])
-    tree.access(TrieCache.dummy_pc, [1,2,3,4])
-    tree.access(TrieCache.dummy_pc, [3])
-    tree.pretty_print()
+    file_path = 'a.csv'
+    size = 10
+    alg = partial(TriePredictAlgorithm, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=0, lognormal=True))
+    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
+    with TrieDataTrace(file_path) as trace:
+        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
+            while not trace.done():
+                pc, address = trace.next()
+                cache.access(pc, address)
+                pbar.update(1)
+    cache.pretty_print()
+
+    alg = TrieLRUAlgorithm
+    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
+    with TrieDataTrace(file_path) as trace:
+        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
+            while not trace.done():
+                pc, address = trace.next()
+                cache.access(pc, address)
+                pbar.update(1)
+    cache.pretty_print()

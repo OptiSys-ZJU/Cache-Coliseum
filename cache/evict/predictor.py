@@ -54,16 +54,27 @@ class OraclePredictor(ABC):
         self.reuse_dis_noise_sigma = reuse_dis_noise_sigma
         self.enable_lognormal = lognormal
     
-    def oracle_access(self, pc, address, next_access_time):
+    def oracle_access(self, pc, address: Union[int, str, List[Union[int, str]]], next_access_time: Union[int, List[int]]):
         if self.reuse_dis_noise_sigma == 0:
             self.__oracle_access__(pc, address, next_access_time)
         else:
+            next_access_time = np.asarray(next_access_time)
             if self.enable_lognormal:
-                self.__oracle_access__(pc, address, next_access_time + np.random.lognormal(0, self.reuse_dis_noise_sigma))
+                noise = np.random.lognormal(0, self.reuse_dis_noise_sigma, size=next_access_time.shape)
             else:
-                self.__oracle_access__(pc, address, next_access_time + np.random.normal(0, self.reuse_dis_noise_sigma))
+                noise = np.random.normal(0, self.reuse_dis_noise_sigma, size=next_access_time.shape)
+
+            noisy_time = next_access_time + noise
+
+            if np.isscalar(next_access_time) or np.ndim(next_access_time) == 0:
+                noisy_time = noisy_time.item()
+            else:
+                noisy_time = noisy_time.tolist()
+
+            self.__oracle_access__(pc, address, noisy_time)
+
     @abstractmethod
-    def __oracle_access__(self, pc, address, next_access_time):
+    def __oracle_access__(self, pc, address: Union[int, str, List[Union[int, str]]], next_access_time: Union[int, List[int]]):
         pass
 
 class OracleReuseDistancePredictor(ReuseDistancePredictor, OraclePredictor):
@@ -72,13 +83,13 @@ class OracleReuseDistancePredictor(ReuseDistancePredictor, OraclePredictor):
         self.oracle_preds = collections.deque()
         self.oracle_check = oracle_check
     
-    def predict_score(self, ts, pc, address, cache_state):
+    def predict_score(self, ts, pc, address: Union[int, str, List[Union[int, str]]], cache_state):
         oracle_key, next_access_time = self.oracle_preds.popleft()
         if self.oracle_check and oracle_key != address:
             raise ValueError("OracleReuseDistancePredictAlgorithm: oracle key not equals to key")
         return next_access_time
 
-    def __oracle_access__(self, pc, address, next_access_time):
+    def __oracle_access__(self, pc, address: Union[int, str, List[Union[int, str]]], next_access_time: Union[int, List[int]]):
         self.oracle_preds.append((address, next_access_time))
 
 class OracleBinaryPredictor(BinaryPredictor, OraclePredictor):
