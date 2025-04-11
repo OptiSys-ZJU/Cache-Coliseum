@@ -9,7 +9,14 @@ from types import SimpleNamespace
 import copy
 import numpy as np
 
-class Cache:
+class BaseCache:
+    def __init__(self):
+        pass
+
+    def access(self, pc, address):
+        pass
+
+class Cache(BaseCache):
     def __init__(self, trace_path, aligner_type: Type[Aligner], evict_type: Type[EvictAlgorithm], hash_type:Type[HashFunction], cache_line_size, cache_capacity, associativity):        
         self.evict_algs = None
         self.hits = 0

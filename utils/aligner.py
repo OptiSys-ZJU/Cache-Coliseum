@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 import numpy as np
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type
 
 class Aligner(ABC):
     def __init__(self, cache_line_size):
@@ -28,3 +29,10 @@ class NormalAligner(Aligner):
     
     def get_aligned_addr(self, address):
         return address
+
+class ListAligner(Aligner):
+    def __init__(self, cache_line_size=1):
+        super().__init__(cache_line_size)
+    
+    def get_aligned_addr(self, address: List) -> List[Tuple]:
+        return [tuple(address[i:i + self._cache_line_size]) for i in range(0, len(address), self._cache_line_size)]

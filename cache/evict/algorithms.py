@@ -8,7 +8,15 @@ import types
 import copy
 import random
 
-class EvictAlgorithm(ABC):
+class BaseEvictAlgorithm(ABC):
+    def __init__(self):
+        pass
+
+    @abstractmethod
+    def access(self, pc, address) -> Union[bool, Tuple]:
+        pass
+
+class EvictAlgorithm(BaseEvictAlgorithm):
     """Evict an entry from one cache line
     
     Max size is associativity
@@ -17,13 +25,10 @@ class EvictAlgorithm(ABC):
         self.cache = [None] * associativity
         self.pcs = [None] * associativity
         self.associativity = associativity
+        super().__init__()
     
     def snapshot(self):
         return list(zip(self.cache, self.pcs))
-    
-    @abstractmethod
-    def access(self, pc, address) -> bool:
-        pass
 
     def boost_access(self, pc, address, boost_pred) -> bool:
         return self.access(pc, address)
