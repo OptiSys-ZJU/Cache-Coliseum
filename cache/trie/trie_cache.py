@@ -68,8 +68,8 @@ class TrieCache(BaseCache):
         self.stat_info = [x + y for x, y in zip(self.stat_info, stat)]
 
 if __name__ == "__main__":
-    file_path = 'a.csv'
-    size = 10
+    file_path = 'traces/a.csv'
+    size = 9
     alg = partial(TriePredictAlgorithm, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=0, lognormal=True))
     cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
     with TrieDataTrace(file_path) as trace:
