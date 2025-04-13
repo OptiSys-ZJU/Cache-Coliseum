@@ -7,7 +7,7 @@ from cache.cache import BaseCache
 from cache.evict.evictor import ReuseDistanceEvictor
 from cache.evict.predictor import OracleReuseDistancePredictor
 from cache.hash import HashFunction, OneHashFunction
-from cache.trie.trie_algorithms import TrieEvictAlgorithm, TrieLRUAlgorithm, TriePredictAlgorithm, TrieRandAlgorithm
+from cache.trie.trie_algorithms import TrieEvictAlgorithm, TrieGuard, TrieLRUAlgorithm, TriePredictAlgorithm, TrieRandAlgorithm
 from data_trace.trie_data_trace import OracleTrieDataTrace, TrieDataTrace
 from utils.aligner import Aligner, ListAligner
 
@@ -48,12 +48,15 @@ class TrieCache(BaseCache):
         if oracle:
             self.__handle_oracle(trace_path)
     
+    def pretty_stat(self):
+        print(f'[Total/Hit/Miss]: [{self.stat_info[0]}/{self.stat_info[1]}/{self.stat_info[2]}]')
+
     def pretty_print(self):
         for i, evict_alg in enumerate(self.evict_algs):
             print('---------------------------')
             print(f'Tree [{i}]')
             evict_alg.pretty_print()
-        print(f'[Total/Hit/Miss]: [{self.stat_info[0]}/{self.stat_info[1]}/{self.stat_info[2]}]')
+        self.pretty_stat()
 
     def __handle_oracle(self, trace_path):
         with OracleTrieDataTrace(trace_path, self._aligner, self.hash_func, scale_times=1, offset=1) as sim_trace:
@@ -70,17 +73,18 @@ class TrieCache(BaseCache):
 if __name__ == "__main__":
     file_path = 'traces/a.csv'
     size = 9
-    alg = partial(TriePredictAlgorithm, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=0, lognormal=True))
-    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
-    with TrieDataTrace(file_path) as trace:
-        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
-            while not trace.done():
-                pc, address = trace.next()
-                cache.access(pc, address)
-                pbar.update(1)
-    cache.pretty_print()
 
-    alg = TrieLRUAlgorithm
+    # alg = TrieLRUAlgorithm
+    # cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
+    # with TrieDataTrace(file_path) as trace:
+    #     with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
+    #         while not trace.done():
+    #             pc, address = trace.next()
+    #             cache.access(pc, address)
+    #             pbar.update(1)
+    # cache.pretty_print()
+
+    alg = partial(TriePredictAlgorithm, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=5, lognormal=True))
     cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
     with TrieDataTrace(file_path) as trace:
         with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
@@ -88,4 +92,15 @@ if __name__ == "__main__":
                 pc, address = trace.next()
                 cache.access(pc, address)
                 pbar.update(1)
-    cache.pretty_print()
+    cache.pretty_stat()
+
+    alg = partial(TrieGuard, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=5, lognormal=True), follow_if_guarded=False, relax_times=0, relax_prob=0)
+    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
+    with TrieDataTrace(file_path) as trace:
+        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
+            while not trace.done():
+                pc, address = trace.next()
+                cache.access(pc, address)
+                # cache.pretty_print()
+                pbar.update(1)
+    cache.pretty_stat()
