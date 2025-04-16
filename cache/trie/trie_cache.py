@@ -78,15 +78,19 @@ class TrieCache(BaseCache):
         self.stat_info = [x + y for x, y in zip(self.stat_info, stat)]
 
 if __name__ == "__main__":
-    file_path = 'traces/oass1_val.csv'
-    # size = 3226
-    size = 4096
+    # file_path = 'traces/oass1_val.csv'
+    # # size = 3226
+    # size = 4096
+
+    file_path = 'traces/oass1_train.csv'
+    # size = 12129
+    size = 16384
+
     reuse_dis_noise_sigma = 10
 
     relax_times = 0
 
-    # file_path = 'traces/oass1_train.csv'
-    # size = 12129
+
 
     print('--------------')
     print('LRU')
@@ -103,6 +107,18 @@ if __name__ == "__main__":
     print('--------------')
     print('RAND')
     alg = TrieRandAlgorithm
+    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
+    with TrieDataTrace(file_path) as trace:
+        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
+            while not trace.done():
+                pc, address = trace.next()
+                cache.access(pc, address)
+                pbar.update(1)
+    cache.pretty_stat()
+
+    print('--------------')
+    print('OPT')
+    alg = partial(TriePredictAlgorithm, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=0, lognormal=True))
     cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
     with TrieDataTrace(file_path) as trace:
         with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:

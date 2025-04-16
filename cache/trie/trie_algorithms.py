@@ -1,4 +1,5 @@
 from collections import defaultdict, deque
+import copy
 from functools import partial
 import random
 import types
@@ -96,7 +97,7 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
         self.leaf_nodes = [self.root_node]
     
     def __leaves__(self):
-        return self.leaf_nodes.copy()
+        return self.leaf_nodes[:]
     
     def __mark_as_non_leaf__(self, node):
         if node in self.leaf_nodes:
@@ -127,6 +128,9 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
     def __insert__(self, this_node, insert_list: List[Tuple]):
         # evict test
         insert_len = len(insert_list)
+        if insert_len == 0:
+            return
+        
         evict_num = self.cur_node_num + insert_len - self.max_node_num
         if evict_num > 0:
             self.__evict__(evict_num, this_node)
@@ -228,7 +232,6 @@ class TriePredictAlgorithm(TrieEvictAlgorithm):
         assert len(self.to_fill_nodes) == 0
 
         return (len(aligned_address), len(aligned_address) - len(insert_list), len(insert_list))
-
 
 class TrieGuard(TriePredictAlgorithm):
     def __init__(self, max_node_num, evictor_type, predictor_type, **kwargs):
