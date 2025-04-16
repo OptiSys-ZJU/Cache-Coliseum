@@ -1,5 +1,4 @@
 from collections import defaultdict, deque
-import copy
 from functools import partial
 import random
 import types
@@ -15,6 +14,9 @@ class TrieNode:
         self.parent = None
         self.key = None
         self.metadata = None
+
+        self.old_visited = -1
+        self.guard = -1
     
     def __str__(self):
         return f"TrieNode(key={self.key}, metadata={self.metadata}, children_count={len(self.children)})"
@@ -37,8 +39,52 @@ class TrieNode:
             if current.key is not None:
                 path.append(current.key)
             current = current.parent
-        reversed_path = list(reversed(path))
-        return tuple(reversed_path[1:])
+        
+        return tuple(reversed(path[1:]))
+
+class SimpleTrie:
+    def __init__(self):
+        self.root = {}
+
+    def add(self, keys):
+        d = self.root
+        for k in keys:
+            d = d.setdefault(k, {})
+
+    def full_match(self, keys):
+        """Return True if keys fully matched the trie"""
+        d = self.root
+        for k in keys:
+            if k not in d:
+                return False
+            d = d[k]
+        return True
+
+class Trie:
+    def __init__(self):
+        self.root_node = TrieNode()
+    
+    def match(self, keys):
+        this_node = self.root_node
+        for idx, key in enumerate(keys):
+            if key in this_node.children.keys():
+                this_node = this_node.children[key]
+            else:
+                return this_node, keys[idx:]
+        return this_node, []
+
+    def add(self, keys):
+        this_node = self.root_node
+        for idx, key in enumerate(keys):
+            if key in this_node.children.keys():
+                this_node = this_node.children[key]
+            else:
+                new_node = TrieNode()
+                new_node.key = key
+                this_node.children[key] = new_node
+                new_node.parent = this_node
+                this_node = new_node
+
 
 class TrieEvictAlgorithm(BaseEvictAlgorithm):
     def __init__(self, max_node_num):
@@ -47,19 +93,26 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
         self.root_node.key = ()
         self.cur_node_num = 0
         self.max_node_num = max_node_num
+        self.leaf_nodes = [self.root_node]
     
-    def __leaves__(self) -> List[TrieNode]:
-        ret_list = []
-        stack = [self.root_node]
+    def __leaves__(self):
+        return self.leaf_nodes.copy()
+    
+    def __mark_as_non_leaf__(self, node):
+        if node in self.leaf_nodes:
+            self.leaf_nodes.remove(node)
 
-        while stack:
-            cur_node = stack.pop()
-            if len(cur_node.children) == 0:
-                ret_list.append(cur_node)
-            else:
-                stack.extend(cur_node.children.values())
-
-        return ret_list
+    def __mark_as_leaf__(self, node):
+        if node not in self.leaf_nodes:
+            self.leaf_nodes.append(node)
+    
+    def __delete_leaf_node__(self, node):
+        target_parent = node.parent
+        del target_parent.children[node.key]
+        self.cur_node_num -= 1
+        self.leaf_nodes.remove(node)
+        if len(target_parent.children) == 0:
+            self.__mark_as_leaf__(target_parent)
     
     def __match__(self, aligned_address: List) -> Tuple[TrieNode, List]:
         this_node = self.root_node
@@ -77,15 +130,16 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
         evict_num = self.cur_node_num + insert_len - self.max_node_num
         if evict_num > 0:
             self.__evict__(evict_num, this_node)
-
         for key in insert_list:
             new_node = TrieNode()
             new_node.key = key
             self.__add_node__(new_node)
+            self.__mark_as_non_leaf__(this_node)
             this_node.children[key] = new_node
             new_node.parent = this_node
             this_node = new_node
             self.cur_node_num += 1
+        self.__mark_as_leaf__(this_node)
     
     def __evict__(self, evict_num, this_node):
         pass
@@ -142,23 +196,18 @@ class TriePredictAlgorithm(TrieEvictAlgorithm):
         self.to_fill_nodes.append(node)
     
     def __evict__(self, evict_num, this_node):
-        leaves = self.__leaves__()
-        if leaves[0] == self.root_node:
-            raise ValueError("Can't evict root node")
-        if this_node in leaves:
-            leaves.remove(this_node)
-        
         for i in range(evict_num):
+            leaves = self.__leaves__()
+            if leaves[0] == self.root_node:
+                raise ValueError("Can't evict root node")
+            if this_node in leaves:
+                leaves.remove(this_node)
+
             a = list(enumerate([leaf.metadata for leaf in leaves]))
             target_idx = self.evictor.evict(a)
             target_leaf = leaves[target_idx]
 
-            target_parent = target_leaf.parent
-            del target_parent.children[target_leaf.key]
-            self.cur_node_num -= 1
-            if len(target_parent.children) == 0:
-                leaves.append(target_parent)
-            leaves.remove(target_leaf)
+            self.__delete_leaf_node__(target_leaf)
     
     def after_pred(self, pc ,address):
         cur_preds = deque(self.predictor.predict_score(self.timestamp, pc, address, None))
@@ -185,15 +234,12 @@ class TrieGuard(TriePredictAlgorithm):
     def __init__(self, max_node_num, evictor_type, predictor_type, **kwargs):
         super().__init__(max_node_num, evictor_type, predictor_type)
 
-        self.old_visited_set = []
-        self.guarded_set = []
-        self.phase_evicted_set = []
+        self.phase_timestamp = 0
+        self.phase_evicted_set = SimpleTrie()
         self.error_times = 0
 
-        if 'follow_if_guarded' in kwargs:
-            self.follow_if_guarded = kwargs['follow_if_guarded']
-        else:
-            self.follow_if_guarded = False
+        self.follow_if_guarded = kwargs.get('follow_if_guarded', False)
+        
         if 'relax_times' in kwargs:
             self.relax_times = kwargs['relax_times']
         else:
@@ -218,36 +264,51 @@ class TrieGuard(TriePredictAlgorithm):
             new_node = TrieNode()
             new_node.key = key
             self.__add_node__(new_node)
+            self.__mark_as_non_leaf__(this_node)
             this_node.children[key] = new_node
             new_node.parent = this_node
             this_node = new_node
             self.cur_node_num += 1
 
+        self.__mark_as_leaf__(this_node)
+
         return to_guard
 
-    def __evict__(self, evict_num, this_node, aligned_address):
-        leaves = self.__leaves__()
-        if leaves[0] == self.root_node:
-            raise ValueError("Can't evict root node")
-        if this_node in leaves:
-            leaves.remove(this_node)
+    def __mark_old_visited__(self, keys):
+        this_node = self.root_node
+        for idx, key in enumerate(keys):
+            assert key in this_node.children.keys()
+            this_node.old_visited = self.timestamp
+            this_node = this_node.children[key]
+    
+    def __mark_guarded__(self, keys):
+        this_node = self.root_node
+        for idx, key in enumerate(keys):
+            assert key in this_node.children.keys()
+            this_node.guard = self.timestamp
+            this_node = this_node.children[key]
 
+    def __evict__(self, evict_num, this_node, aligned_address):
         to_guard = False
-        for i in range(evict_num):
+        for _ in range(evict_num):
+            leaves = self.__leaves__()
+            if leaves[0] == self.root_node:
+                raise ValueError("Can't evict root node")
+            if this_node in leaves:
+                leaves.remove(this_node)
+
             unvisited_idx = []
-            for i, leaf in enumerate(leaves):
-                path = TrieNode.get_path_tuple_from_node(leaf)
-                if not any(TrieNode.is_prefix(path, vp) for vp in self.old_visited_set):
-                    unvisited_idx.append(i)
+            for idx, leaf in enumerate(leaves):
+                if leaf.old_visited < self.phase_timestamp:
+                    unvisited_idx.append(idx)
 
             if not unvisited_idx:
                 # new phase
-                self.old_visited_set = []
-                self.guarded_set = []
-                self.phase_evicted_set = []
+                self.phase_timestamp = self.timestamp
+                self.phase_evicted_set = SimpleTrie()
                 self.error_times = 0
             
-            if any(TrieNode.is_prefix(p, tuple(aligned_address)) for p in self.phase_evicted_set):
+            if self.phase_evicted_set.full_match(aligned_address):
                 if self.relax_times != 0:
                     self.error_times += 1
                     if self.error_times >= self.relax_times:
@@ -260,25 +321,17 @@ class TrieGuard(TriePredictAlgorithm):
                 target_idx = random.choice(unvisited_idx)
             else:
                 unguarded_idx = []
-                for i, leaf in enumerate(leaves):
-                    path = TrieNode.get_path_tuple_from_node(leaf)
-                    if not any(TrieNode.is_prefix(path, gp) for gp in self.guarded_set):
-                        unguarded_idx.append(i)
+                for idx, leaf in enumerate(leaves):
+                    if leaf.guard < self.phase_timestamp:
+                        unguarded_idx.append(idx)
                 target_idx = self.evictor.evict([(i, leaves[i].metadata) for i in unguarded_idx])
 
             target_leaf = leaves[target_idx]
 
             ## handle evict
-            self.phase_evicted_set.append(TrieNode.get_path_tuple_from_node(target_leaf))
+            self.phase_evicted_set.add(TrieNode.get_path_tuple_from_node(target_leaf))
 
-            ## do delete
-            target_parent = target_leaf.parent
-            del target_parent.children[target_leaf.key]
-            self.cur_node_num -= 1
-            if len(target_parent.children) == 0:
-                leaves.append(target_parent)
-            
-            leaves.remove(target_leaf)
+            self.__delete_leaf_node__(target_leaf)
         
         return to_guard
 
@@ -286,9 +339,9 @@ class TrieGuard(TriePredictAlgorithm):
         this_node, insert_list = self.__match__(aligned_address)
         to_guard = self.__insert__(this_node, insert_list, aligned_address)
 
-        self.old_visited_set.append(tuple(aligned_address))
+        self.__mark_old_visited__(tuple(aligned_address))
         if to_guard:
-            self.guarded_set.append(tuple(aligned_address))
+            self.__mark_guarded__(tuple(aligned_address))
 
         self.after_pred(pc, aligned_address)
 
@@ -303,21 +356,17 @@ class TrieRandAlgorithm(TrieEvictAlgorithm):
         self.evictor = RandEvictor()
 
     def __evict__(self, evict_num, this_node):
-        leaves = self.__leaves__()
-        if leaves[0] == self.root_node:
-            raise ValueError("Can't evict root node")
-        if this_node in leaves:
-            leaves.remove(this_node)
-        
         for i in range(evict_num):
+            leaves = self.__leaves__()
+            if leaves[0] == self.root_node:
+                raise ValueError("Can't evict root node")
+            if this_node in leaves:
+                leaves.remove(this_node)
+
             target_idx = self.evictor.evict(list(enumerate(leaves)))
             target_leaf = leaves[target_idx]
-            target_parent = target_leaf.parent
-            del target_parent.children[target_leaf.key]
-            self.cur_node_num -= 1
-            if len(target_parent.children) == 0:
-                leaves.append(target_parent)
-            leaves.remove(target_leaf)
+            
+            self.__delete_leaf_node__(target_leaf)
     
     def access(self, pc, aligned_address: List) -> Tuple:
         this_node, insert_list = self.__match__(aligned_address)
@@ -337,22 +386,17 @@ class TrieLRUAlgorithm(TrieEvictAlgorithm):
         node.metadata = self.counter
     
     def __evict__(self, evict_num, this_node):
-        leaves = self.__leaves__()
-        if leaves[0] == self.root_node:
-            raise ValueError("Can't evict root node")
-        if this_node in leaves:
-            leaves.remove(this_node)
-        
         for i in range(evict_num):
+            leaves = self.__leaves__()
+            if leaves[0] == self.root_node:
+                raise ValueError("Can't evict root node")
+            if this_node in leaves:
+                leaves.remove(this_node)
+
             target_idx = self.evictor.evict(list(enumerate([leaf.metadata for leaf in leaves])))
             target_leaf = leaves[target_idx]
 
-            target_parent = target_leaf.parent
-            del target_parent.children[target_leaf.key]
-            self.cur_node_num -= 1
-            if len(target_parent.children) == 0:
-                leaves.append(target_parent)
-            leaves.remove(target_leaf)
+            self.__delete_leaf_node__(target_leaf)
     
     def access(self, pc, aligned_address: List) -> Tuple:
         this_node, insert_list = self.__match__(aligned_address)

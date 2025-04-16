@@ -69,7 +69,7 @@ class OraclePredictor(ABC):
             if np.isscalar(next_access_time) or np.ndim(next_access_time) == 0:
                 noisy_time = noisy_time.item()
             else:
-                noisy_time = noisy_time.tolist()
+                noisy_time = sorted(noisy_time.tolist())
 
             self.__oracle_access__(pc, address, noisy_time)
 

@@ -1,5 +1,5 @@
 from functools import partial
-from typing import List, Tuple, Type
+from typing import List, Type
 
 import tqdm
 
@@ -49,7 +49,14 @@ class TrieCache(BaseCache):
             self.__handle_oracle(trace_path)
     
     def pretty_stat(self):
-        print(f'[Total/Hit/Miss]: [{self.stat_info[0]}/{self.stat_info[1]}/{self.stat_info[2]}]')
+        total, hit, miss = self.stat_info
+        print(f'[Total/Hit/Miss]: [{total}/{hit}/{miss}]')
+        if total > 0:
+            hit_rate = hit / total
+            print(f'[Hit Rate]: {hit_rate:.4f}')
+        else:
+            print('[Hit Rate]: N/A (Total is 0)')
+
 
     def pretty_print(self):
         for i, evict_alg in enumerate(self.evict_algs):
@@ -71,20 +78,19 @@ class TrieCache(BaseCache):
         self.stat_info = [x + y for x, y in zip(self.stat_info, stat)]
 
 if __name__ == "__main__":
-    file_path = 'traces/a.csv'
-    size = 9
+    file_path = 'traces/oass1_val.csv'
+    # size = 3226
+    size = 4096
+    reuse_dis_noise_sigma = 10
 
-    # alg = TrieLRUAlgorithm
-    # cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
-    # with TrieDataTrace(file_path) as trace:
-    #     with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
-    #         while not trace.done():
-    #             pc, address = trace.next()
-    #             cache.access(pc, address)
-    #             pbar.update(1)
-    # cache.pretty_print()
+    relax_times = 0
 
-    alg = partial(TriePredictAlgorithm, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=5, lognormal=True))
+    # file_path = 'traces/oass1_train.csv'
+    # size = 12129
+
+    print('--------------')
+    print('LRU')
+    alg = TrieLRUAlgorithm
     cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
     with TrieDataTrace(file_path) as trace:
         with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
@@ -94,7 +100,33 @@ if __name__ == "__main__":
                 pbar.update(1)
     cache.pretty_stat()
 
-    alg = partial(TrieGuard, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=5, lognormal=True), follow_if_guarded=False, relax_times=0, relax_prob=0)
+    print('--------------')
+    print('RAND')
+    alg = TrieRandAlgorithm
+    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
+    with TrieDataTrace(file_path) as trace:
+        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
+            while not trace.done():
+                pc, address = trace.next()
+                cache.access(pc, address)
+                pbar.update(1)
+    cache.pretty_stat()
+
+    print('--------------')
+    print('Belady')
+    alg = partial(TriePredictAlgorithm, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=reuse_dis_noise_sigma, lognormal=True))
+    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
+    with TrieDataTrace(file_path) as trace:
+        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
+            while not trace.done():
+                pc, address = trace.next()
+                cache.access(pc, address)
+                pbar.update(1)
+    cache.pretty_stat()
+
+    print('--------------')
+    print('Guard')
+    alg = partial(TrieGuard, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=reuse_dis_noise_sigma, lognormal=True), follow_if_guarded=False, relax_times=relax_times, relax_prob=0)
     cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
     with TrieDataTrace(file_path) as trace:
         with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
