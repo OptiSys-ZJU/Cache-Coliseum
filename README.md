@@ -1,6 +1,6 @@
 # cache-coliseum
 
-A benchmark for evaluating cache algorithms and predictor training, featuring Parrot and LightGBM implementations.
+A benchmark for evaluating learning-augmented caching algorithms, including ML-based predictors for Parrot and LRB.
 
 ## Trace
 
