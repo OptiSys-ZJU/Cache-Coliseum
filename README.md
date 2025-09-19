@@ -5,6 +5,14 @@
 
 A benchmark for evaluating learning-augmented caching algorithms, including ML-based predictors for Parrot and LRB.
 
+## Experimental Code & Acknowledgements
+
+The experimental scripts, training/evaluation pipelines, data preprocessing, and result analysis were implemented and maintained by [Jiaji Zhang](https://github.com/Freesia810).
+
+Some parts of the project code were inspired by or adapted from existing open-source libraries, including:
+- [cache_replacement](https://github.com/google-research/google-research/tree/master/cache_replacement)
+- [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)
+
 ## Trace
 
 Based on [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>, we have reorganized the Brightkite and Cite datasets to conform to a unified format.
