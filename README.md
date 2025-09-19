@@ -1,6 +1,6 @@
 # cache-coliseum
 
-[![Paper](https://img.shields.io/badge/arxiv-2507.16242-1)](http://arxiv.org/abs/2507.14811)
+[![Paper](https://img.shields.io/badge/arxiv-2507.16242-1)](https://arxiv.org/abs/2507.16242)
 [![GitHub](https://img.shields.io/badge/GitHub-Repository-black)](https://github.com/OptiSys-ZJU/cache-coliseum)
 
 A benchmark for evaluating learning-augmented caching algorithms, including ML-based predictors for Parrot and LRB.
