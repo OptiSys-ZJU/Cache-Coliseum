@@ -280,6 +280,9 @@ We also provide some scripts for training and testing, for reference purposes on
 
 ## Citation
 
+If you find this work useful, please cite our paper:
+
+```bibtex
 @misc{chen2025robustifyinglearningaugmentedcachingefficiently,
       title={Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency},
       author={Peng Chen and Hailiang Zhao and Jiaji Zhang and Xueyan Tang and Yixuan Wang and Shuiguang Deng},
