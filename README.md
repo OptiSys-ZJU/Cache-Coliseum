@@ -278,21 +278,6 @@ python -m model.parrot [--dataset DATASET] [--device DEVICE]
 
 We also provide some scripts for training and testing, for reference purposes only. You can find them in the `scripts` folder.
 
-## Citation
-
-If you find this work useful, please cite our paper:
-
-```bibtex
-@misc{chen2025robustifyinglearningaugmentedcachingefficiently,
-      title={Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency},
-      author={Peng Chen and Hailiang Zhao and Jiaji Zhang and Xueyan Tang and Yixuan Wang and Shuiguang Deng},
-      year={2025},
-      eprint={2507.16242},
-      archivePrefix={arXiv},
-      primaryClass={cs.DS},
-      url={https://arxiv.org/abs/2507.16242},
-}
-```
 
 ## References
 
@@ -311,3 +296,20 @@ If you find this work useful, please cite our paper:
 [7] Zhenyu Song, Daniel S. Berger, Kai Li, and Wyatt Lloyd. 2020. Learning relaxed Belady for content distribution network caching. In Proceedings of the 17th Usenix Conference on Networked Systems Design and Implementation (NSDI'20). USENIX Association, USA, 529–544.
 
 [8] Evan Zheran Liu, Milad Hashemi, Kevin Swersky, Parthasarathy Ranganathan, and Junwhan Ahn. 2020. An imitation learning approach for cache replacement. In Proceedings of the 37th International Conference on Machine Learning (ICML'20), Vol. 119. JMLR.org, Article 579, 6237–6247.
+
+
+## Citation
+
+If you find this work useful, please cite our paper:
+
+```bibtex
+@misc{chen2025robustifyinglearningaugmentedcachingefficiently,
+      title={Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency},
+      author={Peng Chen and Hailiang Zhao and Jiaji Zhang and Xueyan Tang and Yixuan Wang and Shuiguang Deng},
+      year={2025},
+      eprint={2507.16242},
+      archivePrefix={arXiv},
+      primaryClass={cs.DS},
+      url={https://arxiv.org/abs/2507.16242},
+}
+```
