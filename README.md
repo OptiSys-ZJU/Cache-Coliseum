@@ -278,6 +278,18 @@ python -m model.parrot [--dataset DATASET] [--device DEVICE]
 
 We also provide some scripts for training and testing, for reference purposes only. You can find them in the `scripts` folder.
 
+## Citation
+
+@misc{chen2025robustifyinglearningaugmentedcachingefficiently,
+      title={Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency},
+      author={Peng Chen and Hailiang Zhao and Jiaji Zhang and Xueyan Tang and Yixuan Wang and Shuiguang Deng},
+      year={2025},
+      eprint={2507.16242},
+      archivePrefix={arXiv},
+      primaryClass={cs.DS},
+      url={https://arxiv.org/abs/2507.16242},
+}
+
 ## References
 
 [1] Chłędowski, Jakub Polak, Adam Szabucki, Bartosz Zolna, Konrad. 2021. Robust Learning-Augmented Caching: An Experimental Study. 10.48550/arXiv.2106.14693. 
