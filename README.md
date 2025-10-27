@@ -14,7 +14,7 @@ Some parts of the project code were inspired by or adapted from existing open-so
 - [cache_replacement](https://github.com/google-research/google-research/tree/master/cache_replacement)
 - [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)
 
-## Trace
+## Traces
 
 Based on [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>, we have reorganized the Brightkite and Cite datasets to conform to a unified format.
 
