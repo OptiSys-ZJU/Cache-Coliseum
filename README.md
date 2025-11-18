@@ -145,7 +145,7 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
   + `pleco-bin`: A PLECO Binary Model based on PLECO that gives a page's **belady's label** when predicting
   + `gbm`: A Gradient Boosting Machine based on Delta and EDC features that gives a page's **belady's label** when predicting
   + `oracle_bin`: An offline predictor that gives the predicted next request time (reuse distance) of a page during prediction, potentially affected by noise (logdis or dis).
-  + `oracle_dis`: An offline predictor that gives a page's **belady's label**, potentially affected by noise (logdis, dis or bin).
+  + `oracle_dis`: An offline predictor that gives a page's **belady's label**, potentially affected by noise (logdis, dis, or bin).
 
 - Dump and Verbose
 
@@ -287,20 +287,20 @@ We also provide some scripts for training and testing, for reference purposes on
 
 [3] Dhruv Rohatgi. 2020. Near-optimal bounds for online caching with machine-learned advice. In Proceedings of the Thirty-First Annual ACM-SIAM Symposium on Discrete Algorithms (SODA '20). Society for Industrial and Applied Mathematics, USA, 1834–1845.
 
-[4] Sadek, K. A. and Elias, M. Algorithms for caching and mts with reduced number of predictions. arXiv preprint arXiv:2404.06280, 2024.
+[4] Sadek, K. A. and Elias, M. Algorithms for caching and MTS with reduced number of predictions. arXiv preprint arXiv:2404.06280, 2024.
 
 [5] Antonios Antoniadis, Joan Boyar, Marek Eliáš, Lene M. Favrholdt, Ruben Hoeksma, Kim S. Larsen, Adam Polak, and Bertrand Simon. 2023. Paging with succinct predictions. In Proceedings of the 40th International Conference on Machine Learning (ICML'23), Vol. 202. JMLR.org, Article 39, 952–968.
 
 [6] Wei, A. Better and simpler learning-augmented online caching. arXiv preprint arXiv:2005.13716, 2020.
 
-[7] Zhenyu Song, Daniel S. Berger, Kai Li, and Wyatt Lloyd. 2020. Learning relaxed Belady for content distribution network caching. In Proceedings of the 17th Usenix Conference on Networked Systems Design and Implementation (NSDI'20). USENIX Association, USA, 529–544.
+[7] Zhenyu Song, Daniel S. Berger, Kai Li, and Wyatt Lloyd. 2020. Learning relaxed Belady for content distribution network caching. In Proceedings of the 17th USENIX Conference on Networked Systems Design and Implementation (NSDI'20). USENIX Association, USA, 529–544.
 
 [8] Evan Zheran Liu, Milad Hashemi, Kevin Swersky, Parthasarathy Ranganathan, and Junwhan Ahn. 2020. An imitation learning approach for cache replacement. In Proceedings of the 37th International Conference on Machine Learning (ICML'20), Vol. 119. JMLR.org, Article 579, 6237–6247.
 
 
 ## Citation
 
-If you find this work useful, please cite our paper:
+If you have any questions regarding the paper, feel free to contact me at pgchen@zju.edu.cn.
 
 ```bibtex
 @misc{chen2025robustifyinglearningaugmentedcachingefficiently,
