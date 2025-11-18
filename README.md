@@ -300,7 +300,7 @@ We also provide some scripts for training and testing, for reference purposes on
 
 ## Citation
 
-If you have any questions regarding the paper, feel free to contact me at pgchen@zju.edu.cn.
+If you have any questions regarding the [paper](https://arxiv.org/abs/2507.16242), feel free to contact me at pgchen@zju.edu.cn.
 
 ```bibtex
 @misc{chen2025robustifyinglearningaugmentedcachingefficiently,
