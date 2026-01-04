@@ -16,7 +16,9 @@ Some parts of the project code were inspired by or adapted from existing open-so
 
 ## Traces
 
-Based on [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>, we have reorganized the Brightkite and Cite datasets to conform to a unified format.
+Download traces from the Dropbox provided by [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>, and organize them into per-workload directories, e.g., ./traces/xalanc for xalanc_test.csv.
+
+And, we have reorganized the Brightkite and Cite datasets to conform to a unified format.
 
 You can easily download all trace files, boost traces pickle and GBM Model Checkpoints from the Releases page.
 
