@@ -657,6 +657,124 @@ class Guard(PredictAlgorithm):
         self.cache[target_index], self.pcs[target_index] = address, pc
         self.after_pred(pc, address, target_index)
         return hit
+    
+class GuardWithoutRandomEvict(PredictAlgorithm):
+    """
+    Our work
+    """
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial], **kwargs) -> None:
+        super().__init__(associativity, evictor_type, predictor_type)
+        self.old_unvisited_set = []
+        self.unguarded_set = []
+        self.phase_evicted_set = set()
+        self.error_times = 0
+
+        if 'follow_if_guarded' in kwargs:
+            self.follow_if_guarded = kwargs['follow_if_guarded']
+        else:
+            self.follow_if_guarded = False
+        if 'relax_times' in kwargs:
+            self.relax_times = kwargs['relax_times']
+        else:
+            self.relax_times = 0
+        if 'relax_prob' in kwargs:
+            self.relax_prob = kwargs['relax_prob']
+        else:
+            self.relax_prob = 0
+    
+    def access(self, pc, address):
+        to_guard = False
+        target_index = -1
+        hit = False
+
+        self.before_pred(pc, address)
+        if address in self.cache:
+            target_index = self.cache.index(address)
+            hit = True
+        elif None in self.cache:
+            target_index = self.cache.index(None)
+        else:
+            if not self.old_unvisited_set:
+                self.old_unvisited_set = list(range(self.associativity))
+                self.unguarded_set = list(range(self.associativity))
+                self.phase_evicted_set = set()
+                self.error_times = 0
+            
+            if address in self.phase_evicted_set:
+                if self.relax_times != 0:
+                    self.error_times += 1
+                    if self.error_times >= self.relax_times:
+                        to_guard = True
+                else:
+                    if random.random() > self.relax_prob:
+                        to_guard = True
+
+            target_index = self.evictor.evict([(i, self.preds[i]) for i in self.unguarded_set])
+
+            self.phase_evicted_set.add(self.cache[target_index])
+
+        if target_index in self.old_unvisited_set:
+            self.old_unvisited_set.remove(target_index)
+
+        if to_guard:
+            self.unguarded_set.remove(target_index)
+        
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.after_pred(pc, address, target_index)
+        return hit
+    
+class GuardWithoutProtection(PredictAlgorithm):
+    """
+    Our work
+    """
+    def __init__(self, associativity, evictor_type: Union[Type[Evictor], partial], predictor_type: Union[Predictor, partial], **kwargs) -> None:
+        super().__init__(associativity, evictor_type, predictor_type)
+        self.old_unvisited_set = []
+        self.unguarded_set = []
+        self.phase_evicted_set = set()
+        self.error_times = 0
+
+        if 'follow_if_guarded' in kwargs:
+            self.follow_if_guarded = kwargs['follow_if_guarded']
+        else:
+            self.follow_if_guarded = False
+        if 'relax_times' in kwargs:
+            self.relax_times = kwargs['relax_times']
+        else:
+            self.relax_times = 0
+        if 'relax_prob' in kwargs:
+            self.relax_prob = kwargs['relax_prob']
+        else:
+            self.relax_prob = 0
+    
+    def access(self, pc, address):
+        target_index = -1
+        hit = False
+
+        self.before_pred(pc, address)
+        if address in self.cache:
+            target_index = self.cache.index(address)
+            hit = True
+        elif None in self.cache:
+            target_index = self.cache.index(None)
+        else:
+            if not self.old_unvisited_set:
+                self.old_unvisited_set = list(range(self.associativity))
+                self.phase_evicted_set = set()
+            
+            if address in self.phase_evicted_set:
+                target_index = random.choice(self.old_unvisited_set)
+            else:
+                target_index = self.evictor.evict([(i, self.preds[i]) for i in self.old_unvisited_set])
+            
+            self.phase_evicted_set.add(self.cache[target_index])
+
+        if target_index in self.old_unvisited_set:
+            self.old_unvisited_set.remove(target_index)
+        
+        self.cache[target_index], self.pcs[target_index] = address, pc
+        self.after_pred(pc, address, target_index)
+        return hit
 
 #######################################################################
 

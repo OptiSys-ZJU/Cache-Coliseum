@@ -236,7 +236,9 @@ if __name__ == "__main__":
                 PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'PLECO'),
                 PredictAlgorithmFactory.generate_predictive_algorithm(partial(FollowerRobust, boost=args.boost_fr), 'PLECO-State', associativity=associativity),
                 PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'PLECO'),
-                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PLECO'),
+                #PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'PLECO'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(GuardWithoutRandomEvict, follow_if_guarded=False, relax_times=0, relax_prob=0), 'PLECO'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(GuardWithoutProtection, follow_if_guarded=False, relax_times=0, relax_prob=0), 'PLECO'),
             ])
             combiner_types.extend([
                 (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'PLECO'), MarkerAlgorithm]),
@@ -256,7 +258,9 @@ if __name__ == "__main__":
                 PredictAlgorithmFactory.generate_predictive_algorithm(LNonMarker, 'POPU'),
                 PredictAlgorithmFactory.generate_predictive_algorithm(partial(FollowerRobust, boost=args.boost_fr), 'POPU-State', associativity=associativity),
                 PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'POPU'),
-                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'POPU'),
+                #PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'POPU'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(GuardWithoutRandomEvict, follow_if_guarded=False, relax_times=0, relax_prob=0), 'POPU'),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(GuardWithoutProtection, follow_if_guarded=False, relax_times=0, relax_prob=0), 'POPU'),
             ])
             combiner_types.extend([
                 (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'POPU'), MarkerAlgorithm]),
@@ -331,7 +335,9 @@ if __name__ == "__main__":
                 (LNonMarker, 'OracleDis'),
                 (partial(FollowerRobust, boost=args.boost_fr), 'OracleState'),
                 (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleDis'),
-                (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleDis'),
+                #(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleDis'),
+                (partial(GuardWithoutRandomEvict, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleDis'),
+                (partial(GuardWithoutProtection, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleDis'),
             ])
             combiner_types.extend([
                 (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleDis'), MarkerAlgorithm]),
@@ -345,7 +351,9 @@ if __name__ == "__main__":
                 (Mark0, 'OracleBin'),
                 (MarkAndPredict, 'OraclePhase'),
                 (partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleBin'),
-                (partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleBin'),
+                #(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'OracleBin'),
+                (partial(GuardWithoutRandomEvict, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleBin'),
+                (partial(GuardWithoutProtection, follow_if_guarded=False, relax_times=0, relax_prob=0), 'OracleBin'),
             ])
             combiner_types.extend([
                 (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [(PredictAlgorithm, 'OracleBin'), MarkerAlgorithm]),
