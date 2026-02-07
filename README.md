@@ -44,7 +44,7 @@ You will see the benchmark results of all supported algorithms on the console.
 #### All Usages
 ```python
 python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle | --real)
-                   [--pred {parrot,pleco,popu,pleco-bin,gbm,oracle_bin,oracle_dis} [{parrot,pleco,popu,pleco-bin,gbm,oracle_bin,oracle_dis} ...]]
+                   [--pred {parrot,pleco,popu,pleco-bin,lrb,oracle_bin,oracle_dis}]
                    [--noise_type {dis,bin,logdis}] [--dump_file] [--output_root_dir OUTPUT_ROOT_DIR] [--verbose]
                    [--boost] [--num_workers NUM_WORKERS] [--boost_fr] [--boost_preds_dir BOOST_PREDS_DIR]
                    [--model_fraction MODEL_FRACTION] [--checkpoints_root_dir CHECKPOINTS_ROOT_DIR]
@@ -72,7 +72,7 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
     
     You can also support your own dataset.
 
-  `--test_all`: This option only works for `brightkite` and `citi` datasets, meaning the entire traces will be used in these datasets. It cannot be used with `parrot` or `gbm` predictors as they require a training set.
+  `--test_all`: This option only works for `brightkite` and `citi` datasets, meaning the entire traces will be used in these datasets. It cannot be used with `parrot` or `lrb` predictors as they require a training set.
 - Device
 
   `--device`: Model target device, like `cpu`, `cuda:0` and `cuda:1`...
@@ -123,31 +123,33 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
   #### Algorithms and Predictors compatibility
 
-  | Algorithm | PLECO | POPU | Parrot | Pleco-Bin | GBM | Oracle-Dis (Belady) | Oracle-Bin (FBP) |
-  |:----------|:------:|:-----:|:----:|:---------:|:---:|:----------:|:----------:|
-  | Rand                               | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
-  | LRU                                | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
-  | Marker                             | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
-  | Predict                            | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
-  | PredictiveMarker<sup>[2]</sup>     | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
-  | LMarker<sup>[3]</sup>              | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
-  | LNonMarker<sup>[3]</sup>           | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
-  | Follower&Robust<sup>[4]</sup>      | &#10004; | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
-  | Mark0<sup>[5]</sup>                | &#10060; | &#10060; | &#10060; | &#10004; | &#10004; | &#10060; | &#10004; |
-  | Mark&Predict<sup>[5]</sup>         | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10004; |
-  | CombineDeterministic<sup>[6]</sup> | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
-  | CombineRandom<sup>[6]</sup>        | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
-  | Guard                              | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | Algorithm                          | PLECO    |   POPU   |  Parrot  |   LRB    |Oracle-Dis|Oracle-Bin|
+  |:----------|:------:|:-----:|:---------:|:---:|:----------:|:----------:|
+  | Rand                               | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | LRU                                | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | Marker                             | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
+  | Predict (BlindOracle/LRB/Parrot)   | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | PredictiveMarker<sup>[2]</sup>     | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | LMarker<sup>[3]</sup>              | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | LNonMarker<sup>[3]</sup>           | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | Follower&Robust(F&R)<sup>[4]</sup> | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | Mark0<sup>[5]</sup>                | &#10060; | &#10060; | &#10060; | &#10004; | &#10060; | &#10004; |
+  | Mark&Predict<sup>[5]</sup>         | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10004; |
+  | CombineDeterministic<sup>[6]</sup> | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | CombineRandom<sup>[6]</sup>        | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | The Guard Framework                | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | Guard&BlindOracle                  | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
+  | Guard&LRB                          | &#10060; | &#10060; | &#10060; | &#10004; | &#10060; | &#10004; |
+  | Guard&Parrot                       | &#10060; | &#10060; | &#10004; | &#10060; | &#10060; | &#10060; |
 
 - Predictor
 
-  + `pleco`: A PLECO Model that gives a page's next request time (reuse distance) when predicting.
-  + `popu`: A Popularity Model that gives a page's next request time (reuse distance) when predicting.
+  + `pleco`: A PLECO Model that predicts next request times (NRT).
+  + `popu`: A Popularity Model that predicts next request times (NRT).
+  + `lrb`: A Gradient Boosting Machine based on Delta and EDC features that predicts belady's binary labels.
+  + `oracle_bin`: An offline predictor that predicts next request times (NRT), potentially affected by noise (dis).
+  + `oracle_dis`: An offline predictor that predicts belady's binary label, potentially affected by noise (logdis, dis).
   + `parrot`: A Parrot Imitation Model that predicts eviction priority for each page.
-  + `pleco-bin`: A PLECO Binary Model based on PLECO that gives a page's **belady's label** when predicting
-  + `gbm`: A Gradient Boosting Machine based on Delta and EDC features that gives a page's **belady's label** when predicting
-  + `oracle_bin`: An offline predictor that gives the predicted next request time (reuse distance) of a page during prediction, potentially affected by noise (logdis or dis).
-  + `oracle_dis`: An offline predictor that gives a page's **belady's label**, potentially affected by noise (logdis, dis, or bin).
 
 - Dump and Verbose
 
