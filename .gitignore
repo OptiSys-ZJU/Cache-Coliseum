@@ -2,6 +2,7 @@ traces/
 __pycache__
 .vscode/
 *.txt
+!requirements.txt
 *.ckpt
 *.gz
 res*/
