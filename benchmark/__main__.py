@@ -1,5 +1,5 @@
 from data_trace.data_trace import DataTrace
-from model.models import ParrotModel, LightGBMModel, CodexModel, ENABLE_GPT52_CODEX
+from model.models import ParrotModel, LightGBMModel
 from model import device_manager
 from utils.aligner import ShiftAligner, NormalAligner
 from cache.cache import Cache, BoostCache, DumpCache
@@ -34,7 +34,7 @@ if __name__ == "__main__":
     mode_group.add_argument('--oracle', action='store_true')
     mode_group.add_argument('--real', action='store_true')
 
-    parser.add_argument('--pred', nargs='+', default='none', choices=['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm', 'codex', 'oracle_bin', 'oracle_dis'])
+    parser.add_argument('--pred', nargs='+', default='none', choices=['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm', 'oracle_bin', 'oracle_dis'])
 
     parser.add_argument("--noise_type", type=str, default='logdis', choices=['dis', 'bin', 'logdis'])
 
@@ -52,7 +52,6 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoints_root_dir", type=str, default='checkpoints')
     parser.add_argument("--parrot_config_path", type=str, default='checkpoints/parrot/model_config.json')
     parser.add_argument("--lightgbm_config_path", type=str, default='checkpoints/lightgbm/model_config.json')
-    parser.add_argument("--codex_config_path", type=str, default='checkpoints/codex/model_config.json')
 
     args = parser.parse_args()
     file_path = f'traces/{args.dataset}/{args.dataset}_test.csv'
@@ -79,7 +78,7 @@ if __name__ == "__main__":
         hash_type = ShiftHashFunction
 
     this_preds = []
-    real_predictors_type = ['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm', 'codex']
+    real_predictors_type = ['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm']
     oracle_predictors_type = ['oracle_bin', 'oracle_dis']
     input_preds = args.pred
     if 'none' in input_preds:
@@ -91,7 +90,7 @@ if __name__ == "__main__":
         this_preds = input_preds
     
     ###########################################################
-    parrot_gen = gbm_gen = codex_gen = None
+    parrot_gen = gbm_gen = None
     ckpt_root_dir = args.checkpoints_root_dir
     if 'parrot' in this_preds:
         this_dir = os.path.join(ckpt_root_dir, 'parrot', args.dataset, args.model_fraction)
@@ -126,46 +125,6 @@ if __name__ == "__main__":
         print(f'LightGBM: Fraction [{args.model_fraction}], Threshold [{threshold}], Model Checkpoint[{this_ckpt_path}], Delta[{deltanums}], EDC[{edcnums}]')
         gbm_gen = lambda : LightGBMModel.from_config(deltanums, edcnums, this_ckpt_path, threshold)
     
-    # GPT-5.2-Codex model initialization (enabled for all clients)
-    if 'codex' in this_preds:
-        if not ENABLE_GPT52_CODEX:
-            raise ValueError('Benchmark: GPT-5.2-Codex is not enabled. Set ENABLE_GPT52_CODEX=True in model/models.py')
-        
-        this_dir = os.path.join(ckpt_root_dir, 'codex', args.dataset, args.model_fraction)
-        codex_config_path = args.codex_config_path
-        
-        # Check for config file, create default if not exists
-        if not os.path.exists(codex_config_path):
-            print(f'Codex: Config not found at {codex_config_path}, using default configuration')
-            codex_config_path = None
-        
-        # Check for checkpoint
-        this_ckpt_path = None
-        if os.path.exists(this_dir):
-            ckpt_file = os.path.join(this_dir, 'best.ckpt')
-            if os.path.exists(ckpt_file):
-                this_ckpt_path = ckpt_file
-                print(f'Codex: Found checkpoint at {this_ckpt_path}')
-        
-        print(f'GPT-5.2-Codex: Enabled for all clients')
-        print(f'GPT-5.2-Codex: Fraction [{args.model_fraction}], Config [{codex_config_path}]')
-        
-        def create_codex_model():
-            if codex_config_path is not None:
-                return CodexModel.from_config(codex_config_path, this_ckpt_path)
-            else:
-                # Default configuration for GPT-5.2-Codex
-                default_config = {
-                    "hidden_size": 768,
-                    "num_layers": 12,
-                    "num_heads": 12,
-                    "max_seq_len": 2048,
-                    "temperature": 0.7
-                }
-                return CodexModel(default_config, this_ckpt_path)
-        
-        codex_gen = create_codex_model
-
     print("Benchmark: Use Predictor:", this_preds)
     print('Benchmark: Use Trace:', file_path)
     if args.dump_file:
