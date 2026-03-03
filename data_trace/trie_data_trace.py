@@ -1,5 +1,8 @@
 import collections
+import json
 import os
+import pickle
+from typing import List, Optional
 
 import tqdm
 from cache.hash import HashFunction
@@ -214,3 +217,89 @@ class OracleTrieDataTrace(object):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._file.close()
+
+
+class SequenceTrieDataTrace:
+    """
+    DataTrace for pre-processed sequence data (e.g., YooChoose sessions).
+    
+    Loads sequences from pickle files where each sequence is a List[int].
+    Designed for use with Tree-LSTM based cache models.
+    """
+    
+    def __init__(self, data_path: str, vocab_path: Optional[str] = None):
+        """
+        Initialize the sequence data trace.
+        
+        Args:
+            data_path: Path to pickle file containing List[List[int]] sequences
+            vocab_path: Optional path to vocab.json for vocabulary information
+        """
+        self._data_path = data_path
+        self._vocab_path = vocab_path
+        self._sequences: List[List[int]] = []
+        self._cursor = 0
+        self._vocab_size = 0
+    
+    def __enter__(self):
+        """Load sequences from pickle file."""
+        with open(self._data_path, 'rb') as f:
+            self._sequences = pickle.load(f)
+        
+        if self._vocab_path and os.path.exists(self._vocab_path):
+            with open(self._vocab_path, 'r') as f:
+                vocab_data = json.load(f)
+                self._vocab_size = vocab_data.get('vocab_size', 0)
+        
+        self._cursor = 0
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Clean up resources."""
+        self._sequences = []
+        self._cursor = 0
+    
+    def __len__(self) -> int:
+        """Return total number of sequences."""
+        return len(self._sequences)
+    
+    def __getitem__(self, index: int) -> List[int]:
+        """Get sequence at index."""
+        return self._sequences[index]
+    
+    def next(self) -> List[int]:
+        """
+        Get next sequence and advance cursor.
+        
+        Returns:
+            List[int]: The next sequence of token IDs
+        """
+        if self._cursor >= len(self._sequences):
+            raise StopIteration("No more sequences")
+        
+        sequence = self._sequences[self._cursor]
+        self._cursor += 1
+        return sequence
+    
+    def done(self) -> bool:
+        """Check if all sequences have been consumed."""
+        return self._cursor >= len(self._sequences)
+    
+    def reset(self):
+        """Reset cursor to beginning."""
+        self._cursor = 0
+    
+    @property
+    def vocab_size(self) -> int:
+        """Return vocabulary size."""
+        return self._vocab_size
+    
+    @property
+    def num_sequences(self) -> int:
+        """Return number of sequences."""
+        return len(self._sequences)
+    
+    def iter_sequences(self):
+        """Iterator over all sequences."""
+        for seq in self._sequences:
+            yield seq

@@ -1,13 +1,20 @@
 from functools import partial
-from typing import List, Type
+from types import SimpleNamespace
+from typing import List, Type, Optional
+import random
 
+import torch
 import tqdm
 
 from cache.cache import BaseCache
 from cache.evict.evictor import ReuseDistanceEvictor
 from cache.evict.predictor import OracleReuseDistancePredictor
 from cache.hash import HashFunction, OneHashFunction
-from cache.trie.trie_algorithms import TrieEvictAlgorithm, TrieGuard, TrieLRUAlgorithm, TriePredictAlgorithm, TrieRandAlgorithm
+from cache.trie.trie_algorithms import (
+    TrieEvictAlgorithm, TrieGuard, TrieLRUAlgorithm, 
+    TrieModelPredictAlgorithm, TrieModelGuard, TrieNode, 
+    TriePredictAlgorithm, TrieRandAlgorithm,
+)
 from data_trace.trie_data_trace import OracleTrieDataTrace, TrieDataTrace
 from utils.aligner import Aligner, ListAligner
 
@@ -76,6 +83,321 @@ class TrieCache(BaseCache):
         aligned_address = self._aligner.get_aligned_addr(address)
         stat = self.evict_algs[self.hash_func.get_bucket_index(aligned_address, TrieCache.dummy_pc)].access(TrieCache.dummy_pc, aligned_address)
         self.stat_info = [x + y for x, y in zip(self.stat_info, stat)]
+
+
+#############################################
+# Task 3.6: TrieTrainingCache for DAgger training
+#############################################
+
+class TrieTrainingCache:
+    """
+    Training cache for TrieParrotModel using DAgger (Dataset Aggregation).
+    
+    Wraps a TrieModelPredictAlgorithm and intercepts eviction decisions to collect
+    training snapshots with Belady oracle labels.
+    
+    Usage:
+        cache = TrieTrainingCache(max_node_num=1024, model=my_model)
+        cache.load_future_accesses(all_sequences)  # for oracle reuse distance
+        cache.set_model_prob(0.0)  # pure oracle at start
+        
+        for seq in sequences:
+            snapshot, hit = cache.collect(seq)
+            # snapshot.oracle_target, snapshot.leaf_node_ids, etc.
+    """
+    
+    def __init__(self, max_node_num: int, model=None):
+        """
+        Args:
+            max_node_num: Maximum trie capacity
+            model: TrieParrotModel (can be None, set later via set_model)
+        """
+        self.max_node_num = max_node_num
+        self.model = model
+        
+        # Internal trie algorithm
+        self.alg = TrieModelPredictAlgorithm(max_node_num, model)
+        
+        # DAgger mixing
+        self.model_prob = 0.0  # fraction of evictions using model policy
+        
+        # Oracle: precomputed future access list
+        self._future_accesses: Optional[List[List[int]]] = None
+        self._current_step = 0
+        
+        # Collected training snapshots
+        self.snapshots: List[SimpleNamespace] = []
+        
+        # Statistics
+        self.total_count = 0
+        self.hit_count = 0
+    
+    def set_model(self, model):
+        """Set or replace the model."""
+        self.model = model
+        self.alg.set_model(model)
+    
+    def set_model_prob(self, prob: float):
+        """Set DAgger model probability (0 = pure oracle, 1 = pure model)."""
+        self.model_prob = prob
+    
+    def load_future_accesses(self, sequences: List[List[int]]):
+        """
+        Load all future access sequences for Belady oracle computation.
+        Must be called before collect() to enable oracle labeling.
+        """
+        self._future_accesses = sequences
+        self._current_step = 0
+    
+    def _reuse_distance(self, path: tuple) -> float:
+        """
+        Belady oracle: how many steps until a future access matches this leaf's path.
+        
+        A leaf's path matches a future sequence if the path is a prefix of that sequence.
+        Returns float('inf') if this path is never re-accessed.
+        """
+        if self._future_accesses is None:
+            return float('inf')
+        
+        path_list = list(path)
+        path_len = len(path_list)
+        for offset in range(self._current_step + 1, len(self._future_accesses)):
+            future_seq = self._future_accesses[offset]
+            if len(future_seq) >= path_len and future_seq[:path_len] == path_list:
+                return offset - self._current_step
+        return float('inf')
+    
+    def _oracle_target(self, candidates: List[TrieNode]) -> int:
+        """
+        Belady's optimal: return index of candidate with max reuse distance 
+        (the one that won't be needed for the longest time).
+        """
+        best_idx = 0
+        best_distance = -1
+        
+        for idx, leaf in enumerate(candidates):
+            path = TrieNode.get_path_tuple_from_node(leaf)
+            distance = self._reuse_distance(path)
+            if distance > best_distance:
+                best_distance = distance
+                best_idx = idx
+        
+        return best_idx
+    
+    def collect(self, sequence: List[int]):
+        """
+        Process one sequence access, collecting training data on eviction.
+        
+        Returns:
+            (snapshot, hit): 
+                snapshot: SimpleNamespace with training fields (None if no eviction)
+                hit: bool, whether the entire sequence was a cache hit
+        """
+        # Match
+        this_node, insert_list = self.alg.__match__(sequence)
+        hit = len(insert_list) == 0
+        
+        if hit:
+            self.hit_count += 1
+        self.total_count += 1
+        
+        # Check if eviction is needed
+        insert_len = len(insert_list)
+        snapshot = None
+        
+        if insert_len > 0:
+            evict_num = self.alg.cur_node_num + insert_len - self.alg.max_node_num
+            if evict_num > 0:
+                snapshot = self._evict_and_collect(evict_num, this_node, sequence)
+            
+            # Insert new nodes (same as TrieModelPredictAlgorithm.__insert__)
+            for key in insert_list:
+                new_node = TrieNode()
+                new_node.key = key
+                new_node.node_id = key
+                new_node.parent = this_node  # Must set parent BEFORE __add_node__ (needs parent.hidden_state)
+                self.alg.__add_node__(new_node)
+                self.alg.__mark_as_non_leaf__(this_node)
+                this_node.children[key] = new_node
+                this_node = new_node
+                self.alg.cur_node_num += 1
+            self.alg.__mark_as_leaf__(this_node)
+        
+        # Update history LSTM
+        if self.model is not None and len(sequence) > 0:
+            with torch.no_grad():
+                self.alg.history_state = self.model.encode_history_step(
+                    sequence[-1], self.alg.history_state
+                )
+        
+        self.alg.timestamp += 1
+        self._current_step += 1
+        
+        return snapshot, hit
+    
+    def _evict_and_collect(self, evict_num: int, this_node: TrieNode, current_path: List[int]) -> SimpleNamespace:
+        """
+        Perform eviction with DAgger mixing and collect training snapshot.
+        
+        For each eviction:
+        1. Compute oracle target (Belady's)
+        2. Record training sample
+        3. Use DAgger to decide actual eviction (oracle or model)
+        """
+        protected_leaves = self.alg._get_protected_leaves(current_path)
+        candidates = [
+            leaf for leaf in self.alg.__leaves__()
+            if leaf not in protected_leaves and leaf != self.alg.root_node
+        ]
+        
+        # Collect one snapshot per eviction batch (all evictions for this access)
+        snapshot = SimpleNamespace()
+        snapshot.sequence = sequence = current_path
+        snapshot.eviction_steps = []
+        
+        for _ in range(evict_num):
+            if not candidates:
+                raise ValueError("No eviction candidates available")
+            
+            # Oracle target
+            oracle_idx = self._oracle_target(candidates)
+            
+            # Record per-eviction step data
+            step_data = SimpleNamespace()
+            step_data.leaf_node_ids = [c.node_id for c in candidates]
+            step_data.leaf_paths = [
+                TrieNode.get_node_id_path(c) for c in candidates
+            ]
+            step_data.oracle_target = oracle_idx
+            step_data.history_state = self.alg.history_state  # (h,c) or None
+            step_data.num_candidates = len(candidates)
+            snapshot.eviction_steps.append(step_data)
+            
+            # DAgger: choose actual eviction target
+            if random.random() < self.model_prob and self.model is not None and self.alg.history_state is not None:
+                # Model policy
+                leaf_states = []
+                for c in candidates:
+                    if c.hidden_state is not None:
+                        leaf_states.append(c.hidden_state[0])
+                    else:
+                        leaf_states.append(torch.zeros(1, self.model.hidden_size))
+                
+                with torch.no_grad():
+                    scores, _ = self.model.forward(self.alg.history_state[0], leaf_states)
+                target_idx = scores.squeeze(0).argmax().item()
+            else:
+                # Oracle policy
+                target_idx = oracle_idx
+            
+            # Evict
+            target_leaf = candidates.pop(target_idx)
+            parent = target_leaf.parent
+            self.alg.__delete_leaf_node__(target_leaf)
+            
+            # Incremental candidate update
+            if parent is not None and parent != self.alg.root_node and parent.is_leaf():
+                if parent not in protected_leaves:
+                    candidates.append(parent)
+        
+        self.snapshots.append(snapshot)
+        return snapshot
+    
+    def get_snapshots(self) -> List[SimpleNamespace]:
+        """Return all collected training snapshots and clear the buffer."""
+        result = self.snapshots
+        self.snapshots = []
+        return result
+    
+    @property
+    def hit_rate(self) -> float:
+        if self.total_count == 0:
+            return 0.0
+        return self.hit_count / self.total_count
+
+
+#############################################
+# Task 5.1: SequenceTrieCache for sequence-based access
+#############################################
+
+class SequenceTrieCache:
+    """
+    Simplified Trie cache for sequence-based access patterns (e.g., YooChoose).
+    
+    Unlike TrieCache which uses pc/aligner/hash, this takes raw sequences directly.
+    Supports TrieModelPredictAlgorithm, TrieModelGuard, TrieLRUAlgorithm, TrieRandAlgorithm.
+    
+    Usage:
+        cache = SequenceTrieCache(max_node_num=1024, evict_type=TrieModelPredictAlgorithm, model=my_model)
+        # or: cache = SequenceTrieCache(max_node_num=1024, evict_type=TrieLRUAlgorithm)
+        
+        for seq in data_trace:
+            cache.access(seq)
+        cache.pretty_stat()
+    """
+    
+    def __init__(self, max_node_num: int, evict_type=None, model=None, **evict_kwargs):
+        """
+        Args:
+            max_node_num: Maximum number of nodes in the trie
+            evict_type: Algorithm class (default: TrieModelPredictAlgorithm)
+            model: TrieParrotModel instance (only for model-based algorithms)
+            **evict_kwargs: Extra kwargs passed to evict_type constructor
+        """
+        if evict_type is None:
+            evict_type = TrieModelPredictAlgorithm
+        
+        # Instantiate algorithm
+        if evict_type in (TrieModelPredictAlgorithm, TrieModelGuard):
+            self.alg = evict_type(max_node_num, model=model, **evict_kwargs)
+        else:
+            # LRU, Rand, etc. don't take model param
+            self.alg = evict_type(max_node_num, **evict_kwargs)
+        
+        self.model = model
+        self.stat_info = [0, 0, 0]  # total, hit, miss
+    
+    def set_model(self, model):
+        """Set or update the model (for model-based algorithms)."""
+        self.model = model
+        if hasattr(self.alg, 'set_model'):
+            self.alg.set_model(model)
+    
+    def access(self, sequence: List[int]):
+        """
+        Process a sequence access.
+        
+        Args:
+            sequence: List of token IDs
+            
+        Returns:
+            Tuple of (total_nodes, hit_nodes, miss_nodes)
+        """
+        if isinstance(self.alg, (TrieModelPredictAlgorithm, TrieModelGuard)):
+            # Model-based algorithms: access(sequence)
+            stat = self.alg.access(sequence)
+        else:
+            # Legacy algorithms: access(pc, aligned_address)
+            stat = self.alg.access(None, sequence)
+        
+        self.stat_info = [x + y for x, y in zip(self.stat_info, stat)]
+        return stat
+    
+    def pretty_stat(self):
+        total, hit, miss = self.stat_info
+        print(f'[Total/Hit/Miss]: [{total}/{hit}/{miss}]')
+        if total > 0:
+            print(f'[Hit Rate]: {hit / total:.4f}')
+        else:
+            print('[Hit Rate]: N/A')
+    
+    def stat(self):
+        """Return (total, hit, miss, hit_rate) — same order as stat_info."""
+        total, hit, miss = self.stat_info
+        if total == 0:
+            return (total, hit, miss, 0.0)
+        return (total, hit, miss, round(hit / total, 4))
+
 
 if __name__ == "__main__":
     # file_path = 'traces/oass1_val.csv'

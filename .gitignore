@@ -13,3 +13,7 @@ stat*/
 plot_res*/
 dis*/
 dump/
+data/
+raw_data/
+checkpoints/
+cache/__pycache__/

@@ -3,8 +3,11 @@ import copy
 from functools import partial
 import random
 import types
+
+import torch
+
 from cache.evict.algorithms import BaseEvictAlgorithm
-from typing import List, Tuple, Type, Union
+from typing import List, Tuple, Type, Union, Optional, Any
 
 from cache.evict.evictor import Evictor, LRUEvictor, RandEvictor
 from cache.evict.predictor import OraclePredictor, Predictor
@@ -12,21 +15,31 @@ from cache.evict.predictor import OraclePredictor, Predictor
 class TrieNode:
     def __init__(self):
         self.children = defaultdict(TrieNode)
-        self.parent = None
+        self.parent: Optional['TrieNode'] = None
         self.key = None
         self.metadata = None
 
         self.old_visited = -1
         self.guard = -1
+        
+        # New fields for Tree-LSTM integration (PRD 2.1)
+        self.node_id: Optional[int] = None  # Token ID from vocabulary
+        self.hidden_state: Optional[Tuple[Any, Any]] = None  # Cached LSTM (h, c) state
+        self.embedding: Optional[Any] = None  # Node embedding tensor
     
     def __str__(self):
-        return f"TrieNode(key={self.key}, metadata={self.metadata}, children_count={len(self.children)})"
+        return f"TrieNode(key={self.key}, node_id={self.node_id}, metadata={self.metadata}, children_count={len(self.children)})"
 
     def __repr__(self):
         return self.__str__()
     
     def is_leaf(self):
         return len(self.children) == 0
+    
+    def clear_hidden_state(self):
+        """Clear cached hidden state (useful when model is updated)."""
+        self.hidden_state = None
+        self.embedding = None
     
     @staticmethod
     def is_prefix(sub, full):
@@ -42,6 +55,22 @@ class TrieNode:
             current = current.parent
         
         return tuple(reversed(path[1:]))
+
+    @staticmethod
+    def get_node_id_path(node: 'TrieNode') -> tuple:
+        """
+        Return root-to-leaf path of node_ids (int tokens) for model encoding.
+        
+        Walks from node up to root, collecting node_id values (skipping root
+        which has node_id=None). Returns in root→leaf order.
+        """
+        path = []
+        current = node
+        while current is not None:
+            if current.node_id is not None:
+                path.append(current.node_id)
+            current = current.parent
+        return tuple(reversed(path))
 
 class SimpleTrie:
     def __init__(self):
@@ -115,6 +144,50 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
         if len(target_parent.children) == 0:
             self.__mark_as_leaf__(target_parent)
     
+    def prune(self, leaf_nodes: List[TrieNode]) -> int:
+        """
+        Batch delete leaf nodes and recursively clean up empty parent nodes.
+        
+        Args:
+            leaf_nodes: List of leaf nodes to delete
+            
+        Returns:
+            Number of nodes actually deleted
+        """
+        deleted_count = 0
+        
+        for node in leaf_nodes:
+            # Skip if not a valid leaf or already deleted
+            if node not in self.leaf_nodes:
+                continue
+            if node == self.root_node:
+                continue  # Never delete root
+            
+            # Delete the leaf
+            self.__delete_leaf_node__(node)
+            deleted_count += 1
+            
+            # Recursively clean up empty parents (up to branch point)
+            parent = node.parent
+            while parent is not None and parent != self.root_node:
+                if len(parent.children) == 0:
+                    # Parent became empty, delete it too
+                    grandparent = parent.parent
+                    if grandparent is not None:
+                        del grandparent.children[parent.key]
+                        self.cur_node_num -= 1
+                        if parent in self.leaf_nodes:
+                            self.leaf_nodes.remove(parent)
+                        deleted_count += 1
+                        # Check if grandparent should become a leaf
+                        if len(grandparent.children) == 0:
+                            self.__mark_as_leaf__(grandparent)
+                    parent = grandparent
+                else:
+                    break  # Parent still has other children, stop
+        
+        return deleted_count
+    
     def __match__(self, aligned_address: List) -> Tuple[TrieNode, List]:
         this_node = self.root_node
         for idx, key in enumerate(aligned_address):
@@ -137,10 +210,10 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
         for key in insert_list:
             new_node = TrieNode()
             new_node.key = key
+            new_node.parent = this_node  # Set parent before __add_node__ for subclass access
             self.__add_node__(new_node)
             self.__mark_as_non_leaf__(this_node)
             this_node.children[key] = new_node
-            new_node.parent = this_node
             this_node = new_node
             self.cur_node_num += 1
         self.__mark_as_leaf__(this_node)
@@ -266,10 +339,10 @@ class TrieGuard(TriePredictAlgorithm):
         for key in insert_list:
             new_node = TrieNode()
             new_node.key = key
+            new_node.parent = this_node  # Set parent before __add_node__ for subclass access
             self.__add_node__(new_node)
             self.__mark_as_non_leaf__(this_node)
             this_node.children[key] = new_node
-            new_node.parent = this_node
             this_node = new_node
             self.cur_node_num += 1
 
@@ -406,3 +479,286 @@ class TrieLRUAlgorithm(TrieEvictAlgorithm):
         self.__insert__(this_node, insert_list)
         self.counter += 1
         return (len(aligned_address), len(aligned_address) - len(insert_list), len(insert_list))
+
+
+#############################################
+# Task 4.1 + 4.2: Model-based eviction with path protection
+#############################################
+
+class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
+    """
+    Tree-LSTM model-based eviction algorithm.
+    
+    Uses a TrieParrotModel to score leaf nodes for eviction.
+    Implements "Protected Leaf Eviction" (PRD 2.3):
+    - Current access path is protected from eviction
+    - Model scores leaf nodes via attention mechanism
+    - Lowest scored leaves are evicted
+    """
+    
+    def __init__(self, max_node_num, model=None):
+        """
+        Args:
+            max_node_num: Maximum number of nodes in the trie
+            model: TrieParrotModel instance (can be set later via set_model)
+        """
+        super().__init__(max_node_num)
+        self.model = model
+        self.history_state = None  # (h, c) from history LSTM
+        self.timestamp = 0
+    
+    def set_model(self, model):
+        """Set or replace the prediction model."""
+        self.model = model
+        self.history_state = None
+    
+    def _get_protected_leaves(self, current_path: List) -> set:
+        """
+        Get the set of leaf nodes on the current access path (protected from eviction).
+        
+        Since the eviction candidate set is already all leaf nodes, we only need
+        to protect leaf nodes that lie on the current path.
+        
+        Args:
+            current_path: The sequence currently being accessed
+            
+        Returns:
+            Set of leaf TrieNode objects on the current path
+        """
+        protected = set()
+        node = self.root_node
+        for key in current_path:
+            if key in node.children:
+                node = node.children[key]
+                if node.is_leaf():
+                    protected.add(node)
+            else:
+                break
+        return protected
+    
+    def _get_eviction_candidates(self, current_path: List) -> List[TrieNode]:
+        """
+        Get leaf nodes eligible for eviction (excluding protected leaves on current path).
+        
+        Args:
+            current_path: The sequence currently being accessed
+            
+        Returns:
+            List of candidate leaf nodes
+        """
+        protected_leaves = self._get_protected_leaves(current_path)
+        leaves = self.__leaves__()
+        candidates = [
+            leaf for leaf in leaves 
+            if leaf not in protected_leaves and leaf != self.root_node
+        ]
+        return candidates
+    
+    def __evict_with_protection__(self, evict_num: int, this_node: TrieNode, current_path: List):
+        """
+        Evict leaf nodes using model scores with path protection.
+        
+        Protected leaves and candidates are computed once. After each eviction,
+        candidates are updated incrementally: remove the evicted leaf, and if its
+        parent becomes a new leaf (and is not root), add the parent to candidates.
+        
+        Args:
+            evict_num: Number of nodes to evict
+            this_node: Node at the end of the matched path
+            current_path: The full current access sequence
+        """
+        # Compute once: protected leaves on current path won't change during this insert
+        protected_leaves = self._get_protected_leaves(current_path)
+        candidates = [
+            leaf for leaf in self.__leaves__()
+            if leaf not in protected_leaves and leaf != self.root_node
+        ]
+        
+        for _ in range(evict_num):
+            if not candidates:
+                raise ValueError("No eviction candidates available (all nodes protected)")
+            
+            if self.model is not None and self.history_state is not None:
+                # Use model to score candidates
+                leaf_states = []
+                for c in candidates:
+                    if c.hidden_state is not None:
+                        leaf_states.append(c.hidden_state[0])  # h component
+                    else:
+                        # Fallback: zero state for nodes without cached state
+                        leaf_states.append(torch.zeros(1, self.model.hidden_size))
+                
+                with torch.no_grad():
+                    scores, _ = self.model.forward(self.history_state[0], leaf_states)
+                
+                # Evict the node with the highest eviction logit
+                target_idx = scores.squeeze(0).argmax().item()
+            else:
+                # Fallback: random eviction when model not available
+                target_idx = random.randint(0, len(candidates) - 1)
+            
+            target_leaf = candidates.pop(target_idx)
+            parent = target_leaf.parent
+            self.__delete_leaf_node__(target_leaf)
+            
+            # Incremental update: if parent became a leaf and is not root, add to candidates
+            if parent is not None and parent != self.root_node and parent.is_leaf():
+                if parent not in protected_leaves:
+                    candidates.append(parent)
+    
+    def __evict__(self, evict_num, this_node):
+        """Fallback eviction (random) when current_path is unavailable."""
+        for _ in range(evict_num):
+            leaves = self.__leaves__()
+            candidates = [l for l in leaves if l != self.root_node and l != this_node]
+            if not candidates:
+                raise ValueError("No eviction candidates available")
+            target_leaf = candidates[random.randint(0, len(candidates) - 1)]
+            self.__delete_leaf_node__(target_leaf)
+    
+    def __visit_node__(self, node: TrieNode):
+        """Track visited nodes for potential state updates."""
+        pass
+    
+    def __add_node__(self, node: TrieNode):
+        """When a new node is added, compute its Tree-LSTM state incrementally."""
+        if self.model is not None:
+            parent = node.parent
+            parent_state = parent.hidden_state if parent is not None else None
+            if node.node_id is not None:
+                with torch.no_grad():
+                    h, c = self.model.compute_node_state(node.node_id, parent_state)
+                node.hidden_state = (h, c)
+    
+    def __insert__(self, this_node, insert_list: List, current_path: List = None):
+        """Insert with path-aware eviction."""
+        insert_len = len(insert_list)
+        if insert_len == 0:
+            return
+        
+        evict_num = self.cur_node_num + insert_len - self.max_node_num
+        if evict_num > 0:
+            if current_path is not None:
+                self.__evict_with_protection__(evict_num, this_node, current_path)
+            else:
+                # Fallback to basic eviction
+                self.__evict__(evict_num, this_node)
+        
+        for key in insert_list:
+            new_node = TrieNode()
+            new_node.key = key
+            new_node.node_id = key  # For Tree-LSTM, key is the token ID
+            new_node.parent = this_node  # Must set parent BEFORE __add_node__ (needs parent.hidden_state)
+            self.__add_node__(new_node)
+            self.__mark_as_non_leaf__(this_node)
+            this_node.children[key] = new_node
+            this_node = new_node
+            self.cur_node_num += 1
+        self.__mark_as_leaf__(this_node)
+
+    def access(self, sequence: List[int]) -> Tuple:
+        """
+        Process a sequence access.
+        
+        Args:
+            sequence: List of token IDs representing the access path
+            
+        Returns:
+            Tuple of (total_nodes, hit_nodes, miss_nodes)
+        """
+        this_node, insert_list = self.__match__(sequence)
+        self.__insert__(this_node, insert_list, current_path=sequence)
+        
+        # Update history LSTM state with the last token of the sequence
+        if self.model is not None and len(sequence) > 0:
+            with torch.no_grad():
+                self.history_state = self.model.encode_history_step(
+                    sequence[-1], self.history_state
+                )
+        
+        self.timestamp += 1
+        return (len(sequence), len(sequence) - len(insert_list), len(insert_list))
+
+
+#############################################
+# Task 4.3: Model-based Guard with confidence fallback
+#############################################
+
+class TrieModelGuard(TrieModelPredictAlgorithm):
+    """
+    Extends TrieModelPredictAlgorithm with confidence-based fallback.
+    
+    When the model's score variance across candidates is below a threshold,
+    the model is considered "unsure" and we fall back to random eviction.
+    Tracks guard statistics for analysis.
+    """
+    
+    def __init__(self, max_node_num, model=None, variance_threshold: float = 0.01):
+        """
+        Args:
+            max_node_num: Maximum number of nodes in the trie
+            model: TrieParrotModel instance
+            variance_threshold: If score variance < this, fall back to random
+        """
+        super().__init__(max_node_num, model)
+        self.variance_threshold = variance_threshold
+        # Statistics
+        self.total_evictions = 0
+        self.guarded_evictions = 0  # Times we fell back to random
+    
+    def __evict_with_protection__(self, evict_num: int, this_node: TrieNode, current_path: List):
+        """
+        Evict with confidence check: if model score variance is too low,
+        fall back to random eviction instead of trusting the model.
+        """
+        protected_leaves = self._get_protected_leaves(current_path)
+        candidates = [
+            leaf for leaf in self.__leaves__()
+            if leaf not in protected_leaves and leaf != self.root_node
+        ]
+        
+        for _ in range(evict_num):
+            if not candidates:
+                raise ValueError("No eviction candidates available (all nodes protected)")
+            
+            self.total_evictions += 1
+            use_model = False
+            
+            if self.model is not None and self.history_state is not None and len(candidates) > 1:
+                leaf_states = []
+                for c in candidates:
+                    if c.hidden_state is not None:
+                        leaf_states.append(c.hidden_state[0])
+                    else:
+                        leaf_states.append(torch.zeros(1, self.model.hidden_size))
+                
+                with torch.no_grad():
+                    scores, _ = self.model.forward(self.history_state[0], leaf_states)
+                
+                score_variance = scores.var().item()
+                
+                if score_variance >= self.variance_threshold:
+                    # Model is confident: use model scores
+                    target_idx = scores.squeeze(0).argmax().item()
+                    use_model = True
+                # else: fall through to random
+            
+            if not use_model:
+                # Fallback: random eviction (model unsure or unavailable)
+                target_idx = random.randint(0, len(candidates) - 1)
+                self.guarded_evictions += 1
+            
+            target_leaf = candidates.pop(target_idx)
+            parent = target_leaf.parent
+            self.__delete_leaf_node__(target_leaf)
+            
+            if parent is not None and parent != self.root_node and parent.is_leaf():
+                if parent not in protected_leaves:
+                    candidates.append(parent)
+    
+    @property
+    def guard_rate(self) -> float:
+        """Fraction of evictions that fell back to random."""
+        if self.total_evictions == 0:
+            return 0.0
+        return self.guarded_evictions / self.total_evictions
