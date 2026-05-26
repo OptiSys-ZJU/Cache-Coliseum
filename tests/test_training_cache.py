@@ -32,8 +32,9 @@ print(f'Total snapshots: {len(cache.get_snapshots())}')
 # At step 3 (access [1,2,3], hit): no eviction (already exists)
 # At step 4 (access [1,2,6], need to evict 1):
 #   candidates = leaves except protected. Future = [[1,2,4]] at step 5
-#   leaf 3 was already visited at step 3.
+#   leaf 3 was already visited at step 3 and is not used again.
 #   leaf 4 is re-accessed at step 5 → reuse dist = 1
-#   leaf 5 is never re-accessed → reuse dist = inf → SHOULD be evicted by oracle
+#   leaf 5 is never re-accessed → reuse dist = inf
+#   leaf 3 and leaf 5 are tied for Belady; either one may be evicted.
 
 print('\nTest TrieTrainingCache: PASSED')

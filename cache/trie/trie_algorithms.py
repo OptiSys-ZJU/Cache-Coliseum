@@ -4,13 +4,17 @@ from functools import partial
 import random
 import types
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 
 from cache.evict.algorithms import BaseEvictAlgorithm
 from typing import List, Tuple, Type, Union, Optional, Any
 
 from cache.evict.evictor import Evictor, LRUEvictor, RandEvictor
 from cache.evict.predictor import OraclePredictor, Predictor
+from cache.trie.oracle import PrefixFutureOracle
 
 class TrieNode:
     def __init__(self):
@@ -50,11 +54,11 @@ class TrieNode:
         path = []
         current = node
         while current is not None:
-            if current.key is not None:
+            if current.parent is not None and current.key is not None:
                 path.append(current.key)
             current = current.parent
         
-        return tuple(reversed(path[1:]))
+        return tuple(reversed(path))
 
     @staticmethod
     def get_node_id_path(node: 'TrieNode') -> tuple:
@@ -124,6 +128,7 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
         self.cur_node_num = 0
         self.max_node_num = max_node_num
         self.leaf_nodes = [self.root_node]
+        self.eviction_count = 0
     
     def __leaves__(self):
         return self.leaf_nodes[:]
@@ -140,6 +145,7 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
         target_parent = node.parent
         del target_parent.children[node.key]
         self.cur_node_num -= 1
+        self.eviction_count += 1
         self.leaf_nodes.remove(node)
         if len(target_parent.children) == 0:
             self.__mark_as_leaf__(target_parent)
@@ -176,6 +182,7 @@ class TrieEvictAlgorithm(BaseEvictAlgorithm):
                     if grandparent is not None:
                         del grandparent.children[parent.key]
                         self.cur_node_num -= 1
+                        self.eviction_count += 1
                         if parent in self.leaf_nodes:
                             self.leaf_nodes.remove(parent)
                         deleted_count += 1
@@ -481,6 +488,59 @@ class TrieLRUAlgorithm(TrieEvictAlgorithm):
         return (len(aligned_address), len(aligned_address) - len(insert_list), len(insert_list))
 
 
+class TrieOracleAlgorithm(TrieEvictAlgorithm):
+    """
+    Belady-style oracle for prefix-trie eviction.
+
+    It evicts the leaf whose root-to-leaf path is reused farthest in the future.
+    A path is reused when it is a prefix of a later request.
+    """
+
+    def __init__(self, max_node_num, future_oracle: Optional[PrefixFutureOracle] = None):
+        super().__init__(max_node_num)
+        self.future_oracle = future_oracle
+        self.timestamp = 0
+
+    def set_future_oracle(self, future_oracle: PrefixFutureOracle):
+        self.future_oracle = future_oracle
+        self.timestamp = 0
+
+    def __evict__(self, evict_num, this_node):
+        for _ in range(evict_num):
+            leaves = self.__leaves__()
+            candidates = [
+                leaf for leaf in leaves
+                if leaf != self.root_node and leaf != this_node
+            ]
+            if not candidates:
+                raise ValueError("No eviction candidates available")
+
+            best_idx = 0
+            best_next_use = -1
+            for idx, leaf in enumerate(candidates):
+                path = TrieNode.get_path_tuple_from_node(leaf)
+                next_use = (
+                    float("inf")
+                    if self.future_oracle is None
+                    else self.future_oracle.next_request_index(path)
+                )
+                if next_use > best_next_use:
+                    best_idx = idx
+                    best_next_use = next_use
+
+            self.__delete_leaf_node__(candidates[best_idx])
+
+    def access(self, pc, aligned_address: List = None) -> Tuple:
+        sequence = aligned_address if aligned_address is not None else pc
+        if self.future_oracle is not None:
+            self.future_oracle.consume_current(sequence, self.timestamp)
+
+        this_node, insert_list = self.__match__(sequence)
+        self.__insert__(this_node, insert_list)
+        self.timestamp += 1
+        return (len(sequence), len(sequence) - len(insert_list), len(insert_list))
+
+
 #############################################
 # Task 4.1 + 4.2: Model-based eviction with path protection
 #############################################
@@ -579,6 +639,8 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
                 raise ValueError("No eviction candidates available (all nodes protected)")
             
             if self.model is not None and self.history_state is not None:
+                if torch is None:
+                    raise ImportError("TrieModelPredictAlgorithm requires torch when model is set")
                 # Use model to score candidates
                 leaf_states = []
                 for c in candidates:
@@ -623,6 +685,8 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
     def __add_node__(self, node: TrieNode):
         """When a new node is added, compute its Tree-LSTM state incrementally."""
         if self.model is not None:
+            if torch is None:
+                raise ImportError("TrieModelPredictAlgorithm requires torch when model is set")
             parent = node.parent
             parent_state = parent.hidden_state if parent is not None else None
             if node.node_id is not None:
@@ -671,6 +735,8 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
         
         # Update history LSTM state with the last token of the sequence
         if self.model is not None and len(sequence) > 0:
+            if torch is None:
+                raise ImportError("TrieModelPredictAlgorithm requires torch when model is set")
             with torch.no_grad():
                 self.history_state = self.model.encode_history_step(
                     sequence[-1], self.history_state
@@ -725,6 +791,8 @@ class TrieModelGuard(TrieModelPredictAlgorithm):
             use_model = False
             
             if self.model is not None and self.history_state is not None and len(candidates) > 1:
+                if torch is None:
+                    raise ImportError("TrieModelGuard requires torch when model is set")
                 leaf_states = []
                 for c in candidates:
                     if c.hidden_state is not None:

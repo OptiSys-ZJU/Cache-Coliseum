@@ -3,19 +3,31 @@ from types import SimpleNamespace
 from typing import List, Type, Optional
 import random
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 import tqdm
 
-from cache.cache import BaseCache
+try:
+    from cache.cache import BaseCache
+except ModuleNotFoundError:
+    class BaseCache:
+        pass
 from cache.evict.evictor import ReuseDistanceEvictor
 from cache.evict.predictor import OracleReuseDistancePredictor
 from cache.hash import HashFunction, OneHashFunction
 from cache.trie.trie_algorithms import (
     TrieEvictAlgorithm, TrieGuard, TrieLRUAlgorithm, 
     TrieModelPredictAlgorithm, TrieModelGuard, TrieNode, 
-    TriePredictAlgorithm, TrieRandAlgorithm,
+    TrieOracleAlgorithm, TriePredictAlgorithm, TrieRandAlgorithm,
 )
-from data_trace.trie_data_trace import OracleTrieDataTrace, TrieDataTrace
+from cache.trie.oracle import PrefixFutureOracle
+try:
+    from data_trace.trie_data_trace import OracleTrieDataTrace, TrieDataTrace
+except ModuleNotFoundError:
+    OracleTrieDataTrace = None
+    TrieDataTrace = None
 from utils.aligner import Aligner, ListAligner
 
 class TrieCache(BaseCache):
@@ -73,6 +85,8 @@ class TrieCache(BaseCache):
         self.pretty_stat()
 
     def __handle_oracle(self, trace_path):
+        if OracleTrieDataTrace is None:
+            raise ImportError("OracleTrieDataTrace dependencies are not available")
         with OracleTrieDataTrace(trace_path, self._aligner, self.hash_func, scale_times=1, offset=1) as sim_trace:
             while not sim_trace.done():
                 pc, address = sim_trace.next()
@@ -123,6 +137,7 @@ class TrieTrainingCache:
         
         # Oracle: precomputed future access list
         self._future_accesses: Optional[List[List[int]]] = None
+        self._future_oracle: Optional[PrefixFutureOracle] = None
         self._current_step = 0
         
         # Collected training snapshots
@@ -147,6 +162,10 @@ class TrieTrainingCache:
         Must be called before collect() to enable oracle labeling.
         """
         self._future_accesses = sequences
+        self._future_oracle = PrefixFutureOracle(
+            sequences,
+            max_prefix_len=self.max_node_num,
+        )
         self._current_step = 0
     
     def _reuse_distance(self, path: tuple) -> float:
@@ -158,6 +177,9 @@ class TrieTrainingCache:
         """
         if self._future_accesses is None:
             return float('inf')
+
+        if self._future_oracle is not None:
+            return self._future_oracle.reuse_distance(path, self._current_step)
         
         path_list = list(path)
         path_len = len(path_list)
@@ -193,9 +215,14 @@ class TrieTrainingCache:
                 snapshot: SimpleNamespace with training fields (None if no eviction)
                 hit: bool, whether the entire sequence was a cache hit
         """
+        cache_sequence = sequence[:self.max_node_num]
+
+        if self._future_oracle is not None:
+            self._future_oracle.consume_current(cache_sequence, self._current_step)
+
         # Match
-        this_node, insert_list = self.alg.__match__(sequence)
-        hit = len(insert_list) == 0
+        this_node, insert_list = self.alg.__match__(cache_sequence)
+        hit = len(insert_list) == 0 and len(cache_sequence) == len(sequence)
         
         if hit:
             self.hit_count += 1
@@ -208,7 +235,7 @@ class TrieTrainingCache:
         if insert_len > 0:
             evict_num = self.alg.cur_node_num + insert_len - self.alg.max_node_num
             if evict_num > 0:
-                snapshot = self._evict_and_collect(evict_num, this_node, sequence)
+                snapshot = self._evict_and_collect(evict_num, this_node, cache_sequence)
             
             # Insert new nodes (same as TrieModelPredictAlgorithm.__insert__)
             for key in insert_list:
@@ -225,6 +252,8 @@ class TrieTrainingCache:
         
         # Update history LSTM
         if self.model is not None and len(sequence) > 0:
+            if torch is None:
+                raise ImportError("TrieTrainingCache requires torch when model is set")
             with torch.no_grad():
                 self.alg.history_state = self.model.encode_history_step(
                     sequence[-1], self.alg.history_state
@@ -275,6 +304,8 @@ class TrieTrainingCache:
             
             # DAgger: choose actual eviction target
             if random.random() < self.model_prob and self.model is not None and self.alg.history_state is not None:
+                if torch is None:
+                    raise ImportError("TrieTrainingCache requires torch when model is set")
                 # Model policy
                 leaf_states = []
                 for c in candidates:
@@ -356,6 +387,10 @@ class SequenceTrieCache:
         
         self.model = model
         self.stat_info = [0, 0, 0]  # total, hit, miss
+        self.request_count = 0
+        self.request_full_hits = 0
+        self.prefix_hit_sum = 0
+        self.uncacheable_block_count = 0
     
     def set_model(self, model):
         """Set or update the model (for model-based algorithms)."""
@@ -373,14 +408,28 @@ class SequenceTrieCache:
         Returns:
             Tuple of (total_nodes, hit_nodes, miss_nodes)
         """
+        cache_sequence = sequence[:self.alg.max_node_num]
+        uncacheable_blocks = max(0, len(sequence) - len(cache_sequence))
+
         if isinstance(self.alg, (TrieModelPredictAlgorithm, TrieModelGuard)):
             # Model-based algorithms: access(sequence)
-            stat = self.alg.access(sequence)
+            cache_stat = self.alg.access(cache_sequence)
         else:
             # Legacy algorithms: access(pc, aligned_address)
-            stat = self.alg.access(None, sequence)
+            cache_stat = self.alg.access(None, cache_sequence)
+
+        _, cache_hit, _ = cache_stat
+        total = len(sequence)
+        hit = cache_hit
+        miss = total - hit
+        stat = (total, hit, miss)
         
         self.stat_info = [x + y for x, y in zip(self.stat_info, stat)]
+        self.request_count += 1
+        self.prefix_hit_sum += hit
+        self.uncacheable_block_count += uncacheable_blocks
+        if miss == 0:
+            self.request_full_hits += 1
         return stat
     
     def pretty_stat(self):
@@ -397,6 +446,37 @@ class SequenceTrieCache:
         if total == 0:
             return (total, hit, miss, 0.0)
         return (total, hit, miss, round(hit / total, 4))
+
+    def kv_stat(self, block_size: int = 1):
+        """Return KV-cache oriented aggregate metrics."""
+        total, hit, miss = self.stat_info
+        block_hit_rate = hit / total if total else 0.0
+        request_full_hit_rate = (
+            self.request_full_hits / self.request_count
+            if self.request_count
+            else 0.0
+        )
+        avg_prefix_hit_len = (
+            self.prefix_hit_sum / self.request_count
+            if self.request_count
+            else 0.0
+        )
+        return {
+            "requests": self.request_count,
+            "request_full_hits": self.request_full_hits,
+            "prefix_hit_sum": self.prefix_hit_sum,
+            "total_blocks": total,
+            "hit_blocks": hit,
+            "miss_blocks": miss,
+            "block_hit_rate": block_hit_rate,
+            "request_full_hit_rate": request_full_hit_rate,
+            "avg_prefix_hit_len": avg_prefix_hit_len,
+            "recompute_blocks": miss,
+            "saved_prefill_tokens": hit * block_size,
+            "uncacheable_blocks": self.uncacheable_block_count,
+            "evictions": getattr(self.alg, "eviction_count", 0),
+            "resident_blocks": getattr(self.alg, "cur_node_num", 0),
+        }
 
 
 if __name__ == "__main__":
