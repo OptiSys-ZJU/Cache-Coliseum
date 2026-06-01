@@ -4,13 +4,15 @@
 [![nips](https://img.shields.io/badge/NeurIPS%202025-Poster-blueviolet)](https://neurips.cc/virtual/2025/poster/116615)
 [![GitHub](https://img.shields.io/badge/GitHub-Repository-black)](https://github.com/OptiSys-ZJU/cache-coliseum)
 
-A benchmark for evaluating learning-augmented caching algorithms, featuring multiple implemented predictors, including PLECO, POPU, LRB, and Parrot.
+A benchmark for evaluating learning-augmented caching algorithms, featuring multiple algorithm implementations and a variety of predictors. This benchmark is used in the following paper:
+
+- NeurIPS 2025 [Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency](https://papers.nips.cc/paper_files/paper/2025/hash/b1e7f61f40d68b2177857bfcb195a507-Abstract-Conference.html) [arXiv version](https://arxiv.org/pdf/2507.16242)
 
 ## Experimental Code & Acknowledgements
 
 The experimental scripts, training/evaluation pipelines, data preprocessing, and result analysis were implemented and maintained by [Jiaji Zhang](https://github.com/Freesia810).
 
-Some parts of the project code were inspired by or adapted from existing open-source libraries, including:
+Some parts of the project code were inspired by or adapted from existing open-source repositories, including:
 - [cache_replacement](https://github.com/google-research/google-research/tree/master/cache_replacement)
 - [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)
 
@@ -304,7 +306,7 @@ We also provide some scripts for training and testing, for reference purposes on
 
 ## Citation
 
-If you have any questions regarding the [paper](https://arxiv.org/abs/2507.16242), feel free to contact me at pgchen@zju.edu.cn.
+If you have any questions regarding the paper, feel free to contact [Peng Chen](https://github.com/Natureal) at pgchen@zju.edu.cn.
 
 ```bibtex
 @misc{chen2025robustifyinglearningaugmentedcachingefficiently,
