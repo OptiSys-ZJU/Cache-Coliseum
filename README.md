@@ -6,7 +6,7 @@
 
 A benchmark for evaluating learning-augmented caching algorithms, featuring multiple algorithm implementations and a variety of predictors. This benchmark is used in the following paper:
 
-- NeurIPS 2025 [Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency](https://papers.nips.cc/paper_files/paper/2025/hash/b1e7f61f40d68b2177857bfcb195a507-Abstract-Conference.html) [arXiv version](https://arxiv.org/pdf/2507.16242)
+- NeurIPS'25 [Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency](https://papers.nips.cc/paper_files/paper/2025/hash/b1e7f61f40d68b2177857bfcb195a507-Abstract-Conference.html) [[arXiv](https://arxiv.org/pdf/2507.16242)]
 
 ## Experimental Code & Acknowledgements
 
@@ -16,13 +16,15 @@ Some parts of the project code were inspired by or adapted from existing open-so
 - [cache_replacement](https://github.com/google-research/google-research/tree/master/cache_replacement)
 - [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)
 
-## Traces
+The algorithm design and refinement of Guard were contributed by [Peng Chen](https://github.com/Natureal).
 
-Download traces from the Dropbox provided by [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>, and organize them into per-workload directories, e.g., ./traces/xalanc for xalanc_test.csv.
+## Traces and Checkpoints
 
-And, we have reorganized the Brightkite and Cite datasets to conform to a unified format.
+We provide SPEC CPU2006 memory traces in the repository, sourced from the Dropbox of [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>. Each trace is located in the `traces/` directory, e.g. `traces/xalanc/xalanc_test.csv`. In addition, we reorganize the Brightkite and Citi datasets into the same format; for these two datasets a `*_all.csv` is also provided and is used by `--test_all` to evaluate on the entire trace instead of the test split.
 
-You can easily download all trace files, boost traces pickle and GBM Model Checkpoints from the Releases page.
+We also ship the **boost traces** under `boost_traces/` and the pre-trained **GBM / Parrot checkpoints** under `checkpoints/`, so the benchmark can be run out of the box with no additional downloads. The boost traces are the per-step predictor outputs consumed by `--boost` in `real` mode (see the **Boost** subsection in Usage below): one pickle per `(dataset, predictor, model_fraction)` triple, e.g. `boost_traces/astar_PLECO_1.pkl`. Their presence lets `--boost` skip the one-time predictor pre-pass entirely. If a pickle is missing — or if the shipped one fails to load on your Python/library setup (see Environment below) — it will be regenerated and saved on first use, which for `gbm` / `parrot` requires the corresponding checkpoint under `checkpoints/`.
+
+> **Note on Parrot checkpoints:** Due to the large size of Parrot model checkpoints, the `checkpoints/` directory in this repository only includes pre-trained LRB (LightGBM) models. To test the Parrot predictor, download the full `checkpoints` archive from the [Releases page](https://github.com/OptiSys-ZJU/Cache-Coliseum/releases), extract it, and replace the `checkpoints/` folder in the repository.
 
 ## Environment
 
@@ -30,18 +32,46 @@ We use an environment based on Python 3.10.16 with Anaconda3 (Anaconda3-2021.05-
 
 You can also install your own environment based on another Python Version but only pay attention that:
 - If you want to use the `Parrot` Model, you should install your torch env(in our benchmark, we use CUDA 12.4 to enable Torch GPU)
-- Because of different Python pickle rules, the released `boost-traces.zip` may not work in your env, so you need to generate your own boost trace file.
+- Because of different Python pickle rules, the boost traces shipped under `boost_traces/` may fail to load on a different Python/library setup. In that case, delete the affected pickles and the benchmark will regenerate them locally on first use.
 
 ## Usage
 
 ### Benchmark
 
-A Simple usage:
-```python
-python -m benchmark --dataset xalanc --real --pred pleco --boost --boost_fr 
+Quick start with different predictors on the `xalanc` dataset, e.g.,:
+
+```bash
+python -m benchmark --dataset xalanc --real --pred pleco --boost --boost_fr
+
+python -m benchmark --dataset xalanc --real --pred lrb --boost --boost_fr
+
+# Parrot predictor (requires Parrot checkpoint under checkpoints/parrot/, see note above)
+python -m benchmark --dataset xalanc --real --pred parrot --boost --boost_fr --device cuda:0
+
+# Oracle with reuse-distance noise
+python -m benchmark --dataset xalanc --oracle --noise_type dis
+
+# Oracle with binary-flipping noise
+python -m benchmark --dataset xalanc --oracle --noise_type bin
 ```
 
-You will see the benchmark results of all supported algorithms on the console.
+You will see the benchmark results of algorithms on the console. Add `--dump_file` to save results as CSV files under `stat/` (e.g., `stat/xalanc_lrb_1.csv`).
+
+To run all SPEC CPU2006 datasets at once, use the batch scripts under `scripts/`, e.g.,:
+
+```bash
+# Real-mode predictors (all 13 datasets, parallel)
+scripts/run_pleco.sh          # PLECO
+scripts/run_lrb.sh            # LRB (default fraction=1)
+scripts/run_parrot.sh         # Parrot (default fraction=1)
+```
+
+Afterward (e.g., via `scripts/run_lrb.sh`), the following command automatically aggregates the per-dataset results into a single table:
+
+```bash
+# Aggregate LRB results (fraction=1)
+python scripts/aggregate_results.py --name lrb
+```
 
 #### All Usages
 ```python
@@ -74,7 +104,7 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
     
     You can also support your own dataset.
 
-  `--test_all`: This option only works for `brightkite` and `citi` datasets, meaning the entire traces will be used in these datasets. It cannot be used with `parrot` or `lrb` predictors as they require a training set.
+  `--split`: Selects which trace split to use (`test`, `train`, `valid`, or `all`). Defaults to `test` for SPEC CPU2006 datasets, and automatically uses `all` for `brightkite` and `citi` (which don't require a train/test split).
 - Device
 
   `--device`: Model target device, like `cpu`, `cuda:0` and `cuda:1`...
@@ -83,36 +113,12 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
   
 - Mode
 
-  `real` and `oracle`: You must specify one of them in command.
+  Exactly one of `--real` / `--oracle` is required.
 
-  - Real Mode
+  - **Real Mode** — supports `parrot`, `pleco`, `popu`, `pleco-bin`, `gbm`. `--verbose` defaults to True; `--noise_type` is ignored.
+  - **Oracle Mode** — supports `oracle_dis`, `oracle_bin`. `--verbose` defaults to False; `--noise_type` selects how the oracle is perturbed. Model-loading flags (`--model_fraction`, `--checkpoints_root_dir`, `--parrot_config_path`, `--lightgbm_config_path`) and `--boost_preds_dir` are ignored since no predictor checkpoint is loaded.
 
-    Supported Predictors:
-
-    + `parrot`
-    + `pleco`
-    + `popu`
-    + `pleco-bin`
-    + `gbm`
-
-    `verbose` default to True
-
-    `boost` will use pickle traces (`num_workers` doesn't work)
-
-    `noise_type` doesn't work
-    
-  - Oracle Mode
-
-    Supported Predictors:
-
-    + `oracle_dis`
-    + `oracle_bin`
- 
-    `verbose` default to False
-
-    `boost` will use multiprocess pool (`num_workers` works)
-
-    `boost_preds_dir` `model_fraction` `checkpoints_root_dir` `parrot_config_path` `lightgbm_config_path` don't work
+  `--boost` and `--num_workers` behave differently in the two modes; see the Boost subsection below.
 
 - Noise Type
   + `logdis`: Log Normal Noise on Next Request Time (Reuse Distance)
@@ -130,7 +136,7 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
   | Rand                               | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
   | LRU                                | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
   | Marker                             | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; | &#10060; |
-  | Predict (BlindOracle/LRB/Parrot)   | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
+  | Predict (BlindOracle)              | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; | &#10004; |
   | PredictiveMarker<sup>[2]</sup>     | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
   | LMarker<sup>[3]</sup>              | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
   | LNonMarker<sup>[3]</sup>           | &#10004; | &#10004; | &#10060; | &#10060; | &#10004; | &#10060; |
@@ -146,26 +152,33 @@ python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle
 
 - Predictor
 
-  + `pleco`: A PLECO Model that predicts next request times (NRT).
-  + `popu`: A Popularity Model that predicts next request times (NRT).
-  + `lrb`: A Gradient Boosting Machine based on Delta and EDC features that predicts belady's binary labels.
-  + `oracle_bin`: An offline predictor that predicts next request times (NRT), potentially affected by noise (dis).
-  + `oracle_dis`: An offline predictor that predicts belady's binary label, potentially affected by noise (logdis, dis).
-  + `parrot`: A Parrot Imitation Model that predicts eviction priority for each page.
+  `--pred` accepts one or more predictor names (it is a multi-valued argument). If omitted, the benchmark runs every predictor compatible with the current mode — all real predictors under `--real`, all oracle predictors under `--oracle`.
+
+  | Flag         | Output                                                  | Needs checkpoint              |
+  |:-------------|:--------------------------------------------------------|:------------------------------|
+  | `pleco`      | next request time (NRT) from a PLECO model              | no                            |
+  | `popu`       | next request time (NRT) from a popularity model         | no                            |
+  | `pleco-bin`  | Belady binary label from PLECO with a probability threshold (default 0.5) | no |
+  | `lrb`        | Belady binary label from a GBM on Delta / EDC features  | yes (`checkpoints/lightgbm/`) |
+  | `parrot`     | per-page eviction priority from a Parrot imitation model | yes (`checkpoints/parrot/`)  |
+  | `oracle_dis` | offline NRT, optionally perturbed by `dis` noise        | no                            |
+  | `oracle_bin` | offline Belady binary label, optionally perturbed by `logdis` / `dis` noise | no |
 
 - Dump and Verbose
 
-  `dump_file`: Enables result dumping, saving test results in the format `$output_root_dir/$dataset/$fraction/$predictor.csv`.
+  `dump_file`: Enables result dumping. Results are written to `$output_root_dir/<dataset>_<predictor>_<model_fraction>.csv` in `real` mode, and to `$output_root_dir/<dataset>_<noise_type>_<model_fraction>.csv` in `oracle` mode.
 
   `verbose`: Enables detailed output. When enabled, all statistical data (hits, misses, hit rates, and competitive ratios) will be displayed; otherwise, only the hit rate and competitive ratio will be shown.
   
 - Boost
-  
-  In `real` mode, `boost` uses a pickle file from `boost_preds_dir` (creating it if it doesn't exist) to accelerate testing.
 
-  In `oracle` mode, boost utilizes a multiprocessing pool to handle all test tasks concurrently.
+  `--boost` and `--boost_fr` are two independent speed-ups; either or both can be enabled.
 
-  We also provide the `boost_fr` parameter, which enables the `Follow&Robust` algorithm to use the Belady trace for calculating the Belady cost within this algorithm. Without this optimization, the entire test process would be significantly slower.
+  - **`--boost`** — shares predictor work across algorithms.
+    - `real` mode: each predictor is run over the trace once, and its per-step outputs are pickled into `boost_preds_dir` (default `boost_traces/`). All algorithms in the run that share that predictor (and any subsequent run) read from the pickle instead of re-running the model. Effectively required for `parrot` and `gbm`, whose inference dominates wall-clock time.
+    - `oracle` mode: no pickle. Every algorithm's cache is instead evaluated in parallel via a multiprocess pool of size `--num_workers` (default `-1` = all cores).
+
+  - **`--boost_fr`** — speeds up the Follower & Robust algorithm. By default F&R recomputes the offline Belady cache from the remaining future trace at every step (quadratic, and dominant whenever F&R is in the run). With this flag, all Belady snapshots are precomputed in a single pre-pass and looked up in O(1). Recommended whenever the run includes F&R (i.e., with `pleco`, `popu`, `parrot`, or `oracle_dis`).
   
 - Model Config
 
@@ -229,6 +242,7 @@ You can use our GBM training tool to generate and test the cache model.
 python -m model.parrot [--dataset DATASET] [--device DEVICE]
                     [--model_fraction MODEL_FRACTION] [--model_config_path MODEL_CONFIG_PATH]
                     [--checkpoints_root_dir CHECKPOINTS_ROOT_DIR] [--traces_root_dir TRACES_ROOT_DIR]
+                    [--real_test]
 ```
 
 - Params:
@@ -238,6 +252,7 @@ python -m model.parrot [--dataset DATASET] [--device DEVICE]
   + `model_config_path`: Model's config
   + `checkpoints_root_dir`: The directory where the checkpoint files are saved after training is completed.
   + `traces_root_dir`: The directory where the datasets are stored.
+  + `real_test`: After training is completed, the test set will be loaded to evaluate the model's performance.
  
 - Config Example:
   ```json
@@ -280,10 +295,27 @@ python -m model.parrot [--dataset DATASET] [--device DEVICE]
   
   You can find more details about Parrot and its training in [cache_replacement](https://github.com/google-research/google-research/tree/master/cache_replacement)<sup>[8]</sup>.
 
+
 ### Script
 
 We also provide some scripts for training and testing, for reference purposes only. You can find them in the `scripts` folder.
 
+
+## Citation
+
+Please cite the following paper if you find this benchmark useful. Feel free to contact [Peng Chen](https://github.com/Natureal) at pgchen@zju.edu.cn for any questions.
+
+```bibtex
+@misc{chen2025robustifyinglearningaugmentedcachingefficiently,
+      title={Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency},
+      author={Peng Chen and Hailiang Zhao and Jiaji Zhang and Xueyan Tang and Yixuan Wang and Shuiguang Deng},
+      year={2025},
+      eprint={2507.16242},
+      archivePrefix={arXiv},
+      primaryClass={cs.DS},
+      url={https://arxiv.org/abs/2507.16242},
+}
+```
 
 ## References
 
@@ -304,18 +336,3 @@ We also provide some scripts for training and testing, for reference purposes on
 [8] Evan Zheran Liu, Milad Hashemi, Kevin Swersky, Parthasarathy Ranganathan, and Junwhan Ahn. 2020. An imitation learning approach for cache replacement. In Proceedings of the 37th International Conference on Machine Learning (ICML'20), Vol. 119. JMLR.org, Article 579, 6237–6247.
 
 
-## Citation
-
-If you have any questions regarding the paper, feel free to contact [Peng Chen](https://github.com/Natureal) at pgchen@zju.edu.cn.
-
-```bibtex
-@misc{chen2025robustifyinglearningaugmentedcachingefficiently,
-      title={Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency},
-      author={Peng Chen and Hailiang Zhao and Jiaji Zhang and Xueyan Tang and Yixuan Wang and Shuiguang Deng},
-      year={2025},
-      eprint={2507.16242},
-      archivePrefix={arXiv},
-      primaryClass={cs.DS},
-      url={https://arxiv.org/abs/2507.16242},
-}
-```

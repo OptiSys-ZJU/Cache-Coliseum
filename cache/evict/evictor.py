@@ -20,9 +20,9 @@ class BinaryEvictor(Evictor):
     def evict(self, candidates):
         indices_with_1 = [i for i, pred in candidates if pred == 1]
         if indices_with_1:
-            chosen_index = random.choice(indices_with_1)
+            chosen_index = indices_with_1[0]
         else:
-            chosen_index = random.choice(candidates)[0]
+            chosen_index = candidates[0][0]
         return chosen_index
 
 class MinEvictor(Evictor):

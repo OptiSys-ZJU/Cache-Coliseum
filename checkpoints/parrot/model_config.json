@@ -1,0 +1,35 @@
+{
+    "address_embedder": {
+        "embed_dim": 64,
+        "max_vocab_size": 5000,
+        "type": "dynamic-vocab"
+    },
+    "cache_line_embedder": "address_embedder",
+    "cache_pc_embedder": "none",
+    "loss": [
+        "ndcg",
+        "reuse_dist"
+    ],
+    "lstm_hidden_size": 128,
+    "max_attention_history": 30,
+    "pc_embedder": {
+        "embed_dim": 64,
+        "max_vocab_size": 5000,
+        "type": "dynamic-vocab"
+    },
+    "positional_embedder": {
+        "embed_dim": 128,
+        "type": "positional"
+    },
+    "sequence_length": 80,
+    "lr": 0.001,
+    "total_steps": 25000,
+    "eval_freq": 5000,
+    "save_freq": 5000,
+    "batch_size": 32,
+    "collection_multiplier": 5,
+    "dagger_init": 1,
+    "dagger_final": 1,
+    "dagger_steps": 200000,
+    "dagger_update_freq": 50000
+}

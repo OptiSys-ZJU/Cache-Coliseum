@@ -1,0 +1,14 @@
+Name,Hit,Miss,Total,Hit Rate,Cost Ratio
+OPT,30706,10382,41088,0.7473,1.000
+Rand,22841,18247,41088,0.5559,1.758
+LRU,5236,35852,41088,0.1274,3.453
+Marker,17376,23712,41088,0.4229,2.284
+Predict[Parrot],25358,15730,41088,0.6172,1.515
+PredMark[Parrot],17517,23571,41088,0.4263,2.270
+LMarker[Parrot],17553,23535,41088,0.4272,2.267
+LNonMarker[Parrot],20601,20487,41088,0.5014,1.973
+FollowerRobust[ParrotState],20395,20693,41088,0.4964,1.993
+Guard[Parrot]-f-pred-no-relax,20531,20557,41088,0.4997,1.980
+Guard[Parrot]-f-pred-relax-times-5,25440,15648,41088,0.6192,1.507
+"CombDet[Predict[Parrot], Marker]",25279,15809,41088,0.6152,1.523
+"CombineRandom[Predict[Parrot], Marker]",24774,16314,41088,0.6029,1.571

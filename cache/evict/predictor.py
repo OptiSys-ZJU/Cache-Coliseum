@@ -371,3 +371,63 @@ class GBMBinPredictor(BinaryPredictor):
 
         self.access_ts += 1
         return self._model((pc, address, *[self.deltas[i][address] for i in range(self.delta_nums)], *[self.edcs[i][address] for i in range(self.edc_nums)]))
+
+class LRBPredictor(BinaryPredictor):
+    """GBM-on-Delta/EDC with a sliding memory window.
+
+    Same feature extraction as GBMBinPredictor, but every 1000 steps purges
+    per-address state for addresses last touched longer than `memory_window`
+    accesses ago. This bounds memory on long traces, matching the online
+    relaxation in Song et al., NSDI'20.
+    """
+    def __init__(self, shared_model, memory_window=1000000):
+        super().__init__()
+        self._model = shared_model
+        self.delta_nums = self._model.deltanums
+        self.edc_nums = self._model.edcnums
+        self.memory_window = memory_window
+
+        self.deltas = [{} for _ in range(self.delta_nums)]
+        self.edcs = [{} for _ in range(self.edc_nums)]
+        self.access_time_dict = {}
+        self.access_ts = 0
+
+    def predict_score(self, ts, pc, address, cache_state):
+        if address not in self.access_time_dict:
+            self.access_time_dict[address] = collections.deque()
+
+        this_access_list = self.access_time_dict[address]
+        if len(this_access_list) == self.delta_nums + 1:
+            this_access_list.popleft()
+        this_access_list.append(self.access_ts)
+
+        for i in range(1, self.delta_nums + 1):
+            this_delta = self.deltas[i-1]
+            if len(this_access_list) > i:
+                this_delta[address] = this_access_list[-i] - this_access_list[-i-1]
+            else:
+                this_delta[address] = np.inf
+
+        delta1 = self.deltas[0][address]
+        for i in range(1, self.edc_nums + 1):
+            this_edc = self.edcs[i-1]
+            if address not in this_edc:
+                this_edc[address] = 0
+            this_edc[address] = 1 + this_edc[address] * 2 ** (-delta1 / (2 ** (9 + i)))
+
+        self.access_ts += 1
+
+        features = (pc, address, *[self.deltas[i][address] for i in range(self.delta_nums)], *[self.edcs[i][address] for i in range(self.edc_nums)])
+        pred = self._model(features)
+
+        if self.access_ts % 1000 == 0:
+            cutoff = self.access_ts - self.memory_window
+            stale = [k for k, q in self.access_time_dict.items() if q[-1] < cutoff]
+            for key in stale:
+                del self.access_time_dict[key]
+                for i in range(self.delta_nums):
+                    self.deltas[i].pop(key, None)
+                for i in range(self.edc_nums):
+                    self.edcs[i].pop(key, None)
+
+        return pred

@@ -1020,6 +1020,7 @@ class PredictAlgorithmFactory:
         "PLECO-State": (DummyEvictor, PLECOStatePredictor),
         "PLECO-Bin": (BinaryEvictor, PLECOBinPredictor),
         "GBM": (BinaryEvictor, GBMBinPredictor),
+        "LRB": (BinaryEvictor, LRBPredictor),
         "POPU": (MaxEvictor, POPUPredictor),
         "POPU-State": (DummyEvictor, POPUStatePredictor),
         "Parrot": (MaxEvictor, ParrotPredictor),
@@ -1040,14 +1041,19 @@ class PredictAlgorithmFactory:
             # shared_model
             if 'shared_model' not in kwargs:
                 raise ValueError('PredictAlgorithmFactory: Parrot need [shared_model]')
-            
+
             if pred_type_str == 'Parrot-State':
                 if 'associativity' not in kwargs:
                     raise ValueError(f'PredictAlgorithmFactory: {pred_type_str} need [associativity]')
                 associativity = kwargs['associativity']
                 predictor_partial = partial(predictor_type, shared_model=kwargs['shared_model'], associativity=associativity)
             else:
-                predictor_partial = partial(predictor_type, shared_model=kwargs['shared_model']) 
+                predictor_partial = partial(predictor_type, shared_model=kwargs['shared_model'])
+        elif pred_type_str == 'LRB':
+            if 'shared_model' not in kwargs:
+                raise ValueError('PredictAlgorithmFactory: LRB need [shared_model]')
+            memory_window = kwargs.pop('memory_window', 1000000)
+            predictor_partial = partial(predictor_type, shared_model=kwargs['shared_model'], memory_window=memory_window)
         elif pred_type_str.startswith('Oracle'):
             reuse_dis_noise_sigma = 0
             lognormal = True
@@ -1154,5 +1160,7 @@ def pretty_print(callable: Union[EvictAlgorithm, partial], verbose=False) -> str
             if 'relax_prob' in kw:
                 relax_prob = kw['relax_prob']
             metadata += format_guard(relax_times, relax_prob)
-            
+
     return metadata
+
+

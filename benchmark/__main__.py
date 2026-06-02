@@ -26,7 +26,9 @@ def process_cache(cache):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=str, default='xalanc')
-    parser.add_argument("--test_all", action='store_true')
+    parser.add_argument("--split", type=str, default='test', choices=['test', 'train', 'valid', 'all'],
+                        help="trace split to use (default: test)")
+    parser.add_argument("--test_all", action='store_true', help="(deprecated, use --split all)")
 
     parser.add_argument("--device", type=str, default='cpu')
 
@@ -34,12 +36,12 @@ if __name__ == "__main__":
     mode_group.add_argument('--oracle', action='store_true')
     mode_group.add_argument('--real', action='store_true')
 
-    parser.add_argument('--pred', nargs='+', default='none', choices=['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm', 'oracle_bin', 'oracle_dis'])
+    parser.add_argument('--pred', nargs='+', default='none', choices=['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm', 'lrb', 'oracle_bin', 'oracle_dis'])
 
     parser.add_argument("--noise_type", type=str, default='logdis', choices=['dis', 'bin', 'logdis'])
 
     parser.add_argument("--dump_file", action='store_true')
-    parser.add_argument("--output_root_dir", type=str, default='res')
+    parser.add_argument("--output_root_dir", type=str, default='stat')
 
     parser.add_argument("--verbose", action='store_true')
 
@@ -53,11 +55,16 @@ if __name__ == "__main__":
     parser.add_argument("--parrot_config_path", type=str, default='checkpoints/parrot/model_config.json')
     parser.add_argument("--lightgbm_config_path", type=str, default='checkpoints/lightgbm/model_config.json')
 
+    parser.add_argument("--memory_window", type=int, default=1000000)
+
     args = parser.parse_args()
-    file_path = f'traces/{args.dataset}/{args.dataset}_test.csv'
     if args.test_all:
-        if args.dataset == 'brightkite' or args.dataset == 'citi':
-            file_path = f'traces/{args.dataset}/{args.dataset}_all.csv'
+        args.split = 'all'
+    if args.dataset in ('brightkite', 'citi') and args.split == 'test':
+        args.split = 'all'
+    file_path = f'traces/{args.dataset}/{args.dataset}_{args.split}.csv'
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Trace not found: {file_path}. Available splits: test, train, valid, all")
     if args.dataset == 'brightkite':
         cache_line_size = 1
         capacity = 1000
@@ -78,7 +85,7 @@ if __name__ == "__main__":
         hash_type = ShiftHashFunction
 
     this_preds = []
-    real_predictors_type = ['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm']
+    real_predictors_type = ['parrot', 'pleco', 'popu', 'pleco-bin', 'gbm', 'lrb']
     oracle_predictors_type = ['oracle_bin', 'oracle_dis']
     input_preds = args.pred
     if 'none' in input_preds:
@@ -90,7 +97,7 @@ if __name__ == "__main__":
         this_preds = input_preds
     
     ###########################################################
-    parrot_gen = gbm_gen = None
+    parrot_gen = gbm_gen = lrb_gen = None
     ckpt_root_dir = args.checkpoints_root_dir
     if 'parrot' in this_preds:
         this_dir = os.path.join(ckpt_root_dir, 'parrot', args.dataset, args.model_fraction)
@@ -124,7 +131,39 @@ if __name__ == "__main__":
                 threshold = float(content)
         print(f'LightGBM: Fraction [{args.model_fraction}], Threshold [{threshold}], Model Checkpoint[{this_ckpt_path}], Delta[{deltanums}], EDC[{edcnums}]')
         gbm_gen = lambda : LightGBMModel.from_config(deltanums, edcnums, this_ckpt_path, threshold)
-    
+
+    if 'lrb' in this_preds:
+        with open(args.lightgbm_config_path, "r") as f:
+            model_config = json.load(f)
+            lrb_deltanums = model_config['delta_nums']
+            lrb_edcnums = model_config['edc_nums']
+
+        lrb_dir = os.path.join(ckpt_root_dir, 'lightgbm', args.dataset, args.model_fraction)
+        if not os.path.exists(lrb_dir):
+            raise ValueError(f'Benchmark: {lrb_dir} not found checkpoints')
+        lrb_ckpt_path = os.path.join(lrb_dir, f'{args.dataset}_{args.model_fraction}_{lrb_deltanums}_{lrb_edcnums}.txt')
+        if not os.path.exists(lrb_ckpt_path):
+            raise ValueError(f'Benchmark: {lrb_ckpt_path} not found checkpoints')
+
+        fraction_thresholds = {
+            '0.01': 0.01,
+            '0.07': 0.6,
+            '0.1': 0.65,
+            '0.2': 0.7,
+            '0.5': 0.7,
+            '1': 0.75,
+        }
+        if args.model_fraction in fraction_thresholds:
+            lrb_threshold = fraction_thresholds[args.model_fraction]
+        else:
+            lrb_threshold = 0.5
+            lrb_threshold_path = os.path.join(lrb_dir, 'threshold')
+            if os.path.exists(lrb_threshold_path):
+                with open(lrb_threshold_path, "r") as file:
+                    lrb_threshold = float(file.read().strip())
+        print(f'LRB: Fraction [{args.model_fraction}], Memory Window [{args.memory_window}], Threshold [{lrb_threshold}], Model Checkpoint[{lrb_ckpt_path}], Delta[{lrb_deltanums}], EDC[{lrb_edcnums}]')
+        lrb_gen = lambda : LightGBMModel.from_config(lrb_deltanums, lrb_edcnums, lrb_ckpt_path, lrb_threshold)
+
     print("Benchmark: Use Predictor:", this_preds)
     print('Benchmark: Use Trace:', file_path)
     if args.dump_file:
@@ -167,12 +206,11 @@ if __name__ == "__main__":
 
     boost_preds_dict = {}
 
-    if not os.path.exists(args.boost_preds_dir):
-        os.makedirs(args.boost_preds_dir)
+    os.makedirs(args.boost_preds_dir, exist_ok=True)
     def boost_generate_prediction(pred_type, **kwargs):
         pred_algorithm = PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, pred_type, **kwargs)
 
-        if args.test_all and (args.dataset == 'brightkite' or args.dataset == 'citi'):
+        if args.split == 'all':
             pred_pickle_path = os.path.join(args.boost_preds_dir, f'{args.dataset}_all_{pred_type}_{args.model_fraction}.pkl')
         else:
             pred_pickle_path = os.path.join(args.boost_preds_dir, f'{args.dataset}_{pred_type}_{args.model_fraction}.pkl')
@@ -182,6 +220,19 @@ if __name__ == "__main__":
                 is_state = True
             else:
                 is_state = False
+
+            if pred_type == 'LRB' and 'shared_model' in kwargs:
+                fraction_thresholds = {
+                    '0.01': 0.01,
+                    '0.07': 0.6,
+                    '0.1': 0.65,
+                    '0.2': 0.7,
+                    '0.5': 0.7,
+                    '1': 0.75,
+                }
+                if args.model_fraction in fraction_thresholds:
+                    kwargs['shared_model'].threshold = fraction_thresholds[args.model_fraction]
+
             dump_cache = DumpCache(is_state, file_path, align_type, pred_algorithm, hash_type, cache_line_size, capacity, associativity)
             with DataTrace(file_path) as trace:
                 with tqdm.tqdm(desc="Producing cache on Boost Prediction") as pbar:
@@ -297,6 +348,22 @@ if __name__ == "__main__":
             combiner_types.extend([
                 (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), MarkerAlgorithm]),
                 (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'GBM', shared_model=gbm_gen()), MarkerAlgorithm]),
+            ])
+
+        ##########################################
+        if 'lrb' in this_preds:
+            if args.boost:
+                boost_preds_dict['LRB'] = boost_generate_prediction('LRB', shared_model=lrb_gen(), memory_window=args.memory_window)
+
+            online_types.extend([
+                PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window),
+                PredictAlgorithmFactory.generate_predictive_algorithm(Mark0, 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=0, relax_prob=0), 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window),
+                PredictAlgorithmFactory.generate_predictive_algorithm(partial(Guard, follow_if_guarded=False, relax_times=5, relax_prob=0), 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window),
+            ])
+            combiner_types.extend([
+                (partial(CombineDeterministicAlgorithm, switch_bound=1, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window), MarkerAlgorithm]),
+                (partial(CombineRandomAlgorithm, alpha=0.0, beta=0.99, lazy_evictor_type=LRUEvictor), [PredictAlgorithmFactory.generate_predictive_algorithm(PredictAlgorithm, 'LRB', shared_model=lrb_gen(), memory_window=args.memory_window), MarkerAlgorithm]),
             ])
 
         ########################################################
@@ -494,7 +561,7 @@ if __name__ == "__main__":
         hit, opt_miss, total, rate = cache_dict['OPT'][0].stat()
 
     if verbose:
-        table.field_names = ["Name", "Hit", "Miss", "Total", "Hit Rate", "Competitive Ratio"]
+        table.field_names = ["Name", "Hit", "Miss", "Total", "Hit Rate", "Cost Ratio"]
         for i, (pretty_name, _, _) in enumerate(funcs):
             hit, miss, total, rate = caches[i].stat()
             table.add_row([pretty_name, hit, miss, total, rate, f"{miss / opt_miss:.3f}"])
@@ -520,14 +587,12 @@ if __name__ == "__main__":
             table.add_row(lst)
 
     if args.dump_file:
-        res_dir = os.path.join(args.output_root_dir, args.dataset, args.model_fraction)
-        if not os.path.exists(res_dir):
-            os.makedirs(res_dir)
+        os.makedirs(args.output_root_dir, exist_ok=True)
         if args.real:
-            with open(os.path.join(res_dir, f"{'_'.join(this_preds)}.csv"), "w", encoding="utf-8") as file:
-                file.write(table.get_csv_string())
+            filename = f"{args.dataset}_{'_'.join(this_preds)}_{args.model_fraction}.csv"
         else:
-            with open(os.path.join(res_dir, f"{args.noise_type}.csv"), "w", encoding="utf-8") as file:
-                file.write(table.get_csv_string())
+            filename = f"{args.dataset}_{args.noise_type}_{args.model_fraction}.csv"
+        with open(os.path.join(args.output_root_dir, filename), "w", encoding="utf-8") as file:
+            file.write(table.get_csv_string())
     print(table)
             
