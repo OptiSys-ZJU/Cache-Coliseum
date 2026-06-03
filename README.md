@@ -16,7 +16,7 @@ Some parts of the project code were inspired by or adapted from existing open-so
 - [cache_replacement](https://github.com/google-research/google-research/tree/master/cache_replacement)
 - [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)
 
-The algorithm design and refinement of Guard were contributed by [Peng Chen](https://github.com/Natureal).
+The design and refinement of Guard were contributed by [Peng Chen](https://github.com/Natureal).
 
 ## Traces and Checkpoints
 
@@ -300,23 +300,6 @@ python -m model.parrot [--dataset DATASET] [--device DEVICE]
 
 We also provide some scripts for training and testing, for reference purposes only. You can find them in the `scripts` folder.
 
-
-## Citation
-
-Please cite the following paper if you find this benchmark useful. Feel free to contact [Peng Chen](https://github.com/Natureal) at pgchen@zju.edu.cn for any questions.
-
-```bibtex
-@misc{chen2025robustifyinglearningaugmentedcachingefficiently,
-      title={Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency},
-      author={Peng Chen and Hailiang Zhao and Jiaji Zhang and Xueyan Tang and Yixuan Wang and Shuiguang Deng},
-      year={2025},
-      eprint={2507.16242},
-      archivePrefix={arXiv},
-      primaryClass={cs.DS},
-      url={https://arxiv.org/abs/2507.16242},
-}
-```
-
 ## References
 
 [1] Chłędowski, Jakub Polak, Adam Szabucki, Bartosz Zolna, Konrad. 2021. Robust Learning-Augmented Caching: An Experimental Study. 10.48550/arXiv.2106.14693. 
@@ -336,3 +319,18 @@ Please cite the following paper if you find this benchmark useful. Feel free to 
 [8] Evan Zheran Liu, Milad Hashemi, Kevin Swersky, Parthasarathy Ranganathan, and Junwhan Ahn. 2020. An imitation learning approach for cache replacement. In Proceedings of the 37th International Conference on Machine Learning (ICML'20), Vol. 119. JMLR.org, Article 579, 6237–6247.
 
 
+## Citation
+
+Please cite the following paper if you find this benchmark useful. Feel free to contact [Peng Chen](https://github.com/Natureal) at pgchen@zju.edu.cn for any questions.
+
+```bibtex
+@misc{chen2025robustifyinglearningaugmentedcachingefficiently,
+      title={Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency},
+      author={Peng Chen and Hailiang Zhao and Jiaji Zhang and Xueyan Tang and Yixuan Wang and Shuiguang Deng},
+      year={2025},
+      eprint={2507.16242},
+      archivePrefix={arXiv},
+      primaryClass={cs.DS},
+      url={https://arxiv.org/abs/2507.16242},
+}
+```
