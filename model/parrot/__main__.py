@@ -76,8 +76,7 @@ if __name__ == '__main__':
     print(f'Parrot: Dagger collection_multiplier[{collection_multiplier}], dagger_init[{dagger_init}], dagger_final[{dagger_final}], dagger_steps[{dagger_steps}], dagger_update_freq[{dagger_update_freq}]')
     
     checkpoint_dir = os.path.join(args.checkpoints_root_dir, 'parrot', args.dataset, args.model_fraction)
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     parrot_model = ParrotModel.from_config(args.model_config_path, None)
     optimizer = torch.optim.Adam(parrot_model._model.parameters(), lr=lr)

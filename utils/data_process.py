@@ -219,8 +219,7 @@ if __name__ == '__main__':
                     start = 'Dis-'
 
                 this_dataset_plot_path = os.path.join(res_csv_path, dataset, prefix)
-                if not os.path.exists(this_dataset_plot_path):
-                    os.makedirs(this_dataset_plot_path)
+                os.makedirs(this_dataset_plot_path, exist_ok=True)
                 dir_path = os.path.join(full_path, '1')                
                 this_path = os.path.join(dir_path, f'{prefix}.csv')
                 if os.path.exists(this_path):

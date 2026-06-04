@@ -5,7 +5,7 @@ mkdir -p logs/benchmark/ppp
 pids=()
 for dataset in "${datasets[@]}"; do
     echo "Running with dataset=$dataset"
-    nohup python -m benchmark --boost --boost_fr --dataset "$dataset" --real --pred pleco popu pleco-bin --test_all --dump_file --output_root_dir stat > "logs/benchmark/ppp/${dataset}.log" 2>&1 &
+    nohup python -m benchmark --boost --boost_fr --dataset "$dataset" --real --pred pleco popu pleco-bin --dump_file --output_root_dir stat > "logs/benchmark/ppp/${dataset}.log" 2>&1 &
     pids+=($!)
 done
 

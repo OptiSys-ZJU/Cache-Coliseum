@@ -6,7 +6,7 @@ mkdir -p logs/benchmark/oracle
 pids=()
 for dataset in "${datasets[@]}"; do
     echo "Running with dataset=$dataset"
-    nohup python -m benchmark --boost_fr --dataset "$dataset" --oracle --pred oracle_bin --noise_type bin --test_all --dump_file --output_root_dir stat > "logs/benchmark/oracle/${dataset}_bin.log" 2>&1 &
+    nohup python -m benchmark --boost_fr --dataset "$dataset" --oracle --pred oracle_bin --noise_type bin --dump_file --output_root_dir stat > "logs/benchmark/oracle/${dataset}_bin.log" 2>&1 &
     pids+=($!)
 done
 

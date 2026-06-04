@@ -4,9 +4,9 @@
 [![nips](https://img.shields.io/badge/NeurIPS%202025-Poster-blueviolet)](https://neurips.cc/virtual/2025/poster/116615)
 [![GitHub](https://img.shields.io/badge/GitHub-Repository-black)](https://github.com/OptiSys-ZJU/cache-coliseum)
 
-A benchmark for evaluating learning-augmented caching algorithms, featuring multiple algorithm implementations and a variety of predictors. This benchmark is used in the following paper:
+A benchmark for evaluating learning-augmented caching algorithms, featuring multiple algorithm implementations and a variety of predictors.
 
-- NeurIPS'25 [Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency](https://papers.nips.cc/paper_files/paper/2025/hash/b1e7f61f40d68b2177857bfcb195a507-Abstract-Conference.html) [[arXiv](https://arxiv.org/pdf/2507.16242)]
+Implementation of the NeurIPS'25 paper [Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency](https://papers.nips.cc/paper_files/paper/2025/hash/b1e7f61f40d68b2177857bfcb195a507-Abstract-Conference.html) [[arXiv](https://arxiv.org/pdf/2507.16242)].
 
 ## Experimental Code & Acknowledgements
 

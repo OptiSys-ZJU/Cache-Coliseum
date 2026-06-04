@@ -87,8 +87,7 @@ if __name__ == '__main__':
         print(f"Generate Feature Label File: Written to {label_path}, Len[{len(features)}]")
 
     bin_label_dir = os.path.join(traces_dir, 'labels')
-    if not os.path.exists(bin_label_dir):
-        os.makedirs(bin_label_dir)
+    os.makedirs(bin_label_dir, exist_ok=True)
     
     valid_bin_file_path = os.path.join(bin_label_dir, f'valid_{deltanums}_{edcnums}.csv')
     if not os.path.exists(valid_bin_file_path):
@@ -157,8 +156,7 @@ if __name__ == '__main__':
         bench_predicitons = predictions
 
     checkpoint_dir = os.path.join(args.checkpoints_root_dir, 'lightgbm', args.dataset, args.model_fraction)
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
     this_ckpt_path = os.path.join(checkpoint_dir, f'{args.dataset}_{args.model_fraction}_{deltanums}_{edcnums}.txt')
     bst.save_model(this_ckpt_path)
