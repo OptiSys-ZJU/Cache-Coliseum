@@ -5,8 +5,9 @@ Reads flat CSV files from ``stat/<dataset>_<name>_<fraction>.csv``,
 computes per-algorithm mean of Hit Rate, Cost Ratio, and LRU-normalized
 Cost Ratio across datasets.
 
-Cross-checks with log files to ensure each dataset actually completed
-successfully in the most recent run.
+Completion is validated by CSV presence (uniform naming across all
+run_*.sh scripts); log files are cross-checked best-effort, since their
+naming varies per predictor script.
 """
 import argparse
 import csv
@@ -68,25 +69,11 @@ def main():
             if f.endswith(f"_{args.name}_{args.fraction}.csv")
         ))
 
-    # --- Verify each dataset has a valid log with result table ---
-    failed = []
-    for dataset in expected:
-        log_path = os.path.join(args.logs_dir, f"{dataset}_{args.fraction}.log")
-        ok, reason = log_has_result_table(log_path)
-        if not ok:
-            failed.append((dataset, reason))
-
-    if failed:
-        print("ERROR: The following datasets do not have valid results in their log files:")
-        for dataset, reason in failed:
-            log_path = os.path.join(args.logs_dir, f"{dataset}_{args.fraction}.log")
-            print(f"  {dataset:<15} ({reason}: {log_path})")
-        print()
-        print("Aggregation aborted. Re-run the benchmark for the failed datasets first.")
-        sys.exit(1)
-
-    # --- Collect CSVs ---
+    # --- Collect CSVs (the authoritative completion signal) ---
+    # CSV naming is uniform across all run_*.sh scripts:
+    #   <results_dir>/<dataset>_<name>_<fraction>.csv
     found = []
+    missing_csv = []
     mtimes = {}
     for dataset in expected:
         path = os.path.join(args.results_dir, f"{dataset}_{args.name}_{args.fraction}.csv")
@@ -94,11 +81,47 @@ def main():
             found.append((dataset, path))
             mtimes[dataset] = os.path.getmtime(path)
         else:
-            failed.append((dataset, "CSV not found"))
+            missing_csv.append((dataset, path))
+
+    if missing_csv:
+        print("ERROR: No result CSV for the following datasets (benchmark did not complete?):")
+        for dataset, path in missing_csv:
+            print(f"  {dataset:<15} (expected: {path})")
+        print()
+        print("Aggregation aborted. Re-run the benchmark for these datasets first.")
+        sys.exit(1)
 
     if not found:
         print(f"ERROR: No CSVs found matching {args.results_dir}/<dataset>_{args.name}_{args.fraction}.csv")
         sys.exit(1)
+
+    # --- Best-effort log sanity check (informational only) ---
+    # Log filenames differ per script (e.g. `<dataset>_1.log` for lrb/gbm/parrot,
+    # `<dataset>.log` for pleco/ppp, `<dataset>_<noise>.log` under oracle/ for
+    # bin/dis/logdis), so a missing log is NOT an error — the CSV above already
+    # confirms completion. Only warn when a log IS found but lacks a result table.
+    def find_log(dataset):
+        if not os.path.isdir(args.logs_dir):
+            return None
+        for cand in (f"{dataset}_{args.fraction}.log", f"{dataset}.log", f"{dataset}_{args.name}.log"):
+            p = os.path.join(args.logs_dir, cand)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    log_warnings = []
+    for dataset, _ in found:
+        log_path = find_log(dataset)
+        if log_path is None:
+            continue
+        ok, reason = log_has_result_table(log_path)
+        if not ok:
+            log_warnings.append((dataset, reason, log_path))
+    if log_warnings:
+        print("WARNING: Some logs look incomplete (CSV present, but log has no result table):")
+        for dataset, reason, log_path in log_warnings:
+            print(f"  {dataset:<15} ({reason}: {log_path})")
+        print()
 
     # --- Staleness check ---
     if mtimes:
