@@ -18,9 +18,9 @@ The design and refinement of Guard were contributed by [Peng Chen](https://githu
 
 ## Traces and Checkpoints
 
-We provide SPEC CPU2006 memory traces in the repository, sourced from the Dropbox of [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>. Each trace is located in the `traces/` directory, e.g. `traces/xalanc/xalanc_test.csv`. In addition, we reorganize the Brightkite and Citi datasets into the same format; for these two datasets a `*_all.csv` is also provided and is used by `--test_all` to evaluate on the entire trace instead of the test split.
+We provide SPEC CPU2006 memory traces in the repository, sourced from the Dropbox of [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)<sup>[1]</sup>. Each trace is located in the `traces/` directory. In addition, we reorganize the Brightkite and Citi datasets into the same format.
 
-We also ship the **boost traces** under `boost_traces/` and the pre-trained **GBM / Parrot checkpoints** under `checkpoints/`, so the benchmark can be run out of the box with no additional downloads. The boost traces are the per-step predictor outputs consumed by `--boost` in `real` mode (see the **Boost** subsection in Usage below): one pickle per `(dataset, predictor, model_fraction)` triple, e.g. `boost_traces/astar_PLECO_1.pkl`. Their presence lets `--boost` skip the one-time predictor pre-pass entirely. If a pickle is missing — or if the shipped one fails to load on your Python/library setup (see Environment below) — it will be regenerated and saved on first use, which for `gbm` / `parrot` requires the corresponding checkpoint under `checkpoints/`.
+We also ship the **boost traces** under `boost_traces/` and the pre-trained **GBM / Parrot checkpoints** under `checkpoints/`, so the benchmark can be run out of the box with no additional downloads. The boost traces are the per-step predictor outputs consumed by `--boost` in `real` mode (see the **Boost** subsection in Usage below). Their presence lets `--boost` skip the one-time predictor pre-pass entirely. If a pickle is missing — or if the shipped one fails to load on your Python/library setup (see Environment below) — it will be regenerated and saved on first use.
 
 > **Note on Parrot checkpoints:** Due to the large size of Parrot model checkpoints, the `checkpoints/` directory in this repository only includes pre-trained LRB (LightGBM) models. To test the Parrot predictor, download the full `checkpoints` archive from the [Releases page](https://github.com/OptiSys-ZJU/Cache-Coliseum/releases), extract it, and replace the `checkpoints/` folder in the repository.
 
@@ -48,9 +48,6 @@ python -m benchmark --dataset xalanc --real --pred parrot --boost --boost_fr --d
 
 # Oracle with reuse-distance noise
 python -m benchmark --dataset xalanc --oracle --noise_type dis
-
-# Oracle with binary-flipping noise
-python -m benchmark --dataset xalanc --oracle --noise_type bin
 ```
 
 You will see the benchmark results of algorithms on the console. Add `--dump_file` to save results as CSV files under `stat/` (e.g., `stat/xalanc_lrb_1.csv`).
@@ -73,7 +70,7 @@ python scripts/aggregate_results.py --name lrb
 
 #### All Usages
 ```python
-python -m benchmark [--dataset DATASET] [--test_all] [--device DEVICE] (--oracle | --real)
+python -m benchmark [--dataset DATASET] [--split {test,train,valid,all}] [--device DEVICE] (--oracle | --real)
                    [--pred {parrot,pleco,popu,pleco-bin,lrb,oracle_bin,oracle_dis}]
                    [--noise_type {dis,bin,logdis}] [--dump_file] [--output_root_dir OUTPUT_ROOT_DIR] [--verbose]
                    [--boost] [--num_workers NUM_WORKERS] [--boost_fr] [--boost_preds_dir BOOST_PREDS_DIR]
