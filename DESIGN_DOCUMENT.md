@@ -4,6 +4,14 @@ This document captures the current `trie-cache` branch state for continuing
 work on LLM prefix/KV-cache simulation after cloning the repository on another
 machine.
 
+## Current Handoff
+
+The active OASST1 timed shared-cache experiment state is tracked in
+`docs/oasst1_timed_experiment_manifest.md`. Read that manifest first before
+continuing experiments or training; it records the current workload semantics,
+generated files, completed block-size/capacity sweeps, missing settings, and
+recommended model-training targets.
+
 ## Goal
 
 Build a prefix-tree cache simulator for multi-turn LLM serving traces where each
@@ -18,8 +26,8 @@ Learning-Augmented Prefix-Tree KV Cache Eviction for Multi-turn LLM Serving
 The current implementation focuses on a reliable offline simulator first:
 
 ```text
-CC/Weka trace hash_ids
-        -> dense integer request sequences
+OASST1 timed request events
+        -> dense global KV block sequences
         -> prefix trie KV cache
         -> LRU / Random / Oracle / Model / Guard eviction
         -> KV-oriented metrics and capacity sweep
@@ -58,12 +66,12 @@ CC/Weka trace hash_ids
     `max_node_num` blocks and counting the rest as misses.
   - Updates `TrieTrainingCache` to use `PrefixFutureOracle` for oracle labels.
 
-- `scripts/data_process/preprocess_cc_traces.py`
-  - Converts CC/Weka-style traces into `SequenceTrieDataTrace`-compatible pkl
-    files.
-  - Supports Hugging Face loading or local JSON/JSONL input.
-  - Outputs `train.pkl`, `valid.pkl`, `test.pkl`, `vocab.json`,
-    `metadata.json`, and optionally `vocab_mapping.json`.
+- `scripts/data_process/preprocess_oasst1_timed.py`
+  - Converts timestamped OASST1 conversation events into
+    `SequenceTrieDataTrace`-compatible pkl files.
+  - Supports session-scoped or global KV block identity.
+  - Outputs split pkl files, split event JSONL files, `vocab.json`, and
+    `metadata.json`.
 
 - `benchmark/trie_kv.py`
   - Runs capacity sweeps for `lru`, `rand`, `oracle`, `model`, and `guard`.
@@ -75,30 +83,26 @@ CC/Weka trace hash_ids
   - Covers prefix future lookup, path recovery, long-request handling, and the
     oracle cache path.
 
-- `tests/test_cc_preprocess.py`
-  - Covers trace-local and global hash id dense mapping.
+## KV Block to Dense Id Mapping
 
-## Hash Id to Dense Id Mapping
+OASST1 timed preprocessing turns each conversation event into fixed-size KV
+block identities. The trie simulator can use raw identities as dict keys, but
+`TrieParrotModel` uses `nn.Embedding`, which requires compact integer ids in
+`[0, vocab_size)`.
 
-CC/Weka requests expose KV block identities as `hash_ids`. The trie simulator
-can use raw hashes as dict keys, but `TrieParrotModel` uses `nn.Embedding`,
-which requires compact integer ids in `[0, vocab_size)`.
-
-The preprocessing step maps each raw hash id to a stable dense integer:
+The preprocessing step maps each raw block/token-chunk identity to a stable
+dense integer:
 
 ```text
-raw hash id      dense id
-"abc..."    ->   1
-"def..."    ->   2
+raw block identity      dense id
+("global", "...")  ->   1
+("global", "...")  ->   2
 ```
 
 Id `0` is reserved for unknown/padding. The simulator should not collapse
 unknown KV blocks to id `0`, because that would create false prefix hits. The
-mapping is persisted as `vocab_mapping.json` when enabled.
-
-Default identity scope is `trace`, because CC/Weka hash ids are intended to be
-trace-local. With trace scope, the same raw hash string in two different traces
-maps to two different dense ids.
+active OASST1 timed main line uses global identity scope so shared cache
+experiments can observe reuse across timestamp-ordered requests.
 
 ## Prefix Future Oracle
 
@@ -147,32 +151,29 @@ as suffix bypass, sliding-window caching, or partial protected-path eviction.
 
 ## Preprocessing
 
-From Hugging Face:
+Build the current OASST1 timed global dataset:
 
 ```bash
-python scripts/data_process/preprocess_cc_traces.py \
-  --output_dir data/cc_weka
+python scripts/data_process/preprocess_oasst1_timed.py \
+  --output_dir data/oasst1_timed_global_b16 \
+  --block_token_size 16 \
+  --identity_scope global \
+  --event_role all
 ```
 
-For a smaller smoke test:
+For a validation-only smoke pass:
 
 ```bash
-python scripts/data_process/preprocess_cc_traces.py \
-  --output_dir data/cc_weka_small \
-  --max_traces 20 \
-  --max_requests_per_trace 200
+python scripts/data_process/preprocess_oasst1_timed.py \
+  --output_dir data/oasst1_timed_global_b16 \
+  --source_splits validation \
+  --block_token_size 16 \
+  --identity_scope global \
+  --event_role all
 ```
 
-From a local JSON/JSONL file:
-
-```bash
-python scripts/data_process/preprocess_cc_traces.py \
-  --input_path /path/to/cc_trace.jsonl \
-  --output_dir data/cc_weka
-```
-
-If Hugging Face loading fails, install the `datasets` package or use
-`--input_path`.
+The script expects the OASST1 sequence/request JSON and CSV files under
+`data/traces` by default.
 
 ## Benchmarking
 
@@ -180,35 +181,33 @@ Run non-model baselines:
 
 ```bash
 python -m benchmark.trie_kv \
-  --dataset cc_weka \
-  --split test \
-  --capacity 512 1024 2048 4096 \
-  --policy lru rand oracle \
-  --reset_per_trace
+  --dataset oasst1_timed_global_b16 \
+  --split valid \
+  --capacity 256 512 1024 2048 4096 \
+  --policy lru rand oracle
 ```
 
 Write results to CSV:
 
 ```bash
 python -m benchmark.trie_kv \
-  --dataset cc_weka \
-  --split test \
-  --capacity 512 1024 2048 4096 \
+  --dataset oasst1_timed_global_b16 \
+  --split valid \
+  --capacity 256 512 1024 2048 4096 \
   --policy lru rand oracle \
-  --reset_per_trace \
-  --output_csv res/cc_weka_kv.csv
+  --output_csv res/oasst1_timed_global_b16_valid_kv.csv
 ```
 
 Run model/guard policies after training:
 
 ```bash
 python -m benchmark.trie_kv \
-  --dataset cc_weka \
-  --split test \
-  --capacity 1024 \
+  --dataset oasst1_timed_global_b16 \
+  --split valid \
+  --capacity 256 \
   --policy model guard \
-  --model_config_path checkpoints/trie_model/cc_weka/config.json \
-  --model_checkpoint_path checkpoints/trie_model/cc_weka/best.ckpt \
+  --model_config_path checkpoints/trie_model/oasst1_timed_global_b16/config.json \
+  --model_checkpoint_path checkpoints/trie_model/oasst1_timed_global_b16/best.ckpt \
   --device cpu
 ```
 
@@ -220,8 +219,9 @@ uses `SequenceTrieDataTrace`.
 Example:
 
 ```bash
+# Create this config first if it does not exist locally.
 python -m model.trie_model \
-  --dataset cc_weka \
+  --dataset oasst1_timed_global_b16 \
   --device cpu \
   --data_root_dir data \
   --model_config_path checkpoints/trie_model/model_config.json
@@ -255,7 +255,6 @@ These commands passed in the current development environment:
 
 ```bash
 python tests/test_prefix_oracle.py
-python tests/test_cc_preprocess.py
 PYTHONPATH=. python tests/test_seq_cache.py
 PYTHONPATH=. python tests/test_evict.py
 PYTHONPATH=. python tests/test_training_cache.py
@@ -263,33 +262,14 @@ python -m py_compile \
   cache/trie/oracle.py \
   cache/trie/trie_algorithms.py \
   cache/trie/trie_cache.py \
-  scripts/data_process/preprocess_cc_traces.py \
+  scripts/data_process/preprocess_oasst1_timed.py \
   benchmark/trie_kv.py \
-  tests/test_prefix_oracle.py \
-  tests/test_cc_preprocess.py
-```
-
-An end-to-end local CC-like JSON smoke test also passed:
-
-```bash
-python scripts/data_process/preprocess_cc_traces.py \
-  --input_path /tmp/sample.json \
-  --output_dir /tmp/cc_weka \
-  --valid_fraction 0 \
-  --test_fraction 0.5
-
-python -m benchmark.trie_kv \
-  --data_root_dir /tmp \
-  --dataset cc_weka \
-  --split test \
-  --capacity 2 3 \
-  --policy lru rand oracle \
-  --reset_per_trace
+  tests/test_prefix_oracle.py
 ```
 
 ## Current Limitations
 
-- The real CC/Weka dataset has not been downloaded in this workspace yet.
+- OASST1 timed preprocessing depends on the local files under `data/traces`.
 - Torch is not installed in the current environment, so model/guard inference
   with a real model checkpoint was not executed locally.
 - `TrieModelPredictAlgorithm` still updates history with only the last block of
@@ -301,9 +281,11 @@ python -m benchmark.trie_kv \
 
 ## Suggested Next Steps
 
-1. Download/preprocess the real CC/Weka traces with `preprocess_cc_traces.py`.
-2. Run LRU/Random/Oracle capacity sweeps and save CSV results.
-3. Train `TrieParrotModel` on `data/cc_weka`.
+1. Use `docs/oasst1_timed_experiment_manifest.md` as the current experiment
+   handoff.
+2. Complete the missing OASST1 timed block-size/capacity sweeps and save CSV
+   results.
+3. Train `TrieParrotModel` on `data/oasst1_timed_global_b16`.
 4. Compare `model` and `guard` against LRU and Oracle.
 5. Add temporal features for model ranking: leaf depth, age, frequency,
    subtree size, last access, matched prefix length, and request length.

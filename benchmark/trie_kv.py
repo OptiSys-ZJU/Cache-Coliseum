@@ -217,9 +217,9 @@ def write_csv(path: str, rows: List[dict]):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark prefix-trie KV cache policies")
-    parser.add_argument("--dataset", type=str, default="cc_weka")
+    parser.add_argument("--dataset", type=str, default="oasst1_timed_global_b16")
     parser.add_argument("--data_root_dir", type=str, default="data")
-    parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--split", type=str, default="valid")
     parser.add_argument("--capacity", type=int, nargs="+", default=[512, 1024, 2048])
     parser.add_argument("--policy", nargs="+", default=["lru", "rand", "oracle"],
                         choices=["lru", "rand", "oracle", "model", "guard"])
