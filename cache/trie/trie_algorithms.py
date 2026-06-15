@@ -653,18 +653,21 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
             return None
         return list(self.history_hidden_states)
 
-    def _record_history_sequence(self, sequence: List[int]):
-        if self.model is None or len(sequence) == 0:
+    def _record_history_step(self, node_id: int):
+        if self.model is None:
             return
         if torch is None:
             raise ImportError("TrieModelPredictAlgorithm requires torch when model is set")
         with torch.no_grad():
-            for node_id in sequence:
-                self.history_state = self.model.encode_history_step(
-                    node_id, self.history_state
-                )
-                self.history_hidden_states.append(self.history_state[0])
-                self.history_token_window.append(node_id)
+            self.history_state = self.model.encode_history_step(
+                node_id, self.history_state
+            )
+        self.history_hidden_states.append(self.history_state[0])
+        self.history_token_window.append(node_id)
+
+    def _record_history_sequence(self, sequence: List[int]):
+        for node_id in sequence:
+            self._record_history_step(node_id)
     
     def _get_protected_leaves(self, current_path: List) -> set:
         """
@@ -833,24 +836,37 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
 
     def access(self, sequence: List[int]) -> Tuple:
         """
-        Process a sequence access.
-        
+        Process the cache-visible prefix of one sequence access.
+
         Args:
-            sequence: List of token IDs representing the access path
+            sequence: List of token IDs representing the access path.
             
         Returns:
-            Tuple of (total_nodes, hit_nodes, miss_nodes)
+            Tuple of (total_nodes, hit_nodes, miss_nodes) for the prefix that
+            can participate in the trie under the current capacity semantics.
         """
+        sequence = sequence[:self.max_node_num]
         self.counter += 1
-        this_node, insert_list = self.__match__(sequence)
-        self.__insert__(this_node, insert_list, current_path=sequence)
+        this_node = self.root_node
+        hit_nodes = 0
 
-        # PARROT-style history update: the current access becomes history only
-        # after the eviction decision for this access has already been made.
-        self._record_history_sequence(sequence)
-        
+        current_prefix = []
+        for node_id in sequence:
+            current_prefix.append(node_id)
+            if node_id in this_node.children:
+                this_node = this_node.children[node_id]
+                self.__visit_node__(this_node)
+                hit_nodes += 1
+            else:
+                self.__insert__(this_node, [node_id], current_path=current_prefix)
+                this_node = this_node.children[node_id]
+
+            # Step-wise PARROT semantics: step i becomes visible only after
+            # the eviction/insertion decision of step i has already finished.
+            self._record_history_step(node_id)
+
         self.timestamp += 1
-        return (len(sequence), len(sequence) - len(insert_list), len(insert_list))
+        return (len(sequence), hit_nodes, len(sequence) - hit_nodes)
 
 
 #############################################

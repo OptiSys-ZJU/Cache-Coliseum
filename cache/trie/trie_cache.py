@@ -221,47 +221,65 @@ class TrieTrainingCache:
         if self._future_oracle is not None:
             self._future_oracle.consume_current(cache_sequence, self._current_step)
 
-        # Match
-        this_node, insert_list = self.alg.__match__(cache_sequence)
-        hit = len(insert_list) == 0 and len(cache_sequence) == len(sequence)
-        
-        if hit:
-            self.hit_count += 1
-        self.total_count += 1
-        
-        # Check if eviction is needed
-        insert_len = len(insert_list)
+        hit_nodes = 0
         snapshot = None
-        
-        if insert_len > 0:
-            evict_num = self.alg.cur_node_num + insert_len - self.alg.max_node_num
-            if evict_num > 0:
-                snapshot = self._evict_and_collect(evict_num, this_node, cache_sequence)
-            
-            # Insert new nodes (same as TrieModelPredictAlgorithm.__insert__)
-            for key in insert_list:
+        this_node = self.alg.root_node
+
+        current_prefix = []
+        for step_index, node_id in enumerate(cache_sequence):
+            current_prefix.append(node_id)
+            if node_id in this_node.children:
+                this_node = this_node.children[node_id]
+                self.alg.__visit_node__(this_node)
+                hit_nodes += 1
+            else:
+                evict_num = self.alg.cur_node_num + 1 - self.alg.max_node_num
+                if evict_num > 0:
+                    step_snapshot = self._evict_and_collect(
+                        evict_num,
+                        this_node,
+                        current_prefix,
+                        step_index,
+                    )
+                    if step_snapshot is not None:
+                        if snapshot is None:
+                            snapshot = step_snapshot
+                        else:
+                            snapshot.eviction_steps.extend(step_snapshot.eviction_steps)
+
                 new_node = TrieNode()
-                new_node.key = key
-                new_node.node_id = key
-                new_node.parent = this_node  # Must set parent BEFORE __add_node__ (needs parent.hidden_state)
+                new_node.key = node_id
+                new_node.node_id = node_id
+                new_node.parent = this_node
                 self.alg.__add_node__(new_node)
                 self.alg.__mark_as_non_leaf__(this_node)
-                this_node.children[key] = new_node
+                this_node.children[node_id] = new_node
                 this_node = new_node
                 self.alg.cur_node_num += 1
-            self.alg.__mark_as_leaf__(this_node)
-        
-        # Keep history semantics aligned with inference: only the cache-visible
-        # prefix contributes when a request is longer than capacity.
-        if self.model is not None and len(sequence) > 0:
-            self.alg._record_history_sequence(cache_sequence)
-        
+                self.alg.__mark_as_leaf__(this_node)
+
+            self.alg._record_history_step(node_id)
+
+        hit = hit_nodes == len(sequence)
+        if hit and len(cache_sequence) == len(sequence):
+            self.hit_count += 1
+        self.total_count += 1
+
+        if snapshot is not None:
+            snapshot.sequence = tuple(cache_sequence)
+
         self.alg.timestamp += 1
         self._current_step += 1
         
         return snapshot, hit
-    
-    def _evict_and_collect(self, evict_num: int, this_node: TrieNode, current_path: List[int]) -> SimpleNamespace:
+
+    def _evict_and_collect(
+        self,
+        evict_num: int,
+        this_node: TrieNode,
+        current_path: List[int],
+        step_index: int,
+    ) -> SimpleNamespace:
         """
         Perform eviction with DAgger mixing and collect training snapshot.
         
@@ -304,6 +322,8 @@ class TrieTrainingCache:
             step_data.leaf_paths = [
                 TrieNode.get_node_id_path(c) for c in candidates
             ]
+            step_data.current_path = tuple(current_path)
+            step_data.step_index = step_index
             step_data.history_tokens = tuple(self.alg.history_token_window)
             step_data.oracle_target = oracle_idx
             step_data.num_candidates = len(candidates)

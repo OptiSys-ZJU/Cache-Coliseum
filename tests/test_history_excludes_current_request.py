@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify eviction-time history excludes the current request being processed."""
+"""Verify eviction-time history excludes the current micro-step being processed."""
 import os
 import sys
 
@@ -21,11 +21,12 @@ class RecordingModel(TrieParrotModel):
         history_memory,
         candidate_states=None,
         candidate_paths=None,
-        current_path=None,
         inference=True,
     ):
         if isinstance(history_memory, list):
             self.history_lengths.append(len(history_memory))
+        elif history_memory is None:
+            self.history_lengths.append(0)
         else:
             self.history_lengths.append(int(history_memory.shape[0]))
         num_candidates = len(candidate_states) if candidate_states is not None else len(candidate_paths)
@@ -45,7 +46,10 @@ def test_eviction_history_excludes_current_request():
 
     alg.access([5, 6])
     assert model.history_lengths, "eviction-time forward should be called"
-    assert model.history_lengths[-1] == 4, "current request should not be part of eviction-time history"
+    assert model.history_lengths == [4, 5], (
+        "step-wise eviction should expose prior history only: block 5 sees [1,2,3,4], "
+        "block 6 then sees [1,2,3,4,5]"
+    )
 
 
 if __name__ == "__main__":

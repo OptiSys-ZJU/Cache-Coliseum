@@ -55,8 +55,17 @@ assert_state_close(
     "training cache",
 )
 
-# Long requests should use the cache-visible prefix on the training path, which
-# mirrors the current inference-side truncation policy.
+# Long requests should use the cache-visible prefix on both inference and
+# training paths.
+small_alg = TrieModelPredictAlgorithm(max_node_num=2, model=model)
+small_alg.access(long_sequence)
+expected_small_alg_state = encode_sequence(model, long_sequence[:2])
+assert_state_close(
+    small_alg.history_state,
+    expected_small_alg_state,
+    "predict algorithm long request",
+)
+
 small_train_cache = TrieTrainingCache(max_node_num=2, model=model)
 small_train_cache.collect(long_sequence)
 expected_small_cache_state = encode_sequence(model, long_sequence[:2])
