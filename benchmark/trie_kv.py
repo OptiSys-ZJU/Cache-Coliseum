@@ -76,7 +76,43 @@ def split_by_trace(
     return chunks
 
 
-def load_model(config_path: str, checkpoint_path: str = None, device: str = "cpu"):
+def interleave_trace_chunks(
+    trace_chunks: Iterable[List[List[int]]],
+    seed: int = 0,
+):
+    traces = [list(chunk) for chunk in trace_chunks if chunk]
+    rng = random.Random(seed)
+    rng.shuffle(traces)
+
+    positions = [0] * len(traces)
+    active = list(range(len(traces)))
+    interleaved = []
+    cursor = 0
+
+    while active:
+        if cursor >= len(active):
+            cursor = 0
+
+        trace_idx = active[cursor]
+        interleaved.append(traces[trace_idx][positions[trace_idx]])
+        positions[trace_idx] += 1
+
+        if positions[trace_idx] >= len(traces[trace_idx]):
+            active.pop(cursor)
+        else:
+            cursor += 1
+
+    return interleaved
+
+
+def load_model(config_path: str, checkpoint_path: str, device: str = "cpu"):
+    if not os.path.exists(config_path):
+        raise ValueError(f"Model config not found: {config_path}")
+    if not checkpoint_path:
+        raise ValueError("--model_checkpoint_path is required for model/guard policies")
+    if not os.path.exists(checkpoint_path):
+        raise ValueError(f"Model checkpoint not found: {checkpoint_path}")
+
     try:
         import torch
     except ModuleNotFoundError as exc:
@@ -192,6 +228,8 @@ def print_rows(rows):
     header = [
         "policy",
         "capacity",
+        "block_token_size",
+        "capacity_tokens",
         "requests",
         "block_hit_rate",
         "request_full_hit_rate",
@@ -208,6 +246,9 @@ def print_rows(rows):
 def write_csv(path: str, rows: List[dict]):
     if not rows:
         return
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     fieldnames = list(rows[0].keys())
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -225,6 +266,7 @@ def main():
                         choices=["lru", "rand", "oracle", "model", "guard"])
     parser.add_argument("--block_size", type=int, default=None)
     parser.add_argument("--reset_per_trace", action="store_true")
+    parser.add_argument("--interleave_traces", action="store_true")
     parser.add_argument("--max_requests", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--model_config_path", type=str, default=None)
@@ -240,10 +282,22 @@ def main():
     sequences, metadata = load_data(data_dir, args.split, args.max_requests)
     block_size = args.block_size or metadata.get("block_size", 1)
 
-    if args.reset_per_trace:
+    if args.reset_per_trace and args.interleave_traces:
+        raise ValueError("--reset_per_trace and --interleave_traces are mutually exclusive")
+
+    if args.interleave_traces:
+        trace_chunks = split_by_trace(sequences, metadata, args.split, args.max_requests)
+        chunks = [interleave_trace_chunks(trace_chunks, seed=args.seed)]
+        trace_mode = "interleaved_shared"
+    elif args.reset_per_trace:
         chunks = split_by_trace(sequences, metadata, args.split, args.max_requests)
+        trace_mode = "reset_per_trace"
     else:
         chunks = [sequences]
+        if metadata.get("event_order") == "timestamp":
+            trace_mode = "timestamp_shared"
+        else:
+            trace_mode = "contiguous_shared"
 
     needs_model = any(policy in ("model", "guard") for policy in args.policy)
     model = None
@@ -270,8 +324,11 @@ def main():
             row = {
                 "dataset": args.dataset,
                 "split": args.split,
+                "trace_mode": trace_mode,
+                "block_token_size": block_size,
                 "policy": policy,
                 "capacity": capacity,
+                "capacity_tokens": capacity * block_size,
                 **stats,
             }
             rows.append(row)

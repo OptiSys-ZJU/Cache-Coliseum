@@ -32,13 +32,17 @@ cache = SequenceTrieCache(max_node_num=8, evict_type=TrieRandAlgorithm)
 for seq in sequences:
     cache.access(seq)
 cache.pretty_stat()
+t, h, m, rate = cache.stat()
+assert t == 24 and h + m == t
 
-# Test 3: Model-based (no model, random fallback)
+# Test 3: Model-based (no model fallback)
 print('\n=== ModelPredict (no model) ===')
 cache = SequenceTrieCache(max_node_num=8, evict_type=TrieModelPredictAlgorithm)
 for seq in sequences:
     cache.access(seq)
 cache.pretty_stat()
+t, h, m, rate = cache.stat()
+assert t == 24 and h + m == t
 
 # Test 4: ModelGuard (no model)
 print('\n=== ModelGuard (no model) ===')
@@ -46,5 +50,7 @@ cache = SequenceTrieCache(max_node_num=8, evict_type=TrieModelGuard, variance_th
 for seq in sequences:
     cache.access(seq)
 cache.pretty_stat()
+t, h, m, rate = cache.stat()
+assert t == 24 and h + m == t
 
-print('\nTask 5.1 (SequenceTrieCache) verification passed!')
+print('\nSequenceTrieCache verification passed!')

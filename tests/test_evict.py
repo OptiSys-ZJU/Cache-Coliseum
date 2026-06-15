@@ -2,7 +2,7 @@
 """Test path protection, model-based eviction, and guard fallback."""
 from cache.trie.trie_algorithms import TrieModelPredictAlgorithm, TrieModelGuard
 
-# ========== Test 1: TrieModelPredictAlgorithm (no model, random fallback) ==========
+# ========== Test 1: TrieModelPredictAlgorithm (no model fallback) ==========
 alg = TrieModelPredictAlgorithm(max_node_num=5, model=None)
 
 result = alg.access([1, 2, 3])
@@ -27,7 +27,7 @@ guard.access([1, 2, 4])
 guard.access([1, 2, 5])  # triggers eviction
 guard.access([1, 2, 6])  # triggers eviction
 
-# Without model, all evictions should be guarded (random fallback)
+# Without model, all evictions should be guarded (LRU fallback)
 assert guard.total_evictions >= 1, f'Expected >=1 evictions, got {guard.total_evictions}'
 assert guard.guarded_evictions == guard.total_evictions, \
     f'Without model, all evictions should be guarded: {guard.guarded_evictions}/{guard.total_evictions}'
@@ -44,4 +44,4 @@ guard2.access([10, 20, 30])   # evict 3, insert 3 (completely new branch)
 assert guard2.cur_node_num <= 4, f'Node count {guard2.cur_node_num} exceeds capacity'
 print(f'Test 3 (incremental candidates): PASSED, cur_node_num={guard2.cur_node_num}')
 
-print('\nAll Task 4.1-4.3 tests passed!')
+print('\nAll eviction/path-protection tests passed!')

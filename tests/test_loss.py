@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Test TrieParrotModel.loss() with gradient flow."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 import torch
 from types import SimpleNamespace
 from model.trie_model.model import TrieParrotModel
@@ -11,14 +16,14 @@ model.train()
 step1 = SimpleNamespace()
 step1.leaf_paths = [(1, 2, 3), (1, 2, 4), (1, 2, 5)]  # 3 candidates
 step1.oracle_target = 2  # evict leaf at index 2 (path 1→2→5)
-step1.history_state = model.initial_history_state()
 step1.num_candidates = 3
+step1.history_tokens = (9, 9, 9)
 
 step2 = SimpleNamespace()
 step2.leaf_paths = [(1, 2, 4), (1, 2, 5)]  # 2 candidates after step1
 step2.oracle_target = 1
-step2.history_state = model.initial_history_state()
 step2.num_candidates = 2
+step2.history_tokens = (8, 8)
 
 snapshot = SimpleNamespace()
 snapshot.eviction_steps = [step1, step2]

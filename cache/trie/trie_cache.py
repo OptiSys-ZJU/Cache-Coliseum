@@ -36,7 +36,7 @@ class TrieCache(BaseCache):
         self.trace_path = trace_path
         self._trace_path = trace_path
 
-        self.stat_info = [0, 0, 0] # hit, miss, count
+        self.stat_info = [0, 0, 0] # total, hit, miss
 
         num_cache_lines = cache_capacity // cache_line_size
         num_sets = num_cache_lines // associativity
@@ -167,6 +167,7 @@ class TrieTrainingCache:
             max_prefix_len=self.max_node_num,
         )
         self._current_step = 0
+        self.alg._reset_history()
     
     def _reuse_distance(self, path: tuple) -> float:
         """
@@ -250,14 +251,10 @@ class TrieTrainingCache:
                 self.alg.cur_node_num += 1
             self.alg.__mark_as_leaf__(this_node)
         
-        # Update history LSTM
+        # Keep history semantics aligned with inference: only the cache-visible
+        # prefix contributes when a request is longer than capacity.
         if self.model is not None and len(sequence) > 0:
-            if torch is None:
-                raise ImportError("TrieTrainingCache requires torch when model is set")
-            with torch.no_grad():
-                self.alg.history_state = self.model.encode_history_step(
-                    sequence[-1], self.alg.history_state
-                )
+            self.alg._record_history_sequence(cache_sequence)
         
         self.alg.timestamp += 1
         self._current_step += 1
@@ -276,15 +273,25 @@ class TrieTrainingCache:
         protected_leaves = self.alg._get_protected_leaves(current_path)
         candidates = [
             leaf for leaf in self.alg.__leaves__()
-            if leaf not in protected_leaves and leaf != self.alg.root_node
+            if leaf not in protected_leaves
+            and leaf != self.alg.root_node
+            and leaf != this_node
+            and self.alg.__is_live_leaf__(leaf)
         ]
         
         # Collect one snapshot per eviction batch (all evictions for this access)
         snapshot = SimpleNamespace()
-        snapshot.sequence = sequence = current_path
+        snapshot.sequence = tuple(current_path)  # metadata only
         snapshot.eviction_steps = []
         
         for _ in range(evict_num):
+            candidates = [
+                leaf for leaf in candidates
+                if leaf not in protected_leaves
+                and leaf != self.alg.root_node
+                and leaf != this_node
+                and self.alg.__is_live_leaf__(leaf)
+            ]
             if not candidates:
                 raise ValueError("No eviction candidates available")
             
@@ -297,13 +304,13 @@ class TrieTrainingCache:
             step_data.leaf_paths = [
                 TrieNode.get_node_id_path(c) for c in candidates
             ]
+            step_data.history_tokens = tuple(self.alg.history_token_window)
             step_data.oracle_target = oracle_idx
-            step_data.history_state = self.alg.history_state  # (h,c) or None
             step_data.num_candidates = len(candidates)
             snapshot.eviction_steps.append(step_data)
             
             # DAgger: choose actual eviction target
-            if random.random() < self.model_prob and self.model is not None and self.alg.history_state is not None:
+            if random.random() < self.model_prob and self.model is not None and self.alg.history_hidden_states:
                 if torch is None:
                     raise ImportError("TrieTrainingCache requires torch when model is set")
                 # Model policy
@@ -315,7 +322,10 @@ class TrieTrainingCache:
                         leaf_states.append(torch.zeros(1, self.model.hidden_size))
                 
                 with torch.no_grad():
-                    scores, _ = self.model.forward(self.alg.history_state[0], leaf_states)
+                    scores, _ = self.model.forward(
+                        self.alg._history_memory(),
+                        candidate_states=leaf_states,
+                    )
                 target_idx = scores.squeeze(0).argmax().item()
             else:
                 # Oracle policy
@@ -346,10 +356,6 @@ class TrieTrainingCache:
             return 0.0
         return self.hit_count / self.total_count
 
-
-#############################################
-# Task 5.1: SequenceTrieCache for sequence-based access
-#############################################
 
 class SequenceTrieCache:
     """
@@ -479,78 +485,3 @@ class SequenceTrieCache:
         }
 
 
-if __name__ == "__main__":
-    # file_path = 'traces/oass1_val.csv'
-    # # size = 3226
-    # size = 4096
-
-    file_path = 'traces/oass1_train.csv'
-    # size = 12129
-    size = 16384
-
-    reuse_dis_noise_sigma = 10
-
-    relax_times = 0
-
-
-
-    print('--------------')
-    print('LRU')
-    alg = TrieLRUAlgorithm
-    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
-    with TrieDataTrace(file_path) as trace:
-        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
-            while not trace.done():
-                pc, address = trace.next()
-                cache.access(pc, address)
-                pbar.update(1)
-    cache.pretty_stat()
-
-    print('--------------')
-    print('RAND')
-    alg = TrieRandAlgorithm
-    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
-    with TrieDataTrace(file_path) as trace:
-        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
-            while not trace.done():
-                pc, address = trace.next()
-                cache.access(pc, address)
-                pbar.update(1)
-    cache.pretty_stat()
-
-    print('--------------')
-    print('OPT')
-    alg = partial(TriePredictAlgorithm, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=0, lognormal=True))
-    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
-    with TrieDataTrace(file_path) as trace:
-        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
-            while not trace.done():
-                pc, address = trace.next()
-                cache.access(pc, address)
-                pbar.update(1)
-    cache.pretty_stat()
-
-    print('--------------')
-    print('Belady')
-    alg = partial(TriePredictAlgorithm, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=reuse_dis_noise_sigma, lognormal=True))
-    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
-    with TrieDataTrace(file_path) as trace:
-        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
-            while not trace.done():
-                pc, address = trace.next()
-                cache.access(pc, address)
-                pbar.update(1)
-    cache.pretty_stat()
-
-    print('--------------')
-    print('Guard')
-    alg = partial(TrieGuard, evictor_type=ReuseDistanceEvictor, predictor_type=partial(OracleReuseDistancePredictor, reuse_dis_noise_sigma=reuse_dis_noise_sigma, lognormal=True), follow_if_guarded=False, relax_times=relax_times, relax_prob=0)
-    cache = TrieCache(file_path, ListAligner, OneHashFunction, alg, 1, size, size)
-    with TrieDataTrace(file_path) as trace:
-        with tqdm.tqdm(desc="Producing cache on MemoryTrace") as pbar:
-            while not trace.done():
-                pc, address = trace.next()
-                cache.access(pc, address)
-                # cache.pretty_print()
-                pbar.update(1)
-    cache.pretty_stat()

@@ -1,4 +1,4 @@
-"""Audit fix verification test."""
+"""Regression checks for recent trie-model fixes."""
 import torch
 from types import SimpleNamespace
 from model.trie_model.model import TrieParrotModel
@@ -25,7 +25,7 @@ snap = SimpleNamespace()
 snap.eviction_steps = [SimpleNamespace(
     leaf_paths=[(1, 2), (3, 4), (5, 6)],
     oracle_target=1,
-    history_state=(torch.randn(1, 32), torch.randn(1, 32)),
+    history_tokens=(10, 11, 12),
     num_candidates=3,
 )]
 losses = model.loss([snap])
@@ -33,7 +33,7 @@ assert losses['eviction'].requires_grad, "Loss should require grad"
 losses['eviction'].backward()
 print(f"Test 2 PASSED: loss={losses['eviction'].item():.4f}, backward OK")
 
-# Test 3: TrieModelPredictAlgorithm.__evict__ random fallback
+# Test 3: TrieModelPredictAlgorithm.__evict__ fallback path
 from cache.trie.trie_algorithms import TrieModelPredictAlgorithm, TrieNode
 alg = TrieModelPredictAlgorithm(max_node_num=10, model=None)
 # Add some nodes
@@ -46,7 +46,7 @@ before = alg.cur_node_num
 alg.__evict__(1, alg.root_node)
 after = alg.cur_node_num
 assert after == before - 1, f"Expected {before-1} nodes, got {after}"
-print(f"Test 3 PASSED: __evict__ random fallback works ({before} -> {after} nodes)")
+print(f"Test 3 PASSED: __evict__ fallback works ({before} -> {after} nodes)")
 
 # Test 4: SequenceTrieCache uses isinstance dispatch
 from cache.trie.trie_cache import SequenceTrieCache
@@ -65,4 +65,4 @@ assert stat[1] == hit, f"stat()[1] should be hit={hit}, got {stat[1]}"
 assert stat[2] == miss, f"stat()[2] should be miss={miss}, got {stat[2]}"
 print(f"Test 5 PASSED: stat() returns consistent (total, hit, miss, rate) = {stat}")
 
-print("\n=== ALL AUDIT FIX TESTS PASSED ===")
+print("\n=== ALL REGRESSION TESTS PASSED ===")
