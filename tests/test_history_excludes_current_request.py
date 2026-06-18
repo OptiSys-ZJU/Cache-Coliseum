@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify eviction-time history excludes the current micro-step being processed."""
+"""Verify eviction-time history excludes the current request being processed."""
 import os
 import sys
 
@@ -42,14 +42,16 @@ def test_eviction_history_excludes_current_request():
 
     alg.access([1, 2])
     alg.access([3, 4])
-    assert len(alg.history_hidden_states) == 4, "first two requests should populate history"
+    assert list(alg.history_path_window) == [(1, 2), (3, 4)]
+    assert len(alg.history_hidden_states) == 2, "first two requests should populate history"
 
     alg.access([5, 6])
     assert model.history_lengths, "eviction-time forward should be called"
-    assert model.history_lengths == [4, 5], (
-        "step-wise eviction should expose prior history only: block 5 sees [1,2,3,4], "
-        "block 6 then sees [1,2,3,4,5]"
+    assert model.history_lengths == [2, 2], (
+        "both evictions for request [5,6] should see only the history that "
+        "existed before the request"
     )
+    assert list(alg.history_path_window) == [(1, 2), (3, 4), (5, 6)]
 
 
 if __name__ == "__main__":

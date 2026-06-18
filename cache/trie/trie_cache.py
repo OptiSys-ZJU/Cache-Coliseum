@@ -195,17 +195,21 @@ class TrieTrainingCache:
         Belady's optimal: return index of candidate with max reuse distance 
         (the one that won't be needed for the longest time).
         """
-        best_idx = 0
-        best_distance = -1
-        
-        for idx, leaf in enumerate(candidates):
-            path = TrieNode.get_path_tuple_from_node(leaf)
-            distance = self._reuse_distance(path)
-            if distance > best_distance:
-                best_distance = distance
-                best_idx = idx
-        
-        return best_idx
+        distances = self._oracle_distances(candidates)
+        return max(range(len(distances)), key=lambda idx: distances[idx])
+
+    def _oracle_distances(self, candidates: List[TrieNode]) -> List[float]:
+        """Return request-clock future reuse distance for each candidate path."""
+        return [
+            self._reuse_distance(TrieNode.get_path_tuple_from_node(leaf))
+            for leaf in candidates
+        ]
+
+    def _oracle_target_from_distances(self, distances: List[float]) -> int:
+        """Belady target index from a precomputed distance vector."""
+        if not distances:
+            raise ValueError("Cannot choose oracle target from an empty candidate list")
+        return max(range(len(distances)), key=lambda idx: distances[idx])
     
     def collect(self, sequence: List[int]):
         """
@@ -258,8 +262,7 @@ class TrieTrainingCache:
                 self.alg.cur_node_num += 1
                 self.alg.__mark_as_leaf__(this_node)
 
-            self.alg._record_history_step(node_id)
-
+        self.alg._record_history_leaf(this_node)
         hit = hit_nodes == len(sequence)
         if hit and len(cache_sequence) == len(sequence):
             self.hit_count += 1
@@ -267,6 +270,7 @@ class TrieTrainingCache:
 
         if snapshot is not None:
             snapshot.sequence = tuple(cache_sequence)
+            self.snapshots.append(snapshot)
 
         self.alg.timestamp += 1
         self._current_step += 1
@@ -313,8 +317,9 @@ class TrieTrainingCache:
             if not candidates:
                 raise ValueError("No eviction candidates available")
             
-            # Oracle target
-            oracle_idx = self._oracle_target(candidates)
+            # Oracle target, aligned to this micro-step's live candidate set.
+            oracle_distances = self._oracle_distances(candidates)
+            oracle_idx = self._oracle_target_from_distances(oracle_distances)
             
             # Record per-eviction step data
             step_data = SimpleNamespace()
@@ -324,7 +329,8 @@ class TrieTrainingCache:
             ]
             step_data.current_path = tuple(current_path)
             step_data.step_index = step_index
-            step_data.history_tokens = tuple(self.alg.history_token_window)
+            step_data.history_paths = tuple(self.alg.history_path_window)
+            step_data.oracle_distances = oracle_distances
             step_data.oracle_target = oracle_idx
             step_data.num_candidates = len(candidates)
             snapshot.eviction_steps.append(step_data)
@@ -361,7 +367,6 @@ class TrieTrainingCache:
                 if parent not in protected_leaves:
                     candidates.append(parent)
         
-        self.snapshots.append(snapshot)
         return snapshot
     
     def get_snapshots(self) -> List[SimpleNamespace]:

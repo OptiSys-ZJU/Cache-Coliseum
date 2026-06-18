@@ -1,81 +1,77 @@
 #!/usr/bin/env python3
-"""Verify history LSTM updates use the cache-visible request sequence."""
+"""Verify completed live leaf paths become path-level history slots."""
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-import torch
 
 from cache.trie.trie_algorithms import TrieModelPredictAlgorithm
 from cache.trie.trie_cache import TrieTrainingCache
 from model.trie_model.model import TrieParrotModel
 
 
-def assert_state_close(actual, expected, label):
-    assert actual is not None, f"{label}: actual state should not be None"
-    assert expected is not None, f"{label}: expected state should not be None"
-    actual_h, actual_c = actual
-    expected_h, expected_c = expected
-    assert torch.allclose(actual_h, expected_h, atol=1e-6), (
-        f"{label}: hidden state mismatch"
-    )
-    assert torch.allclose(actual_c, expected_c, atol=1e-6), (
-        f"{label}: cell state mismatch"
-    )
-
-
-def encode_sequence(model, sequence, prev_state=None):
-    state = prev_state
-    with torch.no_grad():
-        for node_id in sequence:
-            state = model.encode_history_step(node_id, state)
-    return state
+def assert_history_paths(actual, expected, label):
+    assert list(actual) == expected, f"{label}: expected {expected}, got {list(actual)}"
 
 
 model = TrieParrotModel(vocab_size=100, node_embed_dim=16, hidden_size=32)
 model.eval()
 
-sequence = [11, 22, 33]
+first_sequence = [1, 2]
+second_sequence = [3, 4]
 long_sequence = [7, 8, 9]
 
 # Inference path: TrieModelPredictAlgorithm.access()
 alg = TrieModelPredictAlgorithm(max_node_num=20, model=model)
-alg.access(sequence)
-expected_alg_state = encode_sequence(model, sequence)
-assert_state_close(alg.history_state, expected_alg_state, "predict algorithm")
+alg.access(first_sequence)
+assert_history_paths(
+    alg.history_path_window,
+    [(1, 2)],
+    "predict algorithm",
+)
+alg.access(second_sequence)
+assert_history_paths(
+    alg.history_path_window,
+    [(1, 2), (3, 4)],
+    "predict algorithm second request",
+)
+assert alg.history_state is None, "Trie-PARROT v1 should not update legacy token history state"
 
 # Training path: TrieTrainingCache.collect()
 train_cache = TrieTrainingCache(max_node_num=20, model=model)
-train_cache.collect(sequence)
-expected_cache_state = encode_sequence(model, sequence)
-assert_state_close(
-    train_cache.alg.history_state,
-    expected_cache_state,
+train_cache.collect(first_sequence)
+assert_history_paths(
+    train_cache.alg.history_path_window,
+    [(1, 2)],
     "training cache",
 )
+train_cache.collect(second_sequence)
+assert_history_paths(
+    train_cache.alg.history_path_window,
+    [(1, 2), (3, 4)],
+    "training cache second request",
+)
+assert train_cache.alg.history_state is None
 
-# Long requests should use the cache-visible prefix on both inference and
-# training paths.
+# Long requests should record only the terminal cache-visible leaf on both
+# inference and training paths.
 small_alg = TrieModelPredictAlgorithm(max_node_num=2, model=model)
 small_alg.access(long_sequence)
-expected_small_alg_state = encode_sequence(model, long_sequence[:2])
-assert_state_close(
-    small_alg.history_state,
-    expected_small_alg_state,
+assert_history_paths(
+    small_alg.history_path_window,
+    [(7, 8)],
     "predict algorithm long request",
 )
 
 small_train_cache = TrieTrainingCache(max_node_num=2, model=model)
 small_train_cache.collect(long_sequence)
-expected_small_cache_state = encode_sequence(model, long_sequence[:2])
-assert_state_close(
-    small_train_cache.alg.history_state,
-    expected_small_cache_state,
+assert_history_paths(
+    small_train_cache.alg.history_path_window,
+    [(7, 8)],
     "training cache long request",
 )
 
 print(
-    "HISTORY SEQUENCE UPDATE TEST PASSED: cache-visible request prefixes are "
-    "encoded into history state"
+    "HISTORY SEQUENCE UPDATE TEST PASSED: completed live leaves are encoded "
+    "as path-level history slots"
 )

@@ -627,9 +627,9 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
         """
         super().__init__(max_node_num)
         self.model = model
-        self.history_state = None  # rolling (h, c) state for sequential history encoding
+        self.history_state = None  # legacy token-history state; unused by Trie-PARROT v1
         self.history_hidden_states = deque([], maxlen=self._history_maxlen())
-        self.history_token_window = deque([], maxlen=self._history_maxlen())
+        self.history_path_window = deque([], maxlen=self._history_maxlen())
         self.timestamp = 0
         self.counter = 0
     
@@ -641,7 +641,7 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
     def _reset_history(self):
         self.history_state = None
         self.history_hidden_states = deque([], maxlen=self._history_maxlen())
-        self.history_token_window = deque([], maxlen=self._history_maxlen())
+        self.history_path_window = deque([], maxlen=self._history_maxlen())
 
     def set_model(self, model):
         """Set or replace the prediction model."""
@@ -653,21 +653,42 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
             return None
         return list(self.history_hidden_states)
 
-    def _record_history_step(self, node_id: int):
+    def _record_history_path(
+        self,
+        path: List[int],
+        path_state: Tuple[Any, Any] = None,
+    ):
         if self.model is None:
             return
         if torch is None:
             raise ImportError("TrieModelPredictAlgorithm requires torch when model is set")
+
+        path_tuple = tuple(path)
+        if len(path_tuple) == 0:
+            return
+
         with torch.no_grad():
-            self.history_state = self.model.encode_history_step(
-                node_id, self.history_state
-            )
-        self.history_hidden_states.append(self.history_state[0])
-        self.history_token_window.append(node_id)
+            if path_state is not None:
+                hidden = path_state[0]
+            else:
+                hidden = self.model._encode_path(path_tuple, next(self.model.parameters()).device)
+        self.history_hidden_states.append(hidden.detach())
+        self.history_path_window.append(path_tuple)
+
+    def _record_history_leaf(self, node: TrieNode):
+        """Append one completed request leaf to the bounded history window."""
+        if node is None or node == self.root_node:
+            return
+        if not self.__is_live_leaf__(node):
+            return
+        self._record_history_path(TrieNode.get_node_id_path(node), node.hidden_state)
+
+    def _record_history_step(self, node_id: int):
+        """Compatibility wrapper: a single token is a singleton path slot."""
+        self._record_history_path([node_id])
 
     def _record_history_sequence(self, sequence: List[int]):
-        for node_id in sequence:
-            self._record_history_step(node_id)
+        self._record_history_path(sequence)
     
     def _get_protected_leaves(self, current_path: List) -> set:
         """
@@ -861,10 +882,7 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
                 self.__insert__(this_node, [node_id], current_path=current_prefix)
                 this_node = this_node.children[node_id]
 
-            # Step-wise PARROT semantics: step i becomes visible only after
-            # the eviction/insertion decision of step i has already finished.
-            self._record_history_step(node_id)
-
+        self._record_history_leaf(this_node)
         self.timestamp += 1
         return (len(sequence), hit_nodes, len(sequence) - hit_nodes)
 

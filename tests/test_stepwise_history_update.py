@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify PARROT-like step-wise history timing for trie runtime and training."""
+"""Verify PARROT-like request-level leaf-history timing for runtime and training."""
 import os
 import sys
 
@@ -52,7 +52,7 @@ class SnapshotRecordingModel(TrieParrotModel):
             hidden_size=32,
             max_attention_history=16,
         )
-        self.snapshot_history_tokens = []
+        self.snapshot_history_paths = []
 
     def loss(
         self,
@@ -60,8 +60,8 @@ class SnapshotRecordingModel(TrieParrotModel):
         max_candidates=None,
         max_steps_per_snapshot=None,
     ):
-        self.snapshot_history_tokens = [
-            tuple(step.history_tokens)
+        self.snapshot_history_paths = [
+            tuple(step.history_paths)
             for snapshot in snapshots
             for step in snapshot.eviction_steps
         ]
@@ -72,23 +72,23 @@ class SnapshotRecordingModel(TrieParrotModel):
         )
 
 
-def test_step_i_sees_only_prior_prefix_and_step_i_plus_1_sees_h_i():
+def test_evictions_during_request_see_only_prior_leaf_history():
     model = RecordingModel()
     model.eval()
     alg = TrieModelPredictAlgorithm(max_node_num=3, model=model)
 
     alg.access([1, 2])
-    assert list(alg.history_token_window) == [1, 2]
+    assert list(alg.history_path_window) == [(1, 2)]
 
     alg.access([3, 4, 5])
-    assert model.runtime_history_lengths == [3, 4], (
-        "with capacity 3, eviction before block 4 should already see block 3, "
-        "and eviction before block 5 should then see block 4 as well"
+    assert model.runtime_history_lengths == [1, 1], (
+        "both evictions during request [3,4,5] should see only the leaf "
+        "history that existed before the request"
     )
-    assert list(alg.history_token_window) == [1, 2, 3, 4, 5][-model.max_attention_history :]
+    assert list(alg.history_path_window) == [(1, 2), (3, 4, 5)]
 
 
-def test_collect_snapshot_history_tokens_match_micro_step_prefixes():
+def test_collect_snapshot_history_paths_exclude_current_request_prefixes():
     model = TrieParrotModel(
         vocab_size=256,
         node_embed_dim=16,
@@ -114,15 +114,21 @@ def test_collect_snapshot_history_tokens_match_micro_step_prefixes():
 
     assert snapshot is not None, "expected an eviction snapshot"
     step_prefixes = [tuple(step.current_path) for step in snapshot.eviction_steps]
-    step_histories = [tuple(step.history_tokens) for step in snapshot.eviction_steps]
+    step_histories = [tuple(step.history_paths) for step in snapshot.eviction_steps]
 
     assert step_prefixes == [(5,), (5, 6)]
-    assert step_histories == [(1, 2, 3, 4), (1, 2, 3, 4, 5)], (
-        "step i history should stop before its own token, while step i+1 can see step i"
-    )
+    assert step_histories == [
+        ((1, 2), (3, 4)),
+        ((1, 2), (3, 4)),
+    ], "all evictions in one request should see the same pre-request leaf history"
+    assert (5,) not in step_histories[0]
+    assert (5,) not in step_histories[1]
+    assert (5, 6) not in step_histories[0]
+    assert (5, 6) not in step_histories[1]
+    assert list(cache.alg.history_path_window) == [(1, 2), (3, 4), (5, 6)]
 
 
-def test_collect_to_loss_replays_same_micro_step_history_prefixes():
+def test_collect_to_loss_replays_same_leaf_history_snapshots():
     model = SnapshotRecordingModel()
     model.train()
     cache = TrieTrainingCache(max_node_num=4, model=model)
@@ -142,24 +148,30 @@ def test_collect_to_loss_replays_same_micro_step_history_prefixes():
     assert snapshots, "expected at least one snapshot"
 
     expected_histories = [
-        tuple(step.history_tokens)
+        tuple(step.history_paths)
         for snapshot in snapshots
         for step in snapshot.eviction_steps
     ]
 
     losses = model.loss(snapshots)
-    losses["eviction"].backward()
+    sum(losses.values()).backward()
 
-    assert model.snapshot_history_tokens == expected_histories, (
-        "loss replay should consume the same micro-step history prefixes captured at collect() time"
+    assert model.snapshot_history_paths == expected_histories, (
+        "loss replay should consume the same leaf-history snapshots captured at collect() time"
     )
 
+    path_grad = 0.0
     history_grad = 0.0
     for name, param in model.named_parameters():
-        if "history_lstm" in name and param.grad is not None:
+        if param.grad is None:
+            continue
+        if "path_lstm" in name:
+            path_grad += float(param.grad.abs().sum().item())
+        if "history_lstm" in name:
             history_grad += float(param.grad.abs().sum().item())
 
-    assert history_grad > 0.0, "history_lstm should receive gradients through collect()->loss() replay"
+    assert path_grad > 0.0, "path_lstm should receive gradients through collect()->loss() replay"
+    assert history_grad == 0.0, "history_lstm should not be used in Trie-PARROT v1"
 
 
 def test_protection_uses_current_prefix_not_future_suffix():
@@ -213,10 +225,10 @@ def test_train_infer_history_lengths_align_for_same_sequence():
     alg.access(target)
 
     runtime_lengths = list(runtime_model.runtime_history_lengths)
-    snapshot_lengths = [len(step.history_tokens) for step in snapshot.eviction_steps]
+    snapshot_lengths = [len(step.history_paths) for step in snapshot.eviction_steps]
 
-    assert runtime_lengths == snapshot_lengths == [4, 5], (
-        "inference-time history visibility and training snapshot prefixes should align step by step"
+    assert runtime_lengths == snapshot_lengths == [2, 2], (
+        "inference-time history visibility and training snapshot paths should align step by step"
     )
 
 
@@ -241,18 +253,18 @@ def test_history_window_bounding_matches_runtime_and_replay():
     assert snapshots, "expected snapshots after overflowing bounded history"
 
     losses = model.loss(snapshots)
-    losses["eviction"].backward()
+    sum(losses.values()).backward()
 
-    for history_tokens in model.snapshot_history_tokens:
-        assert len(history_tokens) <= model.max_attention_history, (
-            "replayed history prefixes should respect the same bounded window as runtime memory"
+    for history_paths in model.snapshot_history_paths:
+        assert len(history_paths) <= model.max_attention_history, (
+            "replayed history paths should respect the same bounded window as runtime memory"
         )
 
 
 if __name__ == "__main__":
-    test_step_i_sees_only_prior_prefix_and_step_i_plus_1_sees_h_i()
-    test_collect_snapshot_history_tokens_match_micro_step_prefixes()
-    test_collect_to_loss_replays_same_micro_step_history_prefixes()
+    test_evictions_during_request_see_only_prior_leaf_history()
+    test_collect_snapshot_history_paths_exclude_current_request_prefixes()
+    test_collect_to_loss_replays_same_leaf_history_snapshots()
     test_protection_uses_current_prefix_not_future_suffix()
     test_train_infer_history_lengths_align_for_same_sequence()
     test_history_window_bounding_matches_runtime_and_replay()
