@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Verify incremental Tree-LSTM state uses parent hidden_state correctly."""
+import os
+import sys
+
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 from model.trie_model.model import TrieParrotModel
 from cache.trie.trie_algorithms import TrieModelPredictAlgorithm
 

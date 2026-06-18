@@ -1,6 +1,6 @@
 # OASST1 Timed KV Cache Experiment Manifest
 
-Last synced: 2026-06-13
+Last synced: 2026-06-17
 
 This document is the handoff point for the current `trie-cache` experiment line.
 It records what the generated files mean, which assumptions are currently in
@@ -44,7 +44,7 @@ git branch --show-current
 Known local code changes from this experiment line:
 
 - `.gitignore`
-  - includes the local Python virtual environment `lkcp/`
+  - historical local Python virtual environment `lkcp/` remains ignored
 - `benchmark/trie_kv.py`
   - improved CSV output directory handling
   - supports timestamp-shared labeling from dataset metadata
@@ -59,25 +59,65 @@ There are also untracked report files under `reports/` and an untracked
 
 ## Python Environment
 
-Use the existing virtual environment:
+Use the CUDA-enabled conda environment for this experiment line:
 
 ```powershell
-.\lkcp\Scripts\python.exe
+$env:TRIE_PYTHON="$env:USERPROFILE\miniconda3\envs\tencentworkpy38\python.exe"
+& $env:TRIE_PYTHON -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
 ```
 
-Packages installed during this line include at least:
+Expected local result:
 
-- `datasets`
-- `numpy`
-- `tqdm`
-- `matplotlib`
+```text
+2.4.1+cu124 True 12.4
+```
 
-Before training, confirm whether `torch` is installed and whether CPU or CUDA is
-available:
+This environment has GPU-enabled PyTorch and should be used for:
+
+- trie model training
+- checkpoint evaluation
+- rank/top1/top-set diagnostics
+- any script that imports `torch` for model execution
+
+The older local virtual environment `.\lkcp\Scripts\python.exe` is CPU-only in
+this workspace. Do not use it for training or model diagnostics.
+
+Non-model preprocessing and baseline-only LRU/RAND/Oracle simulation can run in
+either environment, but use `TRIE_PYTHON` by default to keep experiments
+consistent.
+
+Before long training, also confirm the GPU:
 
 ```powershell
-.\lkcp\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+nvidia-smi
 ```
+
+## Remote A100 Training Environment
+
+For full OASST1 Trie-PARROT training, use the remote A100 environment instead
+of the local GTX 1660 Ti when available:
+
+```sshconfig
+Host 422-a100
+  HostName instance-p6fmf5lf.yc.smartml.cn
+  Port 11000
+  User sunray
+  IdentityFile C:\Users\35707\.ssh\id_ed25519
+```
+
+Operational notes:
+
+- Do not write the private key passphrase into project files, shell scripts, or
+  command lines. Unlock the key via `ssh-add` or an interactive SSH client.
+- A100 GPU 1 may have some memory occupied, but if utilization is 0 it is still
+  suitable for training with the remaining memory and full compute.
+- Create a remote Python/conda environment with GPU-enabled PyTorch if one is
+  not already present.
+- Run full DAgger training and long model diagnostics on this host by default;
+  keep local runs for smoke tests, code checks, and short diagnostics.
+- Save remote commands, effective configs, checkpoint directories, run ids, and
+  result summaries back into this repository so future agents can resume without
+  re-discovering the environment.
 
 ## Data Sources
 
@@ -130,7 +170,7 @@ Expected files in each generated dataset:
 Recreate a validation-only dataset:
 
 ```powershell
-.\lkcp\Scripts\python.exe scripts\data_process\preprocess_oasst1_timed.py `
+& $env:TRIE_PYTHON scripts\data_process\preprocess_oasst1_timed.py `
   --output_dir data\oasst1_timed_global_b16 `
   --source_splits validation `
   --block_token_size 16 `
@@ -142,7 +182,7 @@ For training, generate both train and validation splits for the chosen block
 size:
 
 ```powershell
-.\lkcp\Scripts\python.exe scripts\data_process\preprocess_oasst1_timed.py `
+& $env:TRIE_PYTHON scripts\data_process\preprocess_oasst1_timed.py `
   --output_dir data\oasst1_timed_global_b16 `
   --source_splits train validation `
   --block_token_size 16 `
@@ -185,7 +225,7 @@ oracle_saved_blocks_vs_lru = lru_recompute_blocks - oracle_recompute_blocks
 Run LRU/RAND/oracle for one preprocessed dataset:
 
 ```powershell
-.\lkcp\Scripts\python.exe -m benchmark.trie_kv `
+& $env:TRIE_PYTHON -m benchmark.trie_kv `
   --dataset oasst1_timed_global_b16 `
   --split valid `
   --capacity 256 512 1024 2048 4096 `
@@ -267,7 +307,7 @@ Trie model training entry point:
 
 ```powershell
 # Create or choose this config before starting training if it does not exist.
-.\lkcp\Scripts\python.exe -m model.trie_model `
+& $env:TRIE_PYTHON -m model.trie_model `
   --dataset oasst1_timed_global_b16 `
   --data_root_dir data `
   --device cpu `
@@ -313,7 +353,7 @@ After a checkpoint exists, compare `model` and `guard` against LRU/oracle under
 the same condition:
 
 ```powershell
-.\lkcp\Scripts\python.exe -m benchmark.trie_kv `
+& $env:TRIE_PYTHON -m benchmark.trie_kv `
   --dataset oasst1_timed_global_b16 `
   --split valid `
   --capacity 256 `
@@ -355,7 +395,7 @@ gap_recovery = (model_hit_rate - lru_hit_rate) / (oracle_hit_rate - lru_hit_rate
 
 1. Fill missing settings and regenerate/merge the summary CSV.
 2. Add or use a deterministic experiment runner so interrupted sweeps can resume.
-3. Confirm PyTorch availability.
+3. Confirm PyTorch CUDA availability in `tencentworkpy38`.
 4. Generate train+valid preprocessed data for the selected block size.
 5. Start checkpointed training.
 6. Evaluate `model` and `guard` at high-gap token budgets, especially:

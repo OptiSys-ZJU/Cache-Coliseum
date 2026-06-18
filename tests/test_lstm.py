@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Test Tree-LSTM module."""
+import os
+import sys
+
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 from model.trie_model.tree_lstm import PathLSTMCell, PathEncoder
 
 print('Testing PathLSTMCell...')

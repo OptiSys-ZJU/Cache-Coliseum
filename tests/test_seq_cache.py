@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Test SequenceTrieCache with different eviction algorithms."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 from cache.trie.trie_cache import SequenceTrieCache
 from cache.trie.trie_algorithms import (
     TrieLRUAlgorithm, TrieRandAlgorithm, 

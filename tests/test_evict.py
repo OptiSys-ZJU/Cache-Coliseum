@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Test path protection, model-based eviction, and guard fallback."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 from cache.trie.trie_algorithms import TrieModelPredictAlgorithm, TrieModelGuard
 
 # ========== Test 1: TrieModelPredictAlgorithm (no model fallback) ==========

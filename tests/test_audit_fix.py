@@ -1,6 +1,12 @@
 """Regression checks for recent trie-model fixes."""
+import os
+import sys
+
 import torch
 from types import SimpleNamespace
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 from model.trie_model.model import TrieParrotModel
 
 # Test 1: forward() returns raw eviction logits (not softmax'd)
@@ -25,13 +31,19 @@ snap = SimpleNamespace()
 snap.eviction_steps = [SimpleNamespace(
     leaf_paths=[(1, 2), (3, 4), (5, 6)],
     oracle_target=1,
-    history_tokens=(10, 11, 12),
+    history_paths=((10,), (10, 11), (10, 11, 12)),
+    oracle_distances=[1.0, float("inf"), 2.0],
     num_candidates=3,
 )]
 losses = model.loss([snap])
-assert losses['eviction'].requires_grad, "Loss should require grad"
-losses['eviction'].backward()
-print(f"Test 2 PASSED: loss={losses['eviction'].item():.4f}, backward OK")
+assert losses['ranking'].requires_grad, "Ranking loss should require grad"
+assert torch.isfinite(losses['ranking']), "Ranking loss should be finite"
+assert torch.isfinite(losses['reuse']), "Reuse loss should be finite"
+sum(losses.values()).backward()
+print(
+    f"Test 2 PASSED: ranking={losses['ranking'].item():.4f}, "
+    f"reuse={losses['reuse'].item():.4f}, backward OK"
+)
 
 # Test 3: TrieModelPredictAlgorithm.__evict__ fallback path
 from cache.trie.trie_algorithms import TrieModelPredictAlgorithm, TrieNode

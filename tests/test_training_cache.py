@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """Test TrieTrainingCache: DAgger collection + Belady oracle."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
 from cache.trie.trie_cache import TrieTrainingCache
 
 # Simulate a sequence of accesses

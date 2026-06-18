@@ -12,6 +12,39 @@ You can easily download all trace files, boost traces pickle and GBM Model Check
 
 We use an environment based on Python 3.10.16 with Anaconda3 (Anaconda3-2021.05-Linux-x86_64.sh), we strongly recommend using Anaconda for Python package management and virtual environment.
 
+For the active `trie-cache` / OASST1 model-training line on this Windows workspace,
+use the CUDA-enabled conda environment instead of the local `lkcp` virtualenv:
+
+```powershell
+$env:TRIE_PYTHON="$env:USERPROFILE\miniconda3\envs\tencentworkpy38\python.exe"
+& $env:TRIE_PYTHON -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+```
+
+Expected local torch stack:
+
+```text
+torch 2.4.1+cu124
+CUDA available: True
+GPU: NVIDIA GeForce GTX 1660 Ti
+```
+
+`lkcp` is a CPU-only fallback in the current workspace and should not be used for
+model training, checkpoint evaluation, or top-sensitive diagnostics.
+
+For full OASST1 Trie-PARROT training runs, prefer the remote A100 host:
+
+```sshconfig
+Host 422-a100
+  HostName instance-p6fmf5lf.yc.smartml.cn
+  Port 11000
+  User sunray
+  IdentityFile C:\Users\35707\.ssh\id_ed25519
+```
+
+Use this host for large DAgger runs and other long GPU experiments. The private
+key passphrase is intentionally not recorded in this repository; unlock the key
+with `ssh-add` or an interactive SSH client before starting remote jobs.
+
 You can also install your own environment based on another Python Version but only pay attention that:
 - If you want to use the `Parrot` Model, you should install your torch env(in our benchmark, we use CUDA 12.4 to enable Torch GPU)
 - Because of different Python pickle rules, the released `boost-traces.zip` may not work in your env, so you need to generate your own boost trace file.

@@ -12,6 +12,17 @@ continuing experiments or training; it records the current workload semantics,
 generated files, completed block-size/capacity sweeps, missing settings, and
 recommended model-training targets.
 
+For this workspace, use the CUDA-enabled conda environment for all torch model
+work:
+
+```powershell
+$env:TRIE_PYTHON="$env:USERPROFILE\miniconda3\envs\tencentworkpy38\python.exe"
+& $env:TRIE_PYTHON -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+Do not use `.\lkcp\Scripts\python.exe` for training or model diagnostics; it is
+currently a CPU-only fallback environment.
+
 ## Goal
 
 Build a prefix-tree cache simulator for multi-turn LLM serving traces where each

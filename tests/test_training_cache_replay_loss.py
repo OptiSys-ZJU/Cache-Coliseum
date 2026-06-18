@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify collect() -> loss() closes the replay loop for history_lstm."""
+"""Verify collect() -> loss() closes the path-history replay loop."""
 import os
 import sys
 
@@ -30,15 +30,32 @@ def test_collect_to_loss_replay():
 
     snapshots = cache.get_snapshots()
     assert snapshots, "expected at least one snapshot"
-    losses = model.loss(snapshots)
-    losses["eviction"].backward()
+    assert any(
+        getattr(step, "history_paths", None)
+        for snapshot in snapshots
+        for step in snapshot.eviction_steps
+    )
+    assert all(
+        hasattr(step, "oracle_distances")
+        for snapshot in snapshots
+        for step in snapshot.eviction_steps
+    )
 
+    losses = model.loss(snapshots)
+    sum(losses.values()).backward()
+
+    path_grad = 0.0
     history_grad = 0.0
     for name, param in model.named_parameters():
-        if "history_lstm" in name and param.grad is not None:
+        if param.grad is None:
+            continue
+        if "path_lstm" in name:
+            path_grad += float(param.grad.abs().sum().item())
+        if "history_lstm" in name:
             history_grad += float(param.grad.abs().sum().item())
 
-    assert history_grad > 0.0, "history_lstm should receive gradients through collect()->loss() replay"
+    assert path_grad > 0.0, "path_lstm should receive gradients through collect()->loss() replay"
+    assert history_grad == 0.0, "legacy history_lstm should not be used by Trie-PARROT v1"
 
 
 if __name__ == "__main__":
