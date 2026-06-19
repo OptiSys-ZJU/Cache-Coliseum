@@ -70,8 +70,19 @@ class PrefixFutureOracle:
             return float("inf")
         return accesses[0]
 
-    def reuse_distance(self, prefix: Tuple[int, ...], current_request_idx: int) -> float:
-        next_idx = self.next_request_index(prefix)
-        if next_idx == float("inf"):
+    def reuse_distance(
+        self,
+        prefix: Tuple[int, ...],
+        current_request_idx: int,
+        include_current: bool = True,
+    ) -> float:
+        accesses = self._future.get(tuple(prefix))
+        if not accesses:
             return float("inf")
-        return next_idx - current_request_idx
+
+        for request_idx in accesses:
+            if request_idx > current_request_idx or (
+                include_current and request_idx == current_request_idx
+            ):
+                return request_idx - current_request_idx
+        return float("inf")

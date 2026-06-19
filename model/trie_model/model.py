@@ -438,6 +438,8 @@ class TrieParrotModel(nn.Module):
 
         Mirrors original Parrot: loss() calls self() (forward) directly.
         forward(inference=False) re-encodes candidate paths with gradient.
+        The snapshot field eviction_steps is a compatibility name; entries may
+        be request-level cache-state training steps rather than eviction events.
         """
         device = next(self.parameters()).device
         ranking_losses = []

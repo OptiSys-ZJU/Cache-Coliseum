@@ -107,8 +107,8 @@ class TrieTrainingCache:
     """
     Training cache for TrieParrotModel using DAgger (Dataset Aggregation).
     
-    Wraps a TrieModelPredictAlgorithm and intercepts eviction decisions to collect
-    training snapshots with Belady oracle labels.
+    Wraps a TrieModelPredictAlgorithm and collects request-level cache-state
+    snapshots with Belady oracle labels before each request is applied.
     
     Usage:
         cache = TrieTrainingCache(max_node_num=1024, model=my_model)
@@ -117,7 +117,7 @@ class TrieTrainingCache:
         
         for seq in sequences:
             snapshot, hit = cache.collect(seq)
-            # snapshot.oracle_target, snapshot.leaf_node_ids, etc.
+            # snapshot.eviction_steps contains request-level training steps.
     """
     
     def __init__(self, max_node_num: int, model=None):
@@ -169,7 +169,7 @@ class TrieTrainingCache:
         self._current_step = 0
         self.alg._reset_history()
     
-    def _reuse_distance(self, path: tuple) -> float:
+    def _reuse_distance(self, path: tuple, include_current: bool = False) -> float:
         """
         Belady oracle: how many steps until a future access matches this leaf's path.
         
@@ -180,11 +180,16 @@ class TrieTrainingCache:
             return float('inf')
 
         if self._future_oracle is not None:
-            return self._future_oracle.reuse_distance(path, self._current_step)
+            return self._future_oracle.reuse_distance(
+                path,
+                self._current_step,
+                include_current=include_current,
+            )
         
         path_list = list(path)
         path_len = len(path_list)
-        for offset in range(self._current_step + 1, len(self._future_accesses)):
+        start = self._current_step if include_current else self._current_step + 1
+        for offset in range(start, len(self._future_accesses)):
             future_seq = self._future_accesses[offset]
             if len(future_seq) >= path_len and future_seq[:path_len] == path_list:
                 return offset - self._current_step
@@ -198,10 +203,17 @@ class TrieTrainingCache:
         distances = self._oracle_distances(candidates)
         return max(range(len(distances)), key=lambda idx: distances[idx])
 
-    def _oracle_distances(self, candidates: List[TrieNode]) -> List[float]:
+    def _oracle_distances(
+        self,
+        candidates: List[TrieNode],
+        include_current: bool = False,
+    ) -> List[float]:
         """Return request-clock future reuse distance for each candidate path."""
         return [
-            self._reuse_distance(TrieNode.get_path_tuple_from_node(leaf))
+            self._reuse_distance(
+                TrieNode.get_path_tuple_from_node(leaf),
+                include_current=include_current,
+            )
             for leaf in candidates
         ]
 
@@ -210,23 +222,65 @@ class TrieTrainingCache:
         if not distances:
             raise ValueError("Cannot choose oracle target from an empty candidate list")
         return max(range(len(distances)), key=lambda idx: distances[idx])
+
+    def _request_state_snapshot(
+        self,
+        cache_sequence: List[int],
+        pre_request_history_paths,
+    ) -> Optional[SimpleNamespace]:
+        """
+        Build a request-level cache-state snapshot before mutating the trie.
+
+        The field name eviction_steps is kept for compatibility with the
+        existing loss/training pipeline; entries are generic training steps.
+        """
+        candidates = [
+            leaf for leaf in self.alg.__leaves__()
+            if leaf != self.alg.root_node
+            and self.alg.__is_live_leaf__(leaf)
+        ]
+        if not candidates:
+            return None
+
+        oracle_distances = self._oracle_distances(candidates, include_current=True)
+        step_data = SimpleNamespace()
+        step_data.step_kind = "request_state"
+        step_data.leaf_node_ids = [c.node_id for c in candidates]
+        step_data.leaf_paths = [
+            TrieNode.get_node_id_path(c) for c in candidates
+        ]
+        step_data.current_path = tuple(cache_sequence)
+        step_data.step_index = -1
+        step_data.history_paths = tuple(pre_request_history_paths)
+        step_data.oracle_distances = oracle_distances
+        step_data.oracle_target = self._oracle_target_from_distances(oracle_distances)
+        step_data.num_candidates = len(candidates)
+
+        snapshot = SimpleNamespace()
+        snapshot.sequence = tuple(cache_sequence)
+        snapshot.eviction_steps = [step_data]
+        return snapshot
     
     def collect(self, sequence: List[int]):
         """
-        Process one sequence access, collecting training data on eviction.
+        Collect a pre-request cache-state snapshot, then process one access.
         
         Returns:
             (snapshot, hit): 
-                snapshot: SimpleNamespace with training fields (None if no eviction)
+                snapshot: request-level training snapshot (None if no candidates)
                 hit: bool, whether the entire sequence was a cache hit
         """
         cache_sequence = sequence[:self.max_node_num]
+        pre_request_history_paths = tuple(self.alg.history_path_window)
+
+        snapshot = self._request_state_snapshot(
+            cache_sequence,
+            pre_request_history_paths,
+        )
 
         if self._future_oracle is not None:
             self._future_oracle.consume_current(cache_sequence, self._current_step)
-
         hit_nodes = 0
-        snapshot = None
         this_node = self.alg.root_node
 
         current_prefix = []
@@ -239,17 +293,12 @@ class TrieTrainingCache:
             else:
                 evict_num = self.alg.cur_node_num + 1 - self.alg.max_node_num
                 if evict_num > 0:
-                    step_snapshot = self._evict_and_collect(
+                    self._evict_and_collect(
                         evict_num,
                         this_node,
                         current_prefix,
                         step_index,
                     )
-                    if step_snapshot is not None:
-                        if snapshot is None:
-                            snapshot = step_snapshot
-                        else:
-                            snapshot.eviction_steps.extend(step_snapshot.eviction_steps)
 
                 new_node = TrieNode()
                 new_node.key = node_id
@@ -269,7 +318,6 @@ class TrieTrainingCache:
         self.total_count += 1
 
         if snapshot is not None:
-            snapshot.sequence = tuple(cache_sequence)
             self.snapshots.append(snapshot)
 
         self.alg.timestamp += 1
@@ -285,7 +333,11 @@ class TrieTrainingCache:
         step_index: int,
     ) -> SimpleNamespace:
         """
-        Perform eviction with DAgger mixing and collect training snapshot.
+        Perform eviction with DAgger mixing.
+
+        The returned prefix-level eviction-decision snapshot is for direct
+        diagnostics/tests only. collect() trains on pre-request cache-state
+        snapshots and does not buffer this helper's micro-steps.
         
         For each eviction:
         1. Compute oracle target (Belady's)
@@ -323,6 +375,7 @@ class TrieTrainingCache:
             
             # Record per-eviction step data
             step_data = SimpleNamespace()
+            step_data.step_kind = "eviction_decision"
             step_data.leaf_node_ids = [c.node_id for c in candidates]
             step_data.leaf_paths = [
                 TrieNode.get_node_id_path(c) for c in candidates

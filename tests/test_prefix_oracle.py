@@ -26,6 +26,8 @@ sequences = [
 oracle = PrefixFutureOracle(sequences)
 assert oracle.next_request_index((1,)) == 0
 assert oracle.next_request_index((1, 2, 3)) == 0
+assert oracle.reuse_distance((1,), 0) == 0
+assert oracle.reuse_distance((1,), 0, include_current=False) == 1
 oracle.consume_current(sequences[0], 0)
 assert oracle.next_request_index((1,)) == 1
 assert oracle.next_request_index((1, 2, 3)) == 3

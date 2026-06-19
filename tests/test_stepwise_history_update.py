@@ -88,7 +88,7 @@ def test_evictions_during_request_see_only_prior_leaf_history():
     assert list(alg.history_path_window) == [(1, 2), (3, 4, 5)]
 
 
-def test_collect_snapshot_history_paths_exclude_current_request_prefixes():
+def test_collect_request_state_history_paths_exclude_current_request():
     model = TrieParrotModel(
         vocab_size=256,
         node_embed_dim=16,
@@ -105,26 +105,22 @@ def test_collect_snapshot_history_paths_exclude_current_request_prefixes():
     cache.load_future_accesses(sequences)
     cache.set_model_prob(0.0)
 
-    snapshot = None
-    for seq in sequences:
-        maybe_snapshot, _ = cache.collect(seq)
-        if maybe_snapshot is not None:
-            snapshot = maybe_snapshot
-            break
+    for seq in sequences[:2]:
+        cache.collect(seq)
+    snapshot, _ = cache.collect(sequences[2])
 
-    assert snapshot is not None, "expected an eviction snapshot"
+    assert snapshot is not None, "expected a request-level cache-state snapshot"
     step_prefixes = [tuple(step.current_path) for step in snapshot.eviction_steps]
     step_histories = [tuple(step.history_paths) for step in snapshot.eviction_steps]
 
-    assert step_prefixes == [(5,), (5, 6)]
+    assert step_prefixes == [(5, 6)]
+    assert [step.step_kind for step in snapshot.eviction_steps] == ["request_state"]
     assert step_histories == [
         ((1, 2), (3, 4)),
-        ((1, 2), (3, 4)),
-    ], "all evictions in one request should see the same pre-request leaf history"
+    ], "request-state supervision should see only pre-request leaf history"
     assert (5,) not in step_histories[0]
-    assert (5,) not in step_histories[1]
     assert (5, 6) not in step_histories[0]
-    assert (5, 6) not in step_histories[1]
+    assert cache.alg.eviction_count == 2
     assert list(cache.alg.history_path_window) == [(1, 2), (3, 4), (5, 6)]
 
 
@@ -220,15 +216,17 @@ def test_train_infer_history_lengths_align_for_same_sequence():
         cache.collect(seq)
 
     snapshot, _ = cache.collect(target)
-    assert snapshot is not None, "expected training eviction snapshot for target sequence"
+    assert snapshot is not None, "expected training request-state snapshot for target sequence"
 
     alg.access(target)
 
     runtime_lengths = list(runtime_model.runtime_history_lengths)
     snapshot_lengths = [len(step.history_paths) for step in snapshot.eviction_steps]
 
-    assert runtime_lengths == snapshot_lengths == [2, 2], (
-        "inference-time history visibility and training snapshot paths should align step by step"
+    assert snapshot_lengths == [2]
+    assert runtime_lengths == [2, 2], (
+        "runtime evictions and request-level training snapshot should share the "
+        "same pre-request history visibility"
     )
 
 
@@ -263,7 +261,7 @@ def test_history_window_bounding_matches_runtime_and_replay():
 
 if __name__ == "__main__":
     test_evictions_during_request_see_only_prior_leaf_history()
-    test_collect_snapshot_history_paths_exclude_current_request_prefixes()
+    test_collect_request_state_history_paths_exclude_current_request()
     test_collect_to_loss_replays_same_leaf_history_snapshots()
     test_protection_uses_current_prefix_not_future_suffix()
     test_train_infer_history_lengths_align_for_same_sequence()

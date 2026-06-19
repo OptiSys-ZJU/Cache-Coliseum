@@ -39,7 +39,7 @@ def collect_snapshots(
     max_requests: int = None,
 ):
     """
-    Run one pass over data, collecting DAgger training snapshots.
+    Run one pass over data, collecting request-level DAgger snapshots.
     
     Returns:
         (snapshots, hit_rate)
@@ -64,6 +64,7 @@ def collect_snapshots(
 
 
 def flatten_eviction_steps(snapshots, max_steps: int = None):
+    """Flatten compatible training-step containers named eviction_steps."""
     steps = []
     for snapshot in snapshots:
         for step in snapshot.eviction_steps:

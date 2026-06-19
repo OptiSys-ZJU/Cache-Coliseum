@@ -51,10 +51,11 @@ def test_training_snapshot_carries_request_metadata():
             snapshot = maybe_snapshot
             break
 
-    assert snapshot is not None, "expected at least one eviction snapshot"
-    assert snapshot.eviction_steps, "expected eviction steps"
+    assert snapshot is not None, "expected at least one request-state snapshot"
+    assert snapshot.eviction_steps, "expected compatible training steps"
     assert isinstance(snapshot.sequence, tuple)
-    assert snapshot.sequence == (1, 2, 6)
+    assert snapshot.sequence == (1, 2, 4)
+    assert snapshot.eviction_steps[0].step_kind == "request_state"
 
 
 test_forward_shapes()
