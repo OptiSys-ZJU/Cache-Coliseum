@@ -31,7 +31,7 @@ def test_collect_to_loss_replay():
     snapshots = cache.get_snapshots()
     assert snapshots, "expected at least one snapshot"
     assert any(
-        getattr(step, "history_paths", None)
+        getattr(step, "microstep_history_paths", None)
         for snapshot in snapshots
         for step in snapshot.eviction_steps
     )
@@ -45,17 +45,17 @@ def test_collect_to_loss_replay():
     sum(losses.values()).backward()
 
     path_grad = 0.0
-    history_grad = 0.0
     for name, param in model.named_parameters():
         if param.grad is None:
             continue
         if "path_lstm" in name:
             path_grad += float(param.grad.abs().sum().item())
-        if "history_lstm" in name:
-            history_grad += float(param.grad.abs().sum().item())
 
     assert path_grad > 0.0, "path_lstm should receive gradients through collect()->loss() replay"
-    assert history_grad == 0.0, "legacy history_lstm should not be used by Trie-PARROT v1"
+    assert all(
+        "history_lstm" not in name and "history_proj" not in name
+        for name, _ in model.named_parameters()
+    )
 
 
 if __name__ == "__main__":

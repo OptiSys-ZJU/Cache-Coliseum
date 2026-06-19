@@ -627,33 +627,45 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
         """
         super().__init__(max_node_num)
         self.model = model
-        self.history_state = None  # legacy token-history state; unused by Trie-PARROT v1
-        self.history_hidden_states = deque([], maxlen=self._history_maxlen())
-        self.history_path_window = deque([], maxlen=self._history_maxlen())
+        self.microstep_history_hidden_states = deque([], maxlen=self._microstep_history_maxlen())
+        self.microstep_history_path_window = deque([], maxlen=self._microstep_history_maxlen())
+        self.request_history_hidden_states = deque([], maxlen=self._request_history_maxlen())
+        self.request_history_path_window = deque([], maxlen=self._request_history_maxlen())
         self.timestamp = 0
         self.counter = 0
     
-    def _history_maxlen(self):
+    def _microstep_history_maxlen(self):
         if self.model is None:
             return 1
-        return max(1, int(self.model.max_attention_history))
+        return max(1, int(self.model.max_microstep_history))
+
+    def _request_history_maxlen(self):
+        if self.model is None:
+            return 1
+        return max(1, int(self.model.max_request_history))
 
     def _reset_history(self):
-        self.history_state = None
-        self.history_hidden_states = deque([], maxlen=self._history_maxlen())
-        self.history_path_window = deque([], maxlen=self._history_maxlen())
+        self.microstep_history_hidden_states = deque([], maxlen=self._microstep_history_maxlen())
+        self.microstep_history_path_window = deque([], maxlen=self._microstep_history_maxlen())
+        self.request_history_hidden_states = deque([], maxlen=self._request_history_maxlen())
+        self.request_history_path_window = deque([], maxlen=self._request_history_maxlen())
 
     def set_model(self, model):
         """Set or replace the prediction model."""
         self.model = model
         self._reset_history()
 
-    def _history_memory(self):
-        if not self.history_hidden_states:
+    def _microstep_history_memory(self):
+        if not self.microstep_history_hidden_states:
             return None
-        return list(self.history_hidden_states)
+        return list(self.microstep_history_hidden_states)
 
-    def _record_history_path(
+    def _request_history_memory(self):
+        if not self.request_history_hidden_states:
+            return None
+        return list(self.request_history_hidden_states)
+
+    def _record_microstep_history_path(
         self,
         path: List[int],
         path_state: Tuple[Any, Any] = None,
@@ -661,7 +673,7 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
         path_tuple = tuple(path)
         if len(path_tuple) == 0:
             return
-        self.history_path_window.append(path_tuple)
+        self.microstep_history_path_window.append(path_tuple)
 
         if self.model is None:
             return
@@ -673,22 +685,53 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
                 hidden = path_state[0]
             else:
                 hidden = self.model._encode_path(path_tuple, next(self.model.parameters()).device)
-        self.history_hidden_states.append(hidden.detach())
+        self.microstep_history_hidden_states.append(hidden.detach())
 
-    def _record_history_leaf(self, node: TrieNode):
-        """Append one completed request leaf to the bounded history window."""
-        if node is None or node == self.root_node:
+    def _record_request_history_path(
+        self,
+        path: List[int],
+        path_state: Tuple[Any, Any] = None,
+    ):
+        path_tuple = tuple(path)
+        if len(path_tuple) == 0:
             return
-        if not self.__is_live_leaf__(node):
+        self.request_history_path_window.append(path_tuple)
+
+        if self.model is None:
             return
-        self._record_history_path(TrieNode.get_node_id_path(node), node.hidden_state)
+        if torch is None:
+            raise ImportError("TrieModelPredictAlgorithm requires torch when model is set")
 
-    def _record_history_step(self, node_id: int):
-        """Compatibility wrapper: a single token is a singleton path slot."""
-        self._record_history_path([node_id])
+        with torch.no_grad():
+            if path_state is not None:
+                hidden = path_state[0]
+            else:
+                hidden = self.model._encode_path(path_tuple, next(self.model.parameters()).device)
+        self.request_history_hidden_states.append(hidden.detach())
 
-    def _record_history_sequence(self, sequence: List[int]):
-        self._record_history_path(sequence)
+    def _node_lru_age(self, node: TrieNode) -> float:
+        if node is None or node.metadata is None:
+            return float(self.counter + 1)
+        return float(max(0, self.counter - node.metadata))
+
+    def _candidate_lru_features(self, candidates: List[TrieNode]) -> List[List[float]]:
+        rows = []
+        for leaf in candidates:
+            path_ages = []
+            node = leaf
+            while node is not None and node != self.root_node:
+                path_ages.append(self._node_lru_age(node))
+                node = node.parent
+            if not path_ages:
+                path_ages = [self._node_lru_age(leaf)]
+            rows.append([
+                self._node_lru_age(leaf),
+                min(path_ages),
+                sum(path_ages) / len(path_ages),
+                max(path_ages),
+                float(len(path_ages)),
+            ])
+        return rows
     
     def _get_protected_leaves(self, current_path: List) -> set:
         """
@@ -769,7 +812,7 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
             if not candidates:
                 raise ValueError("No eviction candidates available (all nodes protected)")
             
-            if self.model is not None and self.history_hidden_states:
+            if self.model is not None:
                 if torch is None:
                     raise ImportError("TrieModelPredictAlgorithm requires torch when model is set")
                 # Use model to score candidates
@@ -783,7 +826,9 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
                 
                 with torch.no_grad():
                     scores, _ = self.model.forward(
-                        self._history_memory(),
+                        self._microstep_history_memory(),
+                        self._request_history_memory(),
+                        self._candidate_lru_features(candidates),
                         candidate_states=leaf_states,
                     )
                 
@@ -881,8 +926,9 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
             else:
                 self.__insert__(this_node, [node_id], current_path=current_prefix)
                 this_node = this_node.children[node_id]
-            self._record_history_path(current_prefix, this_node.hidden_state)
+            self._record_microstep_history_path(current_prefix, this_node.hidden_state)
 
+        self._record_request_history_path(sequence, this_node.hidden_state)
         self.timestamp += 1
         return (len(sequence), hit_nodes, len(sequence) - hit_nodes)
 
@@ -936,7 +982,7 @@ class TrieModelGuard(TrieModelPredictAlgorithm):
             self.total_evictions += 1
             use_model = False
             
-            if self.model is not None and self.history_hidden_states and len(candidates) > 1:
+            if self.model is not None and len(candidates) > 1:
                 if torch is None:
                     raise ImportError("TrieModelGuard requires torch when model is set")
                 leaf_states = []
@@ -948,7 +994,9 @@ class TrieModelGuard(TrieModelPredictAlgorithm):
                 
                 with torch.no_grad():
                     scores, _ = self.model.forward(
-                        self._history_memory(),
+                        self._microstep_history_memory(),
+                        self._request_history_memory(),
+                        self._candidate_lru_features(candidates),
                         candidate_states=leaf_states,
                     )
                 

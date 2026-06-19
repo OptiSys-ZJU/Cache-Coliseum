@@ -14,10 +14,17 @@ model = TrieParrotModel(vocab_size=100, node_embed_dim=16, hidden_size=32)
 model.eval()
 
 h_state = torch.randn(1, 32)
+request_state = torch.randn(1, 32)
 leaf_states = [torch.randn(1, 32) for _ in range(5)]
+lru_features = [(1.0, 1.0, 1.0, 1.0, 1.0) for _ in leaf_states]
 
 with torch.no_grad():
-    logits, reuse_dist = model.forward(h_state, leaf_states)
+    logits, reuse_dist = model.forward(
+        h_state,
+        request_state,
+        lru_features,
+        candidate_states=leaf_states,
+    )
 
 assert logits.shape == (1, 5), f"Expected (1,5), got {logits.shape}"
 # Logits should NOT sum to 1 (not softmax'd)
@@ -31,7 +38,13 @@ snap = SimpleNamespace()
 snap.eviction_steps = [SimpleNamespace(
     leaf_paths=[(1, 2), (3, 4), (5, 6)],
     oracle_target=1,
-    history_paths=((10,), (10, 11), (10, 11, 12)),
+    microstep_history_paths=((10,), (10, 11), (10, 11, 12)),
+    request_history_paths=((1, 2),),
+    lru_features=(
+        (1.0, 1.0, 1.0, 1.0, 2.0),
+        (2.0, 2.0, 2.0, 2.0, 2.0),
+        (3.0, 3.0, 3.0, 3.0, 2.0),
+    ),
     oracle_distances=[1.0, float("inf"), 2.0],
     num_candidates=3,
 )]

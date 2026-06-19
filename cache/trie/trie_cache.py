@@ -169,6 +169,8 @@ class TrieTrainingCache:
         )
         self._current_step = 0
         self.alg._reset_history()
+        self.alg.counter = 0
+        self.alg.timestamp = 0
         self.snapshots = []
         self._collected_training_steps = 0
     
@@ -236,13 +238,14 @@ class TrieTrainingCache:
         cache_sequence: List[int],
         current_prefix: List[int],
         step_index: int,
-        pre_step_history_paths,
+        pre_step_microstep_history_paths,
+        pre_request_history_paths,
     ) -> Optional[SimpleNamespace]:
         """
         Build an access-prefix cache-state snapshot before mutating the trie.
 
-        The field name eviction_steps is kept for compatibility with the
-        existing loss/training pipeline; entries are generic training steps.
+        Entries are generic microstep training states sampled before the trie
+        mutates for the current prefix.
         """
         candidates = [
             leaf for leaf in self.alg.__leaves__()
@@ -266,7 +269,18 @@ class TrieTrainingCache:
         step_data.request_path = tuple(cache_sequence)
         step_data.current_path = tuple(current_prefix)
         step_data.step_index = step_index
-        step_data.history_paths = tuple(pre_step_history_paths)
+        step_data.microstep_history_paths = tuple(pre_step_microstep_history_paths)
+        step_data.request_history_paths = tuple(pre_request_history_paths)
+        step_data.lru_features = tuple(
+            tuple(row) for row in self.alg._candidate_lru_features(candidates)
+        )
+        step_data.lru_feature_names = (
+            "leaf_age",
+            "path_min_age",
+            "path_mean_age",
+            "path_max_age",
+            "path_depth",
+        )
         step_data.oracle_distances = oracle_distances
         step_data.oracle_target = self._oracle_target_from_distances(oracle_distances)
         step_data.required_candidate_indices = tuple(required_candidate_indices)
@@ -284,21 +298,26 @@ class TrieTrainingCache:
                 hit: bool, whether the entire sequence was a cache hit
         """
         cache_sequence = sequence[:self.max_node_num]
+        self.alg.counter += 1
         snapshot = SimpleNamespace()
         snapshot.sequence = tuple(cache_sequence)
         snapshot.eviction_steps = []
         hit_nodes = 0
         this_node = self.alg.root_node
+        pre_request_history_paths = tuple(self.alg.request_history_path_window)
 
         current_prefix = []
         for step_index, node_id in enumerate(cache_sequence):
             current_prefix.append(node_id)
-            pre_step_history_paths = tuple(self.alg.history_path_window)
+            pre_step_microstep_history_paths = tuple(
+                self.alg.microstep_history_path_window
+            )
             step_data = self._microstep_access_snapshot(
                 cache_sequence,
                 current_prefix,
                 step_index,
-                pre_step_history_paths,
+                pre_step_microstep_history_paths,
+                pre_request_history_paths,
             )
             if step_data is not None:
                 snapshot.eviction_steps.append(step_data)
@@ -328,7 +347,10 @@ class TrieTrainingCache:
                 self.alg.cur_node_num += 1
                 self.alg.__mark_as_leaf__(this_node)
 
-            self.alg._record_history_path(current_prefix, this_node.hidden_state)
+            self.alg._record_microstep_history_path(
+                current_prefix,
+                this_node.hidden_state,
+            )
 
         if self._future_oracle is not None:
             self._future_oracle.consume_current(cache_sequence, self._current_step)
@@ -344,6 +366,7 @@ class TrieTrainingCache:
             snapshot = None
 
         self.alg.timestamp += 1
+        self.alg._record_request_history_path(cache_sequence, this_node.hidden_state)
         self._current_step += 1
         
         return snapshot, hit
@@ -405,14 +428,32 @@ class TrieTrainingCache:
             ]
             step_data.current_path = tuple(current_path)
             step_data.step_index = step_index
-            step_data.history_paths = tuple(self.alg.history_path_window)
+            step_data.microstep_history_paths = tuple(
+                self.alg.microstep_history_path_window
+            )
+            step_data.request_history_paths = tuple(
+                self.alg.request_history_path_window
+            )
+            step_data.lru_features = tuple(
+                tuple(row) for row in self.alg._candidate_lru_features(candidates)
+            )
+            step_data.lru_feature_names = (
+                "leaf_age",
+                "path_min_age",
+                "path_mean_age",
+                "path_max_age",
+                "path_depth",
+            )
             step_data.oracle_distances = oracle_distances
             step_data.oracle_target = oracle_idx
             step_data.num_candidates = len(candidates)
             snapshot.eviction_steps.append(step_data)
             
             # DAgger: choose actual eviction target
-            if random.random() < self.model_prob and self.model is not None and self.alg.history_hidden_states:
+            if (
+                random.random() < self.model_prob
+                and self.model is not None
+            ):
                 if torch is None:
                     raise ImportError("TrieTrainingCache requires torch when model is set")
                 # Model policy
@@ -425,7 +466,9 @@ class TrieTrainingCache:
                 
                 with torch.no_grad():
                     scores, _ = self.model.forward(
-                        self.alg._history_memory(),
+                        self.alg._microstep_history_memory(),
+                        self.alg._request_history_memory(),
+                        self.alg._candidate_lru_features(candidates),
                         candidate_states=leaf_states,
                     )
                 target_idx = scores.squeeze(0).argmax().item()
@@ -590,5 +633,4 @@ class SequenceTrieCache:
             "evictions": getattr(self.alg, "eviction_count", 0),
             "resident_blocks": getattr(self.alg, "cur_node_num", 0),
         }
-
 

@@ -24,21 +24,25 @@ class RecordingModel(TrieParrotModel):
 
     def forward(
         self,
-        history_memory,
+        microstep_history_memory,
+        request_history_memory,
+        lru_features,
         candidate_states=None,
         candidate_paths=None,
         inference=True,
     ):
-        if isinstance(history_memory, list):
-            self.runtime_history_lengths.append(len(history_memory))
-        elif history_memory is None:
+        if isinstance(microstep_history_memory, list):
+            self.runtime_history_lengths.append(len(microstep_history_memory))
+        elif microstep_history_memory is None:
             self.runtime_history_lengths.append(0)
         else:
-            self.runtime_history_lengths.append(int(history_memory.shape[0]))
+            self.runtime_history_lengths.append(int(microstep_history_memory.shape[0]))
 
         num_candidates = (
             len(candidate_states) if candidate_states is not None else len(candidate_paths)
         )
+        assert request_history_memory is None or len(request_history_memory) >= 1
+        assert len(lru_features) == num_candidates
         logits = torch.zeros(1, num_candidates, dtype=torch.float32)
         reuse = torch.zeros(1, num_candidates, dtype=torch.float32)
         return logits, reuse
@@ -52,7 +56,7 @@ class SnapshotRecordingModel(TrieParrotModel):
             hidden_size=32,
             max_attention_history=16,
         )
-        self.snapshot_history_paths = []
+        self.snapshot_microstep_history_paths = []
 
     def loss(
         self,
@@ -60,8 +64,8 @@ class SnapshotRecordingModel(TrieParrotModel):
         max_candidates=None,
         max_steps_per_snapshot=None,
     ):
-        self.snapshot_history_paths = [
-            tuple(step.history_paths)
+        self.snapshot_microstep_history_paths = [
+            tuple(step.microstep_history_paths)
             for snapshot in snapshots
             for step in snapshot.eviction_steps
         ]
@@ -78,14 +82,14 @@ def test_evictions_during_request_see_prior_microstep_history():
     alg = TrieModelPredictAlgorithm(max_node_num=3, model=model)
 
     alg.access([1, 2])
-    assert list(alg.history_path_window) == [(1,), (1, 2)]
+    assert list(alg.microstep_history_path_window) == [(1,), (1, 2)]
 
     alg.access([3, 4, 5])
     assert model.runtime_history_lengths == [3, 4], (
         "evictions during request [3,4,5] should see the access-prefix "
         "history available before each microstep"
     )
-    assert list(alg.history_path_window) == [
+    assert list(alg.microstep_history_path_window) == [
         (1,),
         (1, 2),
         (3,),
@@ -117,7 +121,7 @@ def test_collect_microstep_history_paths_exclude_current_microstep():
 
     assert snapshot is not None, "expected microstep cache-state snapshots"
     step_prefixes = [tuple(step.current_path) for step in snapshot.eviction_steps]
-    step_histories = [tuple(step.history_paths) for step in snapshot.eviction_steps]
+    step_histories = [tuple(step.microstep_history_paths) for step in snapshot.eviction_steps]
 
     assert step_prefixes == [(5,), (5, 6)]
     assert [step.step_kind for step in snapshot.eviction_steps] == [
@@ -131,7 +135,7 @@ def test_collect_microstep_history_paths_exclude_current_microstep():
     assert (5,) not in step_histories[0]
     assert (5, 6) not in step_histories[1]
     assert cache.alg.eviction_count == 2
-    assert list(cache.alg.history_path_window) == [
+    assert list(cache.alg.microstep_history_path_window) == [
         (1,),
         (1, 2),
         (3,),
@@ -161,7 +165,7 @@ def test_collect_to_loss_replays_same_leaf_history_snapshots():
     assert snapshots, "expected at least one snapshot"
 
     expected_histories = [
-        tuple(step.history_paths)
+        tuple(step.microstep_history_paths)
         for snapshot in snapshots
         for step in snapshot.eviction_steps
     ]
@@ -169,22 +173,22 @@ def test_collect_to_loss_replays_same_leaf_history_snapshots():
     losses = model.loss(snapshots)
     sum(losses.values()).backward()
 
-    assert model.snapshot_history_paths == expected_histories, (
+    assert model.snapshot_microstep_history_paths == expected_histories, (
         "loss replay should consume the same prefix-history snapshots captured at collect() time"
     )
 
     path_grad = 0.0
-    history_grad = 0.0
     for name, param in model.named_parameters():
         if param.grad is None:
             continue
         if "path_lstm" in name:
             path_grad += float(param.grad.abs().sum().item())
-        if "history_lstm" in name:
-            history_grad += float(param.grad.abs().sum().item())
 
     assert path_grad > 0.0, "path_lstm should receive gradients through collect()->loss() replay"
-    assert history_grad == 0.0, "history_lstm should not be used in Trie-PARROT v1"
+    assert all(
+        "history_lstm" not in name and "history_proj" not in name
+        for name, _ in model.named_parameters()
+    )
 
 
 def test_protection_uses_current_prefix_not_future_suffix():
@@ -238,7 +242,7 @@ def test_train_infer_history_lengths_align_for_same_sequence():
     alg.access(target)
 
     runtime_lengths = list(runtime_model.runtime_history_lengths)
-    snapshot_lengths = [len(step.history_paths) for step in snapshot.eviction_steps]
+    snapshot_lengths = [len(step.microstep_history_paths) for step in snapshot.eviction_steps]
 
     assert snapshot_lengths == [4, 5]
     assert runtime_lengths == [4, 5], (
@@ -270,8 +274,8 @@ def test_history_window_bounding_matches_runtime_and_replay():
     losses = model.loss(snapshots)
     sum(losses.values()).backward()
 
-    for history_paths in model.snapshot_history_paths:
-        assert len(history_paths) <= model.max_attention_history, (
+    for microstep_history_paths in model.snapshot_microstep_history_paths:
+        assert len(microstep_history_paths) <= model.max_attention_history, (
             "replayed history paths should respect the same bounded window as runtime memory"
         )
 

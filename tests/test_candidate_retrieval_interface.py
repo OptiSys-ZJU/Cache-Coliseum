@@ -19,11 +19,15 @@ def make_model():
 
 def test_forward_shapes():
     model = make_model()
-    history_memory = torch.randn(2, model.hidden_size)
+    microstep_history_memory = torch.randn(2, model.hidden_size)
+    request_history_memory = torch.randn(1, model.hidden_size)
     candidate_paths = [(1, 2, 3), (1, 2, 4)]
+    lru_features = [(1.0, 1.0, 1.0, 1.0, 3.0) for _ in candidate_paths]
 
     logits, reuse = model.forward(
-        history_memory,
+        microstep_history_memory,
+        request_history_memory,
+        lru_features,
         candidate_paths=candidate_paths,
         inference=False,
     )
@@ -52,10 +56,13 @@ def test_training_snapshot_carries_request_metadata():
             break
 
     assert snapshot is not None, "expected at least one microstep snapshot"
-    assert snapshot.eviction_steps, "expected compatible training steps"
+    assert snapshot.eviction_steps, "expected collected training steps"
     assert isinstance(snapshot.sequence, tuple)
     assert snapshot.sequence == (1, 2, 3)
     assert snapshot.eviction_steps[0].step_kind == "microstep_access"
+    assert hasattr(snapshot.eviction_steps[0], "microstep_history_paths")
+    assert hasattr(snapshot.eviction_steps[0], "request_history_paths")
+    assert hasattr(snapshot.eviction_steps[0], "lru_features")
 
 
 test_forward_shapes()

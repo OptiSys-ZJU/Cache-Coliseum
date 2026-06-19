@@ -18,18 +18,22 @@ class RecordingModel(TrieParrotModel):
 
     def forward(
         self,
-        history_memory,
+        microstep_history_memory,
+        request_history_memory,
+        lru_features,
         candidate_states=None,
         candidate_paths=None,
         inference=True,
     ):
-        if isinstance(history_memory, list):
-            self.history_lengths.append(len(history_memory))
-        elif history_memory is None:
+        if isinstance(microstep_history_memory, list):
+            self.history_lengths.append(len(microstep_history_memory))
+        elif microstep_history_memory is None:
             self.history_lengths.append(0)
         else:
-            self.history_lengths.append(int(history_memory.shape[0]))
+            self.history_lengths.append(int(microstep_history_memory.shape[0]))
+        assert request_history_memory is None or len(request_history_memory) >= 1
         num_candidates = len(candidate_states) if candidate_states is not None else len(candidate_paths)
+        assert len(lru_features) == num_candidates
         logits = torch.zeros(1, num_candidates, dtype=torch.float32)
         reuse = torch.zeros(1, num_candidates, dtype=torch.float32)
         return logits, reuse
@@ -42,8 +46,8 @@ def test_eviction_history_excludes_current_microstep():
 
     alg.access([1, 2])
     alg.access([3, 4])
-    assert list(alg.history_path_window) == [(1,), (1, 2), (3,), (3, 4)]
-    assert len(alg.history_hidden_states) == 4, "first two requests should populate prefix history"
+    assert list(alg.microstep_history_path_window) == [(1,), (1, 2), (3,), (3, 4)]
+    assert len(alg.microstep_history_hidden_states) == 4, "first two requests should populate prefix history"
 
     alg.access([5, 6])
     assert model.history_lengths, "eviction-time forward should be called"
@@ -51,7 +55,7 @@ def test_eviction_history_excludes_current_microstep():
         "both evictions for request [5,6] should see only the history that "
         "exists before each microstep"
     )
-    assert list(alg.history_path_window) == [
+    assert list(alg.microstep_history_path_window) == [
         (1,),
         (1, 2),
         (3,),

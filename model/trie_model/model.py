@@ -29,14 +29,15 @@ class TrieParrotModel(nn.Module):
         self,
         vocab_size: int,
         node_embed_dim: int = 64,
-        history_embed_dim: int = 64,
         hidden_size: int = 128,
         max_attention_history: int = 30,
         ranking_loss_weight: float = 1.0,
         reuse_loss_weight: float = 0.1,
         ce_loss_weight: float = 0.0,
         ce_target_policy: str = "argmax",
-        candidate_scorer_mode: str = "history_only",
+        max_request_history: Optional[int] = None,
+        max_microstep_history: Optional[int] = None,
+        lru_feature_dim: int = 5,
         reuse_distance_log_cap: float = 5.0,
         ndcg_alpha: float = 10.0,
     ):
@@ -46,7 +47,6 @@ class TrieParrotModel(nn.Module):
         Args:
             vocab_size: Size of node ID vocabulary
             node_embed_dim: Dimension of node embeddings (for tree paths)
-            history_embed_dim: Dimension of history access embeddings
             hidden_size: Dimension of LSTM hidden states (both history and tree)
             max_attention_history: Max number of past history states for attention
         """
@@ -55,6 +55,17 @@ class TrieParrotModel(nn.Module):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.max_attention_history = max_attention_history
+        self.max_request_history = (
+            max_attention_history
+            if max_request_history is None
+            else max_request_history
+        )
+        self.max_microstep_history = (
+            max_attention_history
+            if max_microstep_history is None
+            else max_microstep_history
+        )
+        self.lru_feature_dim = lru_feature_dim
         self.ranking_loss_weight = ranking_loss_weight
         self.reuse_loss_weight = reuse_loss_weight
         self.ce_loss_weight = ce_loss_weight
@@ -64,13 +75,6 @@ class TrieParrotModel(nn.Module):
                 f"got {ce_target_policy!r}"
             )
         self.ce_target_policy = ce_target_policy
-        if candidate_scorer_mode not in {"history_only", "candidate_history_concat"}:
-            raise ValueError(
-                "candidate_scorer_mode must be one of "
-                "{'history_only', 'candidate_history_concat'}, "
-                f"got {candidate_scorer_mode!r}"
-            )
-        self.candidate_scorer_mode = candidate_scorer_mode
         self.reuse_distance_log_cap = reuse_distance_log_cap
         self.ndcg_alpha = ndcg_alpha
         self.last_loss_stats = {
@@ -79,35 +83,37 @@ class TrieParrotModel(nn.Module):
             "candidate_count": 0,
         }
 
-        # --- Node embedding (shared between tree path & history) ---
+        # --- Node embedding for tree paths and path-history slots ---
         self.node_embedder = NodeEmbedder(vocab_size, node_embed_dim)
-
-        # Legacy history encoder kept for checkpoint/API compatibility. Trie-PARROT
-        # v1 uses path-level history slots encoded by path_lstm instead.
-        self.history_lstm = nn.LSTMCell(history_embed_dim, hidden_size)
-
-        # Project node embedding to history input dim (in case they differ)
-        if node_embed_dim != history_embed_dim:
-            self.history_proj = nn.Linear(node_embed_dim, history_embed_dim)
-        else:
-            self.history_proj = nn.Identity()
 
         # --- Path Encoder: Tree-LSTM for encoding root-to-leaf paths ---
         self.path_lstm = PathLSTMCell(node_embed_dim, hidden_size)
 
         # --- Attention: candidate queries attend over ordered path memory ---
-        self.history_pos_embed = nn.Embedding(max_attention_history, hidden_size)
+        pos_history_size = max(
+            1,
+            max_attention_history,
+            self.max_request_history,
+            self.max_microstep_history,
+        )
+        self.history_pos_embed = nn.Embedding(pos_history_size, hidden_size)
         self.query_proj = nn.Linear(hidden_size, hidden_size)
         self.key_proj = nn.Linear(hidden_size, hidden_size)
 
-        if candidate_scorer_mode == "candidate_history_concat":
-            scorer_input_dim = hidden_size * 2
-        else:
-            scorer_input_dim = hidden_size
-        self.scorer = nn.Linear(scorer_input_dim, 1)
-
-        # Predicts log-capped future request reuse distance.
-        self.reuse_distance_estimator = nn.Linear(scorer_input_dim, 1)
+        lru_hidden_size = max(1, hidden_size // 2)
+        self.request_head = nn.Linear(hidden_size, 1)
+        self.micro_head = nn.Linear(hidden_size, 1)
+        self.lru_head = nn.Sequential(
+            nn.LayerNorm(lru_feature_dim),
+            nn.Linear(lru_feature_dim, lru_hidden_size),
+            nn.GELU(),
+            nn.Linear(lru_hidden_size, 1),
+        )
+        self.score_mix_logits = nn.Parameter(torch.zeros(3))
+        self.reuse_estimator = nn.Linear(
+            hidden_size * 2 + lru_feature_dim,
+            1,
+        )
 
     def compute_node_state(
         self,
@@ -133,36 +139,6 @@ class TrieParrotModel(nn.Module):
         h, c = self.path_lstm(node_embed, parent_state)
         return h, c
 
-    def encode_history_step(
-        self,
-        node_id: int,
-        prev_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Legacy helper for the pre-v1 token-history LSTM path.
-
-        Trie-PARROT v1 does not call this in runtime or loss replay; history
-        slots are path-level vectors produced by _encode_path().
-
-        Args:
-            node_id: ID of the currently accessed node
-            prev_state: Previous (h, c) from history LSTM. None for first step.
-
-        Returns:
-            Updated (h, c) for history LSTM
-        """
-        device = next(self.parameters()).device
-        node_embed = self.node_embedder.embed_single(node_id, device)
-        history_input = self.history_proj(node_embed)
-
-        if prev_state is None:
-            h = torch.zeros(1, self.hidden_size, device=device)
-            c = torch.zeros(1, self.hidden_size, device=device)
-            prev_state = (h, c)
-
-        h_new, c_new = self.history_lstm(history_input, prev_state)
-        return h_new, c_new
-
     def _encode_path(
         self,
         path: Optional[Tuple[int, ...]],
@@ -186,8 +162,6 @@ class TrieParrotModel(nn.Module):
         """Normalize history memory to shape (M, H), preserving whether it is real."""
         if history_memory is None:
             return torch.zeros(1, self.hidden_size, device=device), False
-        if isinstance(history_memory, tuple):
-            history_memory = history_memory[0]
         if isinstance(history_memory, list):
             if len(history_memory) == 0:
                 return torch.zeros(1, self.hidden_size, device=device), False
@@ -196,9 +170,13 @@ class TrieParrotModel(nn.Module):
             history_memory = history_memory.unsqueeze(0)
         return history_memory.to(device), history_memory.numel() > 0
 
-    def _add_history_positions(self, history_memory: torch.Tensor) -> torch.Tensor:
+    def _add_history_positions(
+        self,
+        history_memory: torch.Tensor,
+        max_history: Optional[int] = None,
+    ) -> torch.Tensor:
         """Add oldest-to-newest positional embeddings to recent history slots."""
-        limit = max(1, self.max_attention_history)
+        limit = max(1, max_history or self.max_microstep_history)
         if history_memory.size(0) > limit:
             history_memory = history_memory[-limit:]
 
@@ -213,6 +191,7 @@ class TrieParrotModel(nn.Module):
         self,
         history_paths,
         device: torch.device,
+        max_history: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         if history_paths is None:
             return None
@@ -221,9 +200,20 @@ class TrieParrotModel(nn.Module):
         if not paths:
             return None
 
-        limit = max(1, self.max_attention_history)
+        limit = max(1, max_history or self.max_microstep_history)
         encoded = [self._encode_path(path, device) for path in paths[-limit:]]
         return torch.cat(encoded, dim=0).to(device)
+
+    def _encode_request_history_paths(
+        self,
+        history_paths,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        return self._encode_history_paths(
+            history_paths,
+            device,
+            max_history=self.max_request_history,
+        )
 
     def _encode_path_batch(
         self,
@@ -268,9 +258,10 @@ class TrieParrotModel(nn.Module):
         self,
         history_paths_batch,
         device: torch.device,
+        max_history: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return padded history memory and a valid-slot mask for a step batch."""
-        limit = max(1, self.max_attention_history)
+        limit = max(1, max_history or self.max_microstep_history)
         prepared = []
         flat_paths = []
         max_history = 1
@@ -315,6 +306,17 @@ class TrieParrotModel(nn.Module):
 
         return memory, mask
 
+    def _encode_request_history_paths_batch(
+        self,
+        history_paths_batch,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._encode_history_paths_batch(
+            history_paths_batch,
+            device,
+            max_history=self.max_request_history,
+        )
+
     def _encode_candidate_paths_batch(
         self,
         candidate_paths_batch,
@@ -351,14 +353,99 @@ class TrieParrotModel(nn.Module):
             offset += count
         return candidates, mask
 
-    def _forward_batched_encoded(
+    def _prepare_lru_features_batch(
         self,
+        lru_features_batch,
+        candidate_mask: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return padded, log-scaled LRU feature tensor of shape (B, N, F)."""
+        if lru_features_batch is None:
+            raise ValueError("lru_features_batch is required")
+        batch_size, max_candidates = candidate_mask.shape
+        features = torch.zeros(
+            batch_size,
+            max_candidates,
+            self.lru_feature_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        for batch_idx, row_features in enumerate(lru_features_batch):
+            if row_features is None:
+                raise ValueError("lru_features are required for every training step")
+            row = torch.tensor(
+                row_features,
+                dtype=torch.float32,
+                device=device,
+            )
+            if row.dim() == 1:
+                row = row.unsqueeze(0)
+            expected = int(candidate_mask[batch_idx].sum().item())
+            if row.size(0) < expected:
+                raise ValueError(
+                    "lru_features must have one row per selected candidate"
+                )
+            if row.size(1) != self.lru_feature_dim:
+                raise ValueError(
+                    "lru_features width must match model.lru_feature_dim"
+                )
+            if expected > 0:
+                features[batch_idx, :expected, :] = row[:expected, :]
+
+        return self._scale_lru_features(features)
+
+    def _prepare_lru_features(
+        self,
+        lru_features,
+        num_candidates: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if lru_features is None and num_candidates > 0:
+            raise ValueError("lru_features are required for runtime scoring")
+        features = torch.zeros(
+            1,
+            num_candidates,
+            self.lru_feature_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        if num_candidates > 0:
+            row = torch.tensor(lru_features, dtype=torch.float32, device=device)
+            if row.dim() == 1:
+                row = row.unsqueeze(0)
+            if row.size(0) < num_candidates:
+                raise ValueError("lru_features must have one row per candidate")
+            if row.size(1) != self.lru_feature_dim:
+                raise ValueError(
+                    "lru_features width must match model.lru_feature_dim"
+                )
+            if num_candidates > 0:
+                features[0, :num_candidates, :] = row[:num_candidates, :]
+        return self._scale_lru_features(features)
+
+    def _scale_lru_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Log-scale recency ages while leaving depth-style fields readable."""
+        if features.size(-1) == 0:
+            return features
+        scaled = features.clone()
+        age_width = min(4, scaled.size(-1))
+        scaled[..., :age_width] = torch.log1p(torch.clamp_min(
+            scaled[..., :age_width],
+            0.0,
+        ))
+        if scaled.size(-1) > 4:
+            scaled[..., 4:] = torch.log1p(torch.clamp_min(
+                scaled[..., 4:],
+                0.0,
+            ))
+        return scaled
+
+    def _attend_encoded_history(
+        self,
+        candidate_states: torch.Tensor,
         history_memory: torch.Tensor,
         history_mask: torch.Tensor,
-        candidate_states: torch.Tensor,
-        candidate_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Score a padded batch of training steps."""
+    ) -> torch.Tensor:
         queries = self.query_proj(candidate_states)
         memory_keys = self.key_proj(history_memory)
 
@@ -366,15 +453,60 @@ class TrieParrotModel(nn.Module):
         attn_logits = torch.bmm(queries, memory_keys.transpose(1, 2)) / scale
         attn_logits = attn_logits.masked_fill(~history_mask.unsqueeze(1), -1e9)
         attn_weights = F.softmax(attn_logits, dim=-1)
-        retrieved_history = torch.bmm(attn_weights, history_memory)
+        return torch.bmm(attn_weights, history_memory)
 
-        if self.candidate_scorer_mode == "candidate_history_concat":
-            scorer_input = torch.cat([candidate_states, retrieved_history], dim=-1)
-        else:
-            scorer_input = retrieved_history
+    def _combine_score_heads(
+        self,
+        request_context: torch.Tensor,
+        micro_context: torch.Tensor,
+        lru_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        request_logit = self.request_head(request_context).squeeze(-1)
+        micro_logit = self.micro_head(micro_context).squeeze(-1)
+        lru_logit = self.lru_head(lru_features).squeeze(-1)
 
-        eviction_logits = self.scorer(scorer_input).squeeze(-1)
-        pred_reuse_dist = self.reuse_distance_estimator(scorer_input).squeeze(-1)
+        mix_weights = F.softmax(self.score_mix_logits, dim=0)
+        eviction_logits = (
+            mix_weights[0] * request_logit
+            + mix_weights[1] * micro_logit
+            + mix_weights[2] * lru_logit
+        )
+
+        reuse_input = torch.cat(
+            [request_context, micro_context, lru_features],
+            dim=-1,
+        )
+        pred_reuse_dist = self.reuse_estimator(
+            reuse_input,
+        ).squeeze(-1)
+        return eviction_logits, pred_reuse_dist
+
+    def _forward_batched_encoded(
+        self,
+        micro_history_memory: torch.Tensor,
+        micro_history_mask: torch.Tensor,
+        request_history_memory: torch.Tensor,
+        request_history_mask: torch.Tensor,
+        candidate_states: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        lru_features: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Score a padded batch of training steps."""
+        micro_context = self._attend_encoded_history(
+            candidate_states,
+            micro_history_memory,
+            micro_history_mask,
+        )
+        request_context = self._attend_encoded_history(
+            candidate_states,
+            request_history_memory,
+            request_history_mask,
+        )
+        eviction_logits, pred_reuse_dist = self._combine_score_heads(
+            request_context,
+            micro_context,
+            lru_features,
+        )
 
         eviction_logits = eviction_logits.masked_fill(~candidate_mask, -1e9)
         pred_reuse_dist = pred_reuse_dist.masked_fill(~candidate_mask, 0.0)
@@ -382,36 +514,54 @@ class TrieParrotModel(nn.Module):
 
     def forward_batched(
         self,
-        history_paths_batch,
+        microstep_history_paths_batch,
         candidate_paths_batch,
+        request_history_paths_batch,
+        lru_features_batch,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute training scores for a batch of microsteps.
 
-        This is the Parrot-style path used by loss(): time/windows are still
-        grouped in Python, but all steps at the same window position share one
-        tensorized candidate/history attention pass.
+        Candidate paths are encoded as attention queries. They retrieve one
+        context from request-level leaf history and one context from current
+        request microstep history; explicit candidate LRU features provide the
+        third score head.
         """
         device = next(self.parameters()).device
-        history_memory, history_mask = self._encode_history_paths_batch(
-            history_paths_batch,
+        micro_memory, micro_mask = self._encode_history_paths_batch(
+            microstep_history_paths_batch,
+            device,
+            max_history=self.max_microstep_history,
+        )
+        request_memory, request_mask = self._encode_request_history_paths_batch(
+            request_history_paths_batch,
             device,
         )
         candidate_states, candidate_mask = self._encode_candidate_paths_batch(
             candidate_paths_batch,
             device,
         )
+        lru_features = self._prepare_lru_features_batch(
+            lru_features_batch,
+            candidate_mask,
+            device,
+        )
         logits, pred_reuse = self._forward_batched_encoded(
-            history_memory,
-            history_mask,
+            micro_memory,
+            micro_mask,
+            request_memory,
+            request_mask,
             candidate_states,
             candidate_mask,
+            lru_features,
         )
         return logits, pred_reuse, candidate_mask
 
     def forward(
         self,
-        history_memory: torch.Tensor,
+        microstep_history_memory: torch.Tensor,
+        request_history_memory: torch.Tensor,
+        lru_features,
         candidate_states: List[torch.Tensor] = None,
         candidate_paths: List[Tuple[int, ...]] = None,
         inference: bool = True,
@@ -425,9 +575,13 @@ class TrieParrotModel(nn.Module):
             Re-encodes candidate_paths from scratch with gradient.
 
         Args:
-            history_memory: Oldest-to-newest path memory, shape (M, hidden_size).
+            microstep_history_memory: Current-request prefix memory,
+                oldest-to-newest, shape (M, hidden_size).
             candidate_states: List of N pre-computed candidate path hidden states.
             candidate_paths: List of N root-to-leaf node ID tuples.
+            request_history_memory: Completed-request leaf memory,
+                oldest-to-newest, shape (R, hidden_size).
+            lru_features: Raw per-candidate LRU feature rows.
             inference: If True, use cached candidate_states; otherwise re-encode
                 candidate_paths with gradient.
 
@@ -436,9 +590,37 @@ class TrieParrotModel(nn.Module):
             pred_reuse_distances: shape (1, N)
         """
         device = next(self.parameters()).device
-        history_memory, has_history = self._prepare_history_memory(history_memory, device)
-        if has_history:
-            history_memory = self._add_history_positions(history_memory)
+        micro_memory, has_micro_history = self._prepare_history_memory(
+            microstep_history_memory,
+            device,
+        )
+        if has_micro_history:
+            micro_memory = self._add_history_positions(
+                micro_memory,
+                self.max_microstep_history,
+            )
+        micro_mask = torch.ones(
+            1,
+            micro_memory.size(0),
+            dtype=torch.bool,
+            device=device,
+        )
+
+        request_memory, has_request_history = self._prepare_history_memory(
+            request_history_memory,
+            device,
+        )
+        if has_request_history:
+            request_memory = self._add_history_positions(
+                request_memory,
+                self.max_request_history,
+            )
+        request_mask = torch.ones(
+            1,
+            request_memory.size(0),
+            dtype=torch.bool,
+            device=device,
+        )
 
         if inference:
             assert candidate_states is not None, "candidate_states required when inference=True"
@@ -452,33 +634,29 @@ class TrieParrotModel(nn.Module):
             encoded = [self._encode_path(path, device) for path in candidate_paths]
             candidates = torch.cat(encoded, dim=0)
 
-        queries = self.query_proj(candidates)
-        memory_keys = self.key_proj(history_memory)
-
-        scale = self.hidden_size ** 0.5
-        attn_logits = torch.matmul(queries, memory_keys.T) / scale
-        attn_weights = F.softmax(attn_logits, dim=-1)
-        retrieved_history = torch.matmul(attn_weights, history_memory)
-
-        if self.candidate_scorer_mode == "candidate_history_concat":
-            scorer_input = torch.cat([candidates, retrieved_history], dim=-1)
-        else:
-            scorer_input = retrieved_history
-
-        eviction_logits = self.scorer(scorer_input).squeeze(-1).unsqueeze(0)
-        pred_reuse_dist = self.reuse_distance_estimator(
-            scorer_input
-        ).squeeze(-1).unsqueeze(0)
+        candidate_batch = candidates.unsqueeze(0)
+        candidate_mask = torch.ones(
+            1,
+            candidates.size(0),
+            dtype=torch.bool,
+            device=device,
+        )
+        lru_feature_tensor = self._prepare_lru_features(
+            lru_features,
+            candidates.size(0),
+            device,
+        )
+        eviction_logits, pred_reuse_dist = self._forward_batched_encoded(
+            micro_memory.unsqueeze(0),
+            micro_mask,
+            request_memory.unsqueeze(0),
+            request_mask,
+            candidate_batch,
+            candidate_mask,
+            lru_feature_tensor,
+        )
 
         return eviction_logits, pred_reuse_dist
-
-    def initial_history_state(self, device: torch.device = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Create zero-initialized history state."""
-        if device is None:
-            device = next(self.parameters()).device
-        h = torch.zeros(1, self.hidden_size, device=device)
-        c = torch.zeros(1, self.hidden_size, device=device)
-        return h, c
 
     @staticmethod
     def _candidate_subset(
@@ -625,11 +803,10 @@ class TrieParrotModel(nn.Module):
         """
         Compute training loss from snapshots collected by TrieTrainingCache.
 
-        Mirrors original Parrot's batching shape: time positions are grouped
-        across windows, then candidates/history are padded and scored in one
-        batched attention pass.
-        The snapshot field eviction_steps is a compatibility name; entries may
-        be microstep cache-state training steps rather than eviction events.
+        Time positions are grouped across windows, then candidates/history are
+        padded and scored in one batched attention pass. The surrounding field
+        is named eviction_steps, but its entries are microstep cache-state
+        training steps.
         """
         device = next(self.parameters()).device
         ranking_losses = []
@@ -661,13 +838,24 @@ class TrieParrotModel(nn.Module):
                     prepared_steps.append(None)
                     continue
 
-                history_paths = getattr(step, "history_paths", None)
-                if history_paths is None:
-                    if hasattr(step, "history_tokens"):
-                        raise ValueError(
-                            "Trie-PARROT v1 snapshots must provide history_paths; "
-                            "history_tokens is a legacy prefix/token-history format"
-                        )
+                microstep_history_paths = getattr(step, "microstep_history_paths", None)
+                if microstep_history_paths is None:
+                    raise ValueError(
+                        "Trie-PARROT lru-trie snapshots must provide "
+                        "microstep_history_paths"
+                    )
+                request_history_paths = getattr(step, "request_history_paths", None)
+                if request_history_paths is None:
+                    raise ValueError(
+                        "Trie-PARROT lru-trie snapshots must provide "
+                        "request_history_paths"
+                    )
+                raw_lru_features = getattr(step, "lru_features", None)
+                if raw_lru_features is None:
+                    raise ValueError(
+                        "Trie-PARROT lru-trie snapshots must provide "
+                        "lru_features"
+                    )
 
                 selected_indices, target_idx = self._candidate_subset(
                     step.num_candidates,
@@ -682,6 +870,9 @@ class TrieParrotModel(nn.Module):
                 stats["candidate_count"] += len(selected_indices)
 
                 candidate_paths = [step.leaf_paths[idx] for idx in selected_indices]
+                lru_features = [
+                    raw_lru_features[idx] for idx in selected_indices
+                ]
                 oracle_distances = getattr(step, "oracle_distances", None)
                 relevances = None
                 if oracle_distances is not None:
@@ -701,8 +892,10 @@ class TrieParrotModel(nn.Module):
                     ).squeeze(0)
 
                 prepared_steps.append({
-                    "history_paths": history_paths,
+                    "microstep_history_paths": microstep_history_paths,
+                    "request_history_paths": request_history_paths,
                     "candidate_paths": candidate_paths,
+                    "lru_features": lru_features,
                     "relevances": relevances,
                     "target_distribution": target_distribution,
                 })
@@ -720,8 +913,10 @@ class TrieParrotModel(nn.Module):
                 continue
 
             logits, pred_log_reuse, candidate_mask = self.forward_batched(
-                [item["history_paths"] for item in batch_steps],
+                [item["microstep_history_paths"] for item in batch_steps],
                 [item["candidate_paths"] for item in batch_steps],
+                [item["request_history_paths"] for item in batch_steps],
+                [item["lru_features"] for item in batch_steps],
             )
 
             max_batch_candidates = logits.size(1)
@@ -820,14 +1015,15 @@ class TrieParrotModel(nn.Module):
         model = cls(
             vocab_size=config["vocab_size"],
             node_embed_dim=config.get("node_embed_dim", 64),
-            history_embed_dim=config.get("history_embed_dim", 64),
             hidden_size=config.get("hidden_size", 128),
             max_attention_history=config.get("max_attention_history", 30),
+            max_request_history=config.get("max_request_history"),
+            max_microstep_history=config.get("max_microstep_history"),
+            lru_feature_dim=config.get("lru_feature_dim", 5),
             ranking_loss_weight=config.get("ranking_loss_weight", 1.0),
             reuse_loss_weight=config.get("reuse_loss_weight", 0.1),
             ce_loss_weight=config.get("ce_loss_weight", 0.0),
             ce_target_policy=config.get("ce_target_policy", "argmax"),
-            candidate_scorer_mode=config.get("candidate_scorer_mode", "history_only"),
             reuse_distance_log_cap=config.get("reuse_distance_log_cap", 5.0),
             ndcg_alpha=config.get("ndcg_alpha", 10.0),
         )

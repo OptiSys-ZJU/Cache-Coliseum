@@ -22,14 +22,15 @@
   "dagger_steps": 200000,
   "dagger_update_freq": 2000,
   "node_embed_dim": 64,
-  "history_embed_dim": 64,
   "hidden_size": 128,
   "max_attention_history": 30,
+  "max_request_history": 30,
+  "max_microstep_history": 30,
+  "lru_feature_dim": 5,
   "ranking_loss_weight": 1.0,
   "reuse_loss_weight": 0.01,
   "ce_loss_weight": 0.0,
   "ce_target_policy": "top_set",
-  "candidate_scorer_mode": "history_only",
   "reuse_distance_log_cap": 5.0,
   "ndcg_alpha": 10.0
 }

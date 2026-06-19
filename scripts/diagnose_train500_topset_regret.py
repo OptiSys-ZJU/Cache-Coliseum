@@ -39,14 +39,15 @@ def load_model(config_path: str, checkpoint_path: str, device: torch.device) -> 
     model = TrieParrotModel(
         vocab_size=config["vocab_size"],
         node_embed_dim=config.get("node_embed_dim", 64),
-        history_embed_dim=config.get("history_embed_dim", 64),
         hidden_size=config.get("hidden_size", 128),
         max_attention_history=config.get("max_attention_history", 30),
+        max_request_history=config.get("max_request_history"),
+        max_microstep_history=config.get("max_microstep_history"),
+        lru_feature_dim=config.get("lru_feature_dim", 5),
         ranking_loss_weight=config.get("ranking_loss_weight", 1.0),
         reuse_loss_weight=config.get("reuse_loss_weight", 0.1),
         ce_loss_weight=config.get("ce_loss_weight", 0.0),
         ce_target_policy=config.get("ce_target_policy", "argmax"),
-        candidate_scorer_mode=config.get("candidate_scorer_mode", "history_only"),
         reuse_distance_log_cap=config.get("reuse_distance_log_cap", 5.0),
         ndcg_alpha=config.get("ndcg_alpha", 10.0),
     ).to(device)
@@ -213,7 +214,12 @@ class OnlineTopsetRegretDiagnostic:
                 self.alg.cur_node_num += 1
                 self.alg.__mark_as_leaf__(this_node)
 
-        self.alg._record_history_leaf(this_node)
+            self.alg._record_microstep_history_path(
+                current_prefix,
+                this_node.hidden_state,
+            )
+
+        self.alg._record_request_history_path(cache_sequence, this_node.hidden_state)
         self.alg.timestamp += 1
         self.total_blocks += len(sequence)
         self.hit_blocks += hit_nodes
@@ -310,16 +316,14 @@ class OnlineTopsetRegretDiagnostic:
                 leaf_states.append(torch.zeros(1, self.model.hidden_size, device=self.device))
 
         with torch.no_grad():
-            if self.alg.history_hidden_states:
-                scores, _ = self.model.forward(
-                    self.alg._history_memory(),
-                    candidate_states=leaf_states,
-                )
-                model_idx = int(scores.squeeze(0).argmax().item())
-                score_values = scores.squeeze(0).detach().float().cpu().tolist()
-            else:
-                model_idx = 0
-                score_values = [0.0 for _ in candidates]
+            scores, _ = self.model.forward(
+                self.alg._microstep_history_memory(),
+                self.alg._request_history_memory(),
+                self.alg._candidate_lru_features(candidates),
+                candidate_states=leaf_states,
+            )
+            model_idx = int(scores.squeeze(0).argmax().item())
+            score_values = scores.squeeze(0).detach().float().cpu().tolist()
 
         lru_idx = min(
             range(len(candidates)),
@@ -349,7 +353,8 @@ class OnlineTopsetRegretDiagnostic:
         max_depth = max(candidate_depth(path) for path in paths)
         min_depth = min(candidate_depth(path) for path in paths)
         avg_depth = mean(candidate_depth(path) for path in paths)
-        history_len = len(self.alg.history_hidden_states)
+        microstep_history_len = len(self.alg.microstep_history_hidden_states)
+        request_history_len = len(self.alg.request_history_hidden_states)
         newly_exposed_candidate_ids = {
             idx for idx, candidate in enumerate(candidates)
             if id(candidate) in newly_exposed_leaf_ids
@@ -364,10 +369,14 @@ class OnlineTopsetRegretDiagnostic:
             "step_index": step_index,
             "eviction_ordinal": eviction_ordinal,
             "num_candidates": len(candidates),
-            "history_len": history_len,
+            "microstep_history_len": microstep_history_len,
+            "request_history_len": request_history_len,
             "current_path_len": len(current_path),
             "candidate_count_bucket": bucket_candidate_count(len(candidates)),
-            "history_len_bucket": bucket_history_len(history_len, self.model.max_attention_history),
+            "microstep_history_len_bucket": bucket_history_len(
+                microstep_history_len,
+                self.model.max_microstep_history,
+            ),
             "step_index_bucket": bucket_step_index(step_index),
             "parent_exposed_input": int(bool(newly_exposed_candidate_ids)),
             "new_parent_leaf_candidate_count": len(newly_exposed_candidate_ids),
@@ -522,7 +531,10 @@ def make_summary(
         "eviction_steps": len(rows),
         "overall": aggregate_rows(rows)["overall"] if rows else {},
         "by_candidate_count_bucket": aggregate_rows(rows, "candidate_count_bucket"),
-        "by_history_len_bucket": aggregate_rows(rows, "history_len_bucket"),
+        "by_microstep_history_len_bucket": aggregate_rows(
+            rows,
+            "microstep_history_len_bucket",
+        ),
         "by_step_index_bucket": aggregate_rows(rows, "step_index_bucket"),
         "by_parent_exposed_input": aggregate_rows(rows, "parent_exposed_input"),
         "by_previously_exposed_parent_input": aggregate_rows(

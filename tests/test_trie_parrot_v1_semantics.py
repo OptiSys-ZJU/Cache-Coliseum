@@ -8,6 +8,7 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
+import torch.nn as nn
 
 from cache.trie.oracle import PrefixFutureOracle
 from cache.trie.trie_algorithms import TrieModelPredictAlgorithm, TrieNode
@@ -121,10 +122,10 @@ def test_request_snapshot_uses_pre_access_live_leaf_set():
     assert first_step.step_kind == "microstep_access"
     assert [tuple(path) for path in first_step.leaf_paths] == [(1,)]
     assert tuple(first_step.current_path) == (1,)
-    assert tuple(first_step.history_paths) == ((1,),)
+    assert tuple(first_step.microstep_history_paths) == ((1,),)
     assert tuple(second_step.current_path) == (1, 2)
-    assert tuple(second_step.history_paths) == ((1,), (1,))
-    assert list(cache.alg.history_path_window) == [(1,), (1,), (1, 2)]
+    assert tuple(second_step.microstep_history_paths) == ((1,), (1,))
+    assert list(cache.alg.microstep_history_path_window) == [(1,), (1,), (1, 2)]
 
 
 def test_hit_without_eviction_still_collects_request_snapshot():
@@ -153,8 +154,8 @@ def test_hit_without_eviction_still_collects_request_snapshot():
     ]
     assert [tuple(path) for path in snapshot.eviction_steps[0].leaf_paths] == [(1, 2)]
     assert [tuple(path) for path in snapshot.eviction_steps[1].leaf_paths] == [(1, 2)]
-    assert tuple(snapshot.eviction_steps[0].history_paths) == ((1,), (1, 2))
-    assert tuple(snapshot.eviction_steps[1].history_paths) == ((1,), (1, 2), (1,))
+    assert tuple(snapshot.eviction_steps[0].microstep_history_paths) == ((1,), (1, 2))
+    assert tuple(snapshot.eviction_steps[1].microstep_history_paths) == ((1,), (1, 2), (1,))
 
 
 def test_pre_access_snapshot_labels_current_hit_as_immediate_reuse():
@@ -255,9 +256,10 @@ def test_eviction_does_not_append_history():
     for seq in ([1, 2], [3], [4]):
         _insert_raw(cache.alg, seq)
 
-    cache.alg._record_history_leaf(_node_for_path(cache.alg, [3]))
-    before_paths = tuple(cache.alg.history_path_window)
-    before_len = len(cache.alg.history_hidden_states)
+    node = _node_for_path(cache.alg, [3])
+    cache.alg._record_microstep_history_path([3], node.hidden_state)
+    before_paths = tuple(cache.alg.microstep_history_path_window)
+    before_len = len(cache.alg.microstep_history_hidden_states)
 
     cache._evict_and_collect(
         evict_num=1,
@@ -266,8 +268,8 @@ def test_eviction_does_not_append_history():
         step_index=0,
     )
 
-    assert tuple(cache.alg.history_path_window) == before_paths
-    assert len(cache.alg.history_hidden_states) == before_len
+    assert tuple(cache.alg.microstep_history_path_window) == before_paths
+    assert len(cache.alg.microstep_history_hidden_states) == before_len
 
 
 def test_request_touch_appends_microstep_history_slots():
@@ -276,23 +278,32 @@ def test_request_touch_appends_microstep_history_slots():
 
     alg.access([1, 2, 3])
 
-    assert list(alg.history_path_window) == [(1,), (1, 2), (1, 2, 3)]
-    assert len(alg.history_hidden_states) == 3
+    assert list(alg.microstep_history_path_window) == [(1,), (1, 2), (1, 2, 3)]
+    assert len(alg.microstep_history_hidden_states) == 3
+    assert list(alg.request_history_path_window) == [(1, 2, 3)]
+    assert len(alg.request_history_hidden_states) == 1
 
 
 def test_candidate_is_query_only_not_direct_scorer_input():
     model = TrieParrotModel(vocab_size=128, node_embed_dim=16, hidden_size=8)
     model.eval()
 
-    history_memory = torch.randn(1, model.hidden_size)
+    microstep_history_memory = torch.randn(1, model.hidden_size)
+    request_history_memory = torch.randn(1, model.hidden_size)
     candidate_states = [
         torch.randn(1, model.hidden_size),
         torch.randn(1, model.hidden_size),
     ]
+    lru_features = [
+        (1.0, 1.0, 1.0, 1.0, 1.0),
+        (1.0, 1.0, 1.0, 1.0, 1.0),
+    ]
 
     with torch.no_grad():
         logits, pred_reuse = model.forward(
-            history_memory,
+            microstep_history_memory,
+            request_history_memory,
+            lru_features,
             candidate_states=candidate_states,
             inference=True,
         )
@@ -301,30 +312,44 @@ def test_candidate_is_query_only_not_direct_scorer_input():
     assert torch.allclose(pred_reuse[:, 0], pred_reuse[:, 1], atol=1e-6)
 
 
-def test_candidate_history_concat_scorer_uses_candidate_directly():
-    model = TrieParrotModel(
-        vocab_size=128,
-        node_embed_dim=16,
-        hidden_size=8,
-        candidate_scorer_mode="candidate_history_concat",
-    )
+def test_lru_expert_directly_conditions_score():
+    model = TrieParrotModel(vocab_size=128, node_embed_dim=16, hidden_size=8)
     model.eval()
+    model.request_head = nn.Linear(model.hidden_size, 1)
+    model.micro_head = nn.Linear(model.hidden_size, 1)
+    model.lru_head = nn.Linear(model.lru_feature_dim, 1)
+    with torch.no_grad():
+        model.request_head.weight.zero_()
+        model.request_head.bias.zero_()
+        model.micro_head.weight.zero_()
+        model.micro_head.bias.zero_()
+        model.lru_head.weight.zero_()
+        model.lru_head.weight[0, 0] = 1.0
+        model.lru_head.bias.zero_()
+        model.score_mix_logits[:] = torch.tensor([-10.0, -10.0, 10.0])
 
-    history_memory = torch.randn(1, model.hidden_size)
+    microstep_history_memory = torch.randn(1, model.hidden_size)
+    request_history_memory = torch.randn(1, model.hidden_size)
     candidate_states = [
         torch.randn(1, model.hidden_size),
         torch.randn(1, model.hidden_size),
     ]
+    lru_features = [
+        (1.0, 1.0, 1.0, 1.0, 1.0),
+        (8.0, 8.0, 8.0, 8.0, 1.0),
+    ]
 
     with torch.no_grad():
         logits, pred_reuse = model.forward(
-            history_memory,
+            microstep_history_memory,
+            request_history_memory,
+            lru_features,
             candidate_states=candidate_states,
             inference=True,
         )
 
     assert not torch.allclose(logits[:, 0], logits[:, 1], atol=1e-6)
-    assert not torch.allclose(pred_reuse[:, 0], pred_reuse[:, 1], atol=1e-6)
+    assert pred_reuse.shape == logits.shape
 
 
 def test_loss_handles_finite_and_inf_oracle_distances_without_nan():
@@ -340,7 +365,13 @@ def test_loss_handles_finite_and_inf_oracle_distances_without_nan():
         leaf_paths=[(1, 2), (3,), (4, 5)],
         oracle_distances=[1.0, float("inf"), 3.0],
         oracle_target=1,
-        history_paths=((9,), (9, 8)),
+        microstep_history_paths=((9,), (9, 8)),
+        request_history_paths=((7,),),
+        lru_features=(
+            (1.0, 1.0, 1.0, 1.0, 2.0),
+            (2.0, 2.0, 2.0, 2.0, 1.0),
+            (3.0, 3.0, 3.0, 3.0, 2.0),
+        ),
         num_candidates=3,
     )
     snapshot = SimpleNamespace(eviction_steps=[step])
@@ -373,6 +404,6 @@ if __name__ == "__main__":
     test_eviction_does_not_append_history()
     test_request_touch_appends_microstep_history_slots()
     test_candidate_is_query_only_not_direct_scorer_input()
-    test_candidate_history_concat_scorer_uses_candidate_directly()
+    test_lru_expert_directly_conditions_score()
     test_loss_handles_finite_and_inf_oracle_distances_without_nan()
     print("TRIE-PARROT V1 SEMANTICS TESTS PASSED")

@@ -161,7 +161,13 @@ def test_rank_eval_metrics_are_logged_fields_and_finite():
     model = TrieParrotModel(vocab_size=128, node_embed_dim=16, hidden_size=32)
     step = SimpleNamespace(
         leaf_paths=[(1,), (2,), (3,)],
-        history_paths=((9,), (9, 8)),
+        microstep_history_paths=((9,), (9, 8)),
+        request_history_paths=((7,),),
+        lru_features=(
+            (1.0, 1.0, 1.0, 1.0, 1.0),
+            (2.0, 2.0, 2.0, 2.0, 1.0),
+            (3.0, 3.0, 3.0, 3.0, 1.0),
+        ),
         oracle_distances=[1.0, 10.0, float("inf")],
         oracle_target=2,
         num_candidates=3,
@@ -216,7 +222,7 @@ def test_microstep_window_batches_are_32_by_40_and_consecutive():
     assert [step.step_id for step in last_window] == list(range(40, 80))
 
 
-def test_full_dagger_config_uses_history_only_scorer():
+def test_full_dagger_config_uses_lru_trie_fields():
     config_path = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
         "configs",
@@ -225,7 +231,10 @@ def test_full_dagger_config_uses_history_only_scorer():
     with open(config_path) as f:
         config = json.load(f)
 
-    assert config.get("candidate_scorer_mode") == "history_only"
+    assert "candidate_scorer_mode" not in config
+    assert config.get("max_request_history") == 30
+    assert config.get("max_microstep_history") == 30
+    assert config.get("lru_feature_dim") == 5
 
 
 def test_full_parrot_like_config_uses_parrot_window_shape():
@@ -237,8 +246,12 @@ def test_full_parrot_like_config_uses_parrot_window_shape():
     with open(config_path) as f:
         config = json.load(f)
 
-    assert config.get("batch_size") == 32
+    assert config.get("batch_size") == 16
     assert config.get("sequence_length") == 40
+    assert "candidate_scorer_mode" not in config
+    assert config.get("max_request_history") == 30
+    assert config.get("max_microstep_history") == 30
+    assert config.get("lru_feature_dim") == 5
 
 
 if __name__ == "__main__":
@@ -248,6 +261,6 @@ if __name__ == "__main__":
     test_round_budget_limits_each_collect_round()
     test_rank_eval_metrics_are_logged_fields_and_finite()
     test_microstep_window_batches_are_32_by_40_and_consecutive()
-    test_full_dagger_config_uses_history_only_scorer()
+    test_full_dagger_config_uses_lru_trie_fields()
     test_full_parrot_like_config_uses_parrot_window_shape()
     print("TRIE TRAINING METRIC LOGGING TESTS PASSED")

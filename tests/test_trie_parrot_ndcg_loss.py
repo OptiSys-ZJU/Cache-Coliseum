@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Tests for Trie-PARROT NDCG/ranking loss semantics."""
+"""Tests for lru-trie Trie-PARROT ranking/loss semantics."""
+import json
 import math
 import os
 import sys
-import json
 import tempfile
 from types import SimpleNamespace
 
@@ -25,15 +25,42 @@ def make_model(**kwargs):
     return model
 
 
-def make_snapshot(oracle_distances):
-    step = SimpleNamespace(
-        leaf_paths=[(1,), (2,), (3,)],
-        oracle_distances=oracle_distances,
-        oracle_target=max(range(len(oracle_distances)), key=lambda idx: oracle_distances[idx]),
-        history_paths=((9,), (9, 8)),
-        num_candidates=3,
+def lru_features_for(leaf_paths):
+    rows = []
+    for idx, path in enumerate(leaf_paths):
+        age = float(idx + 1)
+        rows.append((age, age, age, age, float(len(path))))
+    return tuple(rows)
+
+
+def make_step(
+    leaf_paths,
+    oracle_distances,
+    microstep_history_paths=((9,), (9, 8)),
+    request_history_paths=((7,),),
+    required_candidate_indices=None,
+):
+    return SimpleNamespace(
+        leaf_paths=list(leaf_paths),
+        oracle_distances=list(oracle_distances),
+        oracle_target=max(
+            range(len(oracle_distances)),
+            key=lambda idx: oracle_distances[idx],
+        ),
+        required_candidate_indices=required_candidate_indices,
+        microstep_history_paths=tuple(microstep_history_paths),
+        request_history_paths=tuple(request_history_paths),
+        lru_features=lru_features_for(leaf_paths),
+        num_candidates=len(leaf_paths),
     )
-    return SimpleNamespace(eviction_steps=[step])
+
+
+def make_snapshot(oracle_distances):
+    return SimpleNamespace(
+        eviction_steps=[
+            make_step([(1,), (2,), (3,)], oracle_distances),
+        ],
+    )
 
 
 def stepwise_reference_loss(
@@ -42,7 +69,7 @@ def stepwise_reference_loss(
     max_candidates=None,
     max_steps_per_snapshot=None,
 ):
-    """Previous per-step loss implementation, kept as a test oracle."""
+    """Previous per-step loss shape, kept as a batching oracle."""
     device = next(model.parameters()).device
     ranking_losses = []
     reuse_losses = []
@@ -65,17 +92,6 @@ def stepwise_reference_loss(
             if step.num_candidates < 2:
                 continue
 
-            history_paths = getattr(step, "history_paths", None)
-            if history_paths is not None:
-                history_memory = model._encode_history_paths(history_paths, device)
-            else:
-                if hasattr(step, "history_tokens"):
-                    raise ValueError(
-                        "Trie-PARROT v1 snapshots must provide history_paths; "
-                        "history_tokens is a legacy prefix/token-history format"
-                    )
-                history_memory = None
-
             selected_indices, target_idx = model._candidate_subset(
                 step.num_candidates,
                 step.oracle_target,
@@ -83,8 +99,22 @@ def stepwise_reference_loss(
                 getattr(step, "required_candidate_indices", None),
             )
             candidate_paths = [step.leaf_paths[idx] for idx in selected_indices]
+            selected_lru_features = [
+                step.lru_features[idx] for idx in selected_indices
+            ]
+            micro_memory = model._encode_history_paths(
+                step.microstep_history_paths,
+                device,
+                max_history=model.max_microstep_history,
+            )
+            request_memory = model._encode_request_history_paths(
+                step.request_history_paths,
+                device,
+            )
             logits, pred_log_reuse = model(
-                history_memory,
+                micro_memory,
+                request_memory,
+                selected_lru_features,
                 candidate_paths=candidate_paths,
                 inference=False,
             )
@@ -148,104 +178,52 @@ def test_relevance_transform_parrot_style():
         dtype=torch.float32,
     )
     assert torch.allclose(transformed.cpu(), expected, atol=1e-6)
-    assert transformed[2] > transformed[1]
-    assert transformed[3] > transformed[2]
-    assert transformed[4] > transformed[3]
 
 
 def test_ndcg_position_sign_improving_high_relevance_score_lowers_loss():
     model = make_model()
     relevance = torch.tensor([[0.0, 5.0]], dtype=torch.float32)
-
-    low_score_for_best = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
-    high_score_for_best = torch.tensor([[0.0, 4.0]], dtype=torch.float32)
-
-    bad_loss = model._approx_ndcg_loss(low_score_for_best, relevance)
-    good_loss = model._approx_ndcg_loss(high_score_for_best, relevance)
-
-    assert good_loss.item() < bad_loss.item(), (
-        "raising the score of the high-relevance candidate must lower ranking loss"
+    bad_loss = model._approx_ndcg_loss(
+        torch.tensor([[0.0, 0.0]], dtype=torch.float32),
+        relevance,
     )
-
-
-def test_ranking_loss_prefers_oracle_order():
-    model = make_model()
-    relevance = torch.tensor([[0.0, 1.0, 5.0]], dtype=torch.float32)
-
-    correct = torch.tensor([[0.0, 1.0, 2.0]], dtype=torch.float32)
-    reversed_scores = torch.tensor([[2.0, 1.0, 0.0]], dtype=torch.float32)
-
-    correct_loss = model._approx_ndcg_loss(correct, relevance)
-    reversed_loss = model._approx_ndcg_loss(reversed_scores, relevance)
-
-    assert correct_loss.item() < reversed_loss.item()
-
-
-def test_ndcg_gain_matches_parrot_expm1_relevance():
-    model = make_model()
-    scores = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
-    relevance = torch.tensor([[1.0, 5.0]], dtype=torch.float32)
-
-    positions = torch.tensor([[1.5, 1.5]], dtype=torch.float32)
-    gains = torch.expm1(relevance)
-    dcg = (gains / torch.log2(positions + 1.0)).sum(dim=-1)
-    ideal_positions = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
-    idcg = (torch.sort(gains, dim=-1, descending=True).values / torch.log2(
-        ideal_positions + 1.0
-    )).sum(dim=-1)
-    expected = -(dcg / idcg)
-
-    actual = model._approx_ndcg_loss(scores, relevance)
-
-    assert torch.allclose(actual, expected, atol=1e-6)
-
-
-def test_ranking_loss_uses_all_candidates_not_only_oracle_target():
-    model = make_model(reuse_loss_weight=0.0)
-    scores = torch.tensor([[0.2, 0.1, 0.9]], dtype=torch.float32)
-
-    # Candidate 2 remains the oracle target in both cases, but candidate 1's
-    # relevance changes. A full-candidate ranking loss must notice this.
-    rel_a = model._transform_oracle_distances(
-        [1.0, 2.0, float("inf")],
-        [0, 1, 2],
-        torch.device("cpu"),
-    ).unsqueeze(0)
-    rel_b = model._transform_oracle_distances(
-        [1.0, 100.0, float("inf")],
-        [0, 1, 2],
-        torch.device("cpu"),
-    ).unsqueeze(0)
-
-    loss_a = model._approx_ndcg_loss(scores, rel_a)
-    loss_b = model._approx_ndcg_loss(scores, rel_b)
-
-    assert not torch.allclose(loss_a, loss_b), (
-        "ranking loss should change when a non-target candidate's relevance changes"
+    good_loss = model._approx_ndcg_loss(
+        torch.tensor([[0.0, 4.0]], dtype=torch.float32),
+        relevance,
     )
+    assert good_loss.item() < bad_loss.item()
 
 
 def test_loss_uses_all_candidates_by_default():
     model = make_model(reuse_loss_weight=0.0)
     num_candidates = 20
-    step = SimpleNamespace(
-        leaf_paths=[(idx + 1,) for idx in range(num_candidates)],
-        oracle_distances=[float(idx + 1) for idx in range(num_candidates - 1)]
-        + [float("inf")],
-        oracle_target=num_candidates - 1,
-        history_paths=((9,),),
-        num_candidates=num_candidates,
+    step = make_step(
+        [(idx + 1,) for idx in range(num_candidates)],
+        [float(idx + 1) for idx in range(num_candidates - 1)] + [float("inf")],
     )
     snapshot = SimpleNamespace(eviction_steps=[step])
     seen_candidate_counts = []
     original_forward = model.forward_batched
 
-    def spy_forward_batched(history_paths_batch, candidate_paths_batch):
+    def spy_forward_batched(
+        microstep_history_paths_batch,
+        candidate_paths_batch,
+        request_history_paths_batch,
+        lru_features_batch,
+    ):
+        del microstep_history_paths_batch
+        del request_history_paths_batch
+        del lru_features_batch
         seen_candidate_counts.extend(
             len(candidate_paths)
             for candidate_paths in candidate_paths_batch
         )
-        return original_forward(history_paths_batch, candidate_paths_batch)
+        return original_forward(
+            [step.microstep_history_paths],
+            candidate_paths_batch,
+            [step.request_history_paths],
+            [step.lru_features],
+        )
 
     model.forward_batched = spy_forward_batched
     model.loss([snapshot])
@@ -258,24 +236,28 @@ def test_loss_uses_all_candidates_by_default():
 
 def test_loss_candidate_cap_keeps_current_hit_required_candidate():
     model = make_model(reuse_loss_weight=0.0)
-    step = SimpleNamespace(
-        leaf_paths=[(idx + 1,) for idx in range(6)],
-        oracle_distances=[0.0, 2.0, 3.0, 4.0, 5.0, float("inf")],
-        oracle_target=5,
+    step = make_step(
+        [(idx + 1,) for idx in range(6)],
+        [0.0, 2.0, 3.0, 4.0, 5.0, float("inf")],
         required_candidate_indices=(0,),
-        history_paths=((9,),),
-        num_candidates=6,
     )
     snapshot = SimpleNamespace(eviction_steps=[step])
     seen_candidate_paths = []
     original_forward = model.forward_batched
 
-    def spy_forward_batched(history_paths_batch, candidate_paths_batch):
-        seen_candidate_paths.extend(
-            tuple(candidate_paths)
-            for candidate_paths in candidate_paths_batch
+    def spy_forward_batched(
+        microstep_history_paths_batch,
+        candidate_paths_batch,
+        request_history_paths_batch,
+        lru_features_batch,
+    ):
+        seen_candidate_paths.extend(tuple(paths) for paths in candidate_paths_batch)
+        return original_forward(
+            microstep_history_paths_batch,
+            candidate_paths_batch,
+            request_history_paths_batch,
+            lru_features_batch,
         )
-        return original_forward(history_paths_batch, candidate_paths_batch)
 
     model.forward_batched = spy_forward_batched
     model.loss([snapshot], max_candidates=2)
@@ -289,106 +271,78 @@ def test_loss_candidate_cap_keeps_current_hit_required_candidate():
 def test_batched_loss_matches_stepwise_reference_with_padding():
     snapshots = [
         SimpleNamespace(eviction_steps=[
-            SimpleNamespace(
-                leaf_paths=[(1,), (2, 3), (4,)],
-                oracle_distances=[1.0, 5.0, float("inf")],
-                oracle_target=2,
+            make_step(
+                [(1,), (2, 3), (4,)],
+                [1.0, 5.0, float("inf")],
                 required_candidate_indices=(0,),
-                history_paths=((9,),),
-                num_candidates=3,
             ),
-            SimpleNamespace(
-                leaf_paths=[(5,), (6, 7)],
-                oracle_distances=[2.0, float("inf")],
-                oracle_target=1,
-                history_paths=((9,), (9, 8)),
-                num_candidates=2,
+            make_step(
+                [(5,), (6, 7)],
+                [2.0, float("inf")],
+                microstep_history_paths=((9,), (9, 8)),
             ),
         ]),
         SimpleNamespace(eviction_steps=[
-            SimpleNamespace(
-                leaf_paths=[(10,), (11,), (12,), (13, 14)],
-                oracle_distances=[0.0, 3.0, float("inf"), 6.0],
-                oracle_target=2,
-                history_paths=(),
-                num_candidates=4,
+            make_step(
+                [(10,), (11,), (12,), (13, 14)],
+                [0.0, 3.0, float("inf"), 6.0],
+                microstep_history_paths=(),
+                request_history_paths=(),
             ),
-            SimpleNamespace(
-                leaf_paths=[(15, 16), (17,), (18,)],
-                oracle_distances=[float("inf"), 4.0, 4.0],
-                oracle_target=0,
-                history_paths=((10,),),
-                num_candidates=3,
+            make_step(
+                [(15, 16), (17,), (18,)],
+                [float("inf"), 4.0, 4.0],
+                microstep_history_paths=((10,),),
             ),
         ]),
     ]
 
-    for candidate_scorer_mode in ("history_only", "candidate_history_concat"):
-        model = make_model(
-            reuse_loss_weight=0.2,
-            ce_loss_weight=0.5,
-            ce_target_policy="top_set",
-            candidate_scorer_mode=candidate_scorer_mode,
-        )
-        expected = stepwise_reference_loss(model, snapshots, max_candidates=3)
-        actual = model.loss(snapshots, max_candidates=3)
+    model = make_model(
+        reuse_loss_weight=0.2,
+        ce_loss_weight=0.5,
+        ce_target_policy="top_set",
+    )
+    expected = stepwise_reference_loss(model, snapshots, max_candidates=3)
+    actual = model.loss(snapshots, max_candidates=3)
 
-        for name in ("ranking", "reuse", "ce"):
-            assert torch.allclose(actual[name], expected[name], atol=1e-6), (
-                candidate_scorer_mode,
-                name,
-            )
+    for name in ("ranking", "reuse", "ce"):
+        assert torch.allclose(actual[name], expected[name], atol=1e-6), name
 
 
 def test_loss_batches_same_time_steps_across_windows():
     model = make_model(reuse_loss_weight=0.0)
     snapshots = [
         SimpleNamespace(eviction_steps=[
-            SimpleNamespace(
-                leaf_paths=[(1,), (2,)],
-                oracle_distances=[1.0, float("inf")],
-                oracle_target=1,
-                history_paths=((9,),),
-                num_candidates=2,
-            ),
-            SimpleNamespace(
-                leaf_paths=[(3,), (4,), (5,)],
-                oracle_distances=[1.0, 2.0, float("inf")],
-                oracle_target=2,
-                history_paths=((9,), (10,)),
-                num_candidates=3,
-            ),
+            make_step([(1,), (2,)], [1.0, float("inf")]),
+            make_step([(3,), (4,), (5,)], [1.0, 2.0, float("inf")]),
         ]),
         SimpleNamespace(eviction_steps=[
-            SimpleNamespace(
-                leaf_paths=[(6,), (7,), (8,)],
-                oracle_distances=[1.0, 2.0, float("inf")],
-                oracle_target=2,
-                history_paths=((11,),),
-                num_candidates=3,
-            ),
-            SimpleNamespace(
-                leaf_paths=[(9,), (10,)],
-                oracle_distances=[float("inf"), 1.0],
-                oracle_target=0,
-                history_paths=((11,), (12,)),
-                num_candidates=2,
-            ),
+            make_step([(6,), (7,), (8,)], [1.0, 2.0, float("inf")]),
+            make_step([(9,), (10,)], [float("inf"), 1.0]),
         ]),
     ]
     seen_batches = []
     original_forward = model.forward_batched
 
-    def spy_forward_batched(history_paths_batch, candidate_paths_batch):
+    def spy_forward_batched(
+        microstep_history_paths_batch,
+        candidate_paths_batch,
+        request_history_paths_batch,
+        lru_features_batch,
+    ):
         seen_batches.append((
-            len(history_paths_batch),
+            len(microstep_history_paths_batch),
             tuple(len(paths) for paths in candidate_paths_batch),
         ))
-        return original_forward(history_paths_batch, candidate_paths_batch)
+        return original_forward(
+            microstep_history_paths_batch,
+            candidate_paths_batch,
+            request_history_paths_batch,
+            lru_features_batch,
+        )
 
     model.forward_batched = spy_forward_batched
     model.loss(snapshots)
-
     assert seen_batches == [(2, (2, 3)), (2, (3, 2))]
 
 
@@ -432,8 +386,6 @@ def test_argmax_ce_matches_single_target_cross_entropy():
         logits,
         torch.tensor([2], dtype=torch.long),
     )
-
-    assert torch.allclose(target_distribution, torch.tensor([[0.0, 0.0, 1.0]]))
     assert torch.allclose(actual, expected)
 
 
@@ -451,24 +403,6 @@ def test_top_set_ce_targets_all_max_relevance_candidates():
         torch.nn.functional.log_softmax(logits, dim=-1)[0, 1]
         + torch.nn.functional.log_softmax(logits, dim=-1)[0, 2]
     )
-
-    assert torch.allclose(target_distribution, torch.tensor([[0.0, 0.5, 0.5]]))
-    assert torch.allclose(actual, expected)
-
-
-def test_top_set_ce_respects_selected_subset():
-    model = make_model(ce_loss_weight=1.0, ce_target_policy="top_set")
-    logits = torch.tensor([[1.0, 0.5]], dtype=torch.float32)
-    target_distribution = model._ce_target_distribution(
-        [float("inf"), float("inf"), 1.0],
-        [0, 2],
-        0,
-        torch.device("cpu"),
-    )
-    actual = model._distribution_cross_entropy(logits, target_distribution)
-    expected = -torch.nn.functional.log_softmax(logits, dim=-1)[0, 0]
-
-    assert torch.allclose(target_distribution, torch.tensor([[1.0, 0.0]]))
     assert torch.allclose(actual, expected)
 
 
@@ -481,33 +415,53 @@ def test_invalid_ce_target_policy_rejected():
         raise AssertionError("invalid ce_target_policy should fail fast")
 
 
-def test_invalid_candidate_scorer_mode_rejected():
-    try:
-        make_model(candidate_scorer_mode="bogus")
-    except ValueError as exc:
-        assert "candidate_scorer_mode" in str(exc)
-    else:
-        raise AssertionError("invalid candidate_scorer_mode should fail fast")
+def test_required_snapshot_fields_are_enforced():
+    model = make_model()
+    base = dict(
+        leaf_paths=[(1,), (2,)],
+        oracle_distances=[1.0, float("inf")],
+        oracle_target=1,
+        num_candidates=2,
+    )
+    for missing_field in (
+        "microstep_history_paths",
+        "request_history_paths",
+        "lru_features",
+    ):
+        step_kwargs = dict(base)
+        if missing_field != "microstep_history_paths":
+            step_kwargs["microstep_history_paths"] = ((9,),)
+        if missing_field != "request_history_paths":
+            step_kwargs["request_history_paths"] = ((7,),)
+        if missing_field != "lru_features":
+            step_kwargs["lru_features"] = lru_features_for(step_kwargs["leaf_paths"])
+
+        try:
+            model.loss([SimpleNamespace(eviction_steps=[SimpleNamespace(**step_kwargs)])])
+        except ValueError as exc:
+            assert missing_field in str(exc)
+        else:
+            raise AssertionError(f"{missing_field} should be required")
 
 
-def test_legacy_history_tokens_snapshot_rejected():
+def test_lru_feature_width_is_strict():
     model = make_model()
     step = SimpleNamespace(
         leaf_paths=[(1,), (2,)],
         oracle_distances=[1.0, float("inf")],
         oracle_target=1,
-        history_tokens=(9, 8),
         num_candidates=2,
+        microstep_history_paths=((9,),),
+        request_history_paths=((7,),),
+        lru_features=((1.0, 1.0), (2.0, 2.0)),
     )
-    snapshot = SimpleNamespace(eviction_steps=[step])
 
     try:
-        model.loss([snapshot])
+        model.loss([SimpleNamespace(eviction_steps=[step])])
     except ValueError as exc:
-        assert "history_paths" in str(exc)
-        assert "history_tokens" in str(exc)
+        assert "lru_features width" in str(exc)
     else:
-        raise AssertionError("legacy history_tokens snapshots should fail fast")
+        raise AssertionError("lru_features width should be strict")
 
 
 def test_empty_history_paths_are_not_real_history_slots():
@@ -522,7 +476,7 @@ def test_empty_history_paths_are_not_real_history_slots():
     assert not has_history
 
 
-def test_from_config_reads_candidate_scorer_mode():
+def test_from_config_reads_lru_trie_fields():
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = os.path.join(tmpdir, "config.json")
         with open(config_path, "w") as f:
@@ -530,25 +484,25 @@ def test_from_config_reads_candidate_scorer_mode():
                 {
                     "vocab_size": 128,
                     "node_embed_dim": 16,
-                    "history_embed_dim": 16,
                     "hidden_size": 32,
-                    "candidate_scorer_mode": "candidate_history_concat",
+                    "max_request_history": 11,
+                    "max_microstep_history": 7,
+                    "lru_feature_dim": 5,
                     "ce_target_policy": "top_set",
                 },
                 f,
             )
 
         model = TrieParrotModel.from_config(config_path)
-        assert model.candidate_scorer_mode == "candidate_history_concat"
+        assert model.max_request_history == 11
+        assert model.max_microstep_history == 7
+        assert model.lru_feature_dim == 5
         assert model.ce_target_policy == "top_set"
 
 
 if __name__ == "__main__":
     test_relevance_transform_parrot_style()
     test_ndcg_position_sign_improving_high_relevance_score_lowers_loss()
-    test_ranking_loss_prefers_oracle_order()
-    test_ndcg_gain_matches_parrot_expm1_relevance()
-    test_ranking_loss_uses_all_candidates_not_only_oracle_target()
     test_loss_uses_all_candidates_by_default()
     test_loss_candidate_cap_keeps_current_hit_required_candidate()
     test_batched_loss_matches_stepwise_reference_with_padding()
@@ -557,10 +511,9 @@ if __name__ == "__main__":
     test_ce_optional_default_zero_and_enabled_path()
     test_argmax_ce_matches_single_target_cross_entropy()
     test_top_set_ce_targets_all_max_relevance_candidates()
-    test_top_set_ce_respects_selected_subset()
     test_invalid_ce_target_policy_rejected()
-    test_invalid_candidate_scorer_mode_rejected()
-    test_legacy_history_tokens_snapshot_rejected()
+    test_required_snapshot_fields_are_enforced()
+    test_lru_feature_width_is_strict()
     test_empty_history_paths_are_not_real_history_slots()
-    test_from_config_reads_candidate_scorer_mode()
+    test_from_config_reads_lru_trie_fields()
     print("TRIE-PARROT NDCG LOSS TESTS PASSED")

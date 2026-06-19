@@ -68,7 +68,7 @@ def collect_snapshots(
 
 
 def flatten_eviction_steps(snapshots, max_steps: int = None):
-    """Flatten compatible training-step containers named eviction_steps."""
+    """Flatten collected training-step containers named eviction_steps."""
     steps = []
     for snapshot in snapshots:
         for step in snapshot.eviction_steps:
@@ -174,10 +174,21 @@ def compute_rank_eval_metrics(model: TrieParrotModel, eviction_steps):
     model.eval()
     with torch.no_grad():
         for step in eviction_steps:
-            history_paths = getattr(step, "history_paths", None)
-            history_memory = model._encode_history_paths(history_paths, device)
+            microstep_history_paths = getattr(step, "microstep_history_paths")
+            request_history_paths = getattr(step, "request_history_paths")
+            microstep_history_memory = model._encode_history_paths(
+                microstep_history_paths,
+                device,
+                max_history=model.max_microstep_history,
+            )
+            request_history_memory = model._encode_request_history_paths(
+                request_history_paths,
+                device,
+            )
             logits, _ = model(
-                history_memory,
+                microstep_history_memory,
+                request_history_memory,
+                step.lru_features,
                 candidate_paths=step.leaf_paths,
                 inference=False,
             )
@@ -494,7 +505,6 @@ if __name__ == '__main__':
     reuse_loss_weight = config.get('reuse_loss_weight', 0.1)
     ce_loss_weight = config.get('ce_loss_weight', 0.0)
     ce_target_policy = config.get('ce_target_policy', 'argmax')
-    candidate_scorer_mode = config.get('candidate_scorer_mode', 'history_only')
     reuse_distance_log_cap = config.get('reuse_distance_log_cap', 5.0)
     ndcg_alpha = config.get('ndcg_alpha', 10.0)
 
@@ -521,7 +531,6 @@ if __name__ == '__main__':
         "TrieParrot: loss weights "
         f"ranking={ranking_loss_weight} reuse={reuse_loss_weight} ce={ce_loss_weight} "
         f"ce_target_policy={ce_target_policy} "
-        f"candidate_scorer_mode={candidate_scorer_mode} "
         f"reuse_distance_log_cap={reuse_distance_log_cap} ndcg_alpha={ndcg_alpha}"
     )
     print(f'TrieParrot: DAgger init={dagger_init}, final={dagger_final}, '
@@ -571,14 +580,15 @@ if __name__ == '__main__':
     model = TrieParrotModel(
         vocab_size=vocab_size,
         node_embed_dim=config.get('node_embed_dim', 64),
-        history_embed_dim=config.get('history_embed_dim', 64),
         hidden_size=config.get('hidden_size', 128),
         max_attention_history=config.get('max_attention_history', 30),
+        max_request_history=config.get('max_request_history'),
+        max_microstep_history=config.get('max_microstep_history'),
+        lru_feature_dim=config.get('lru_feature_dim', 5),
         ranking_loss_weight=ranking_loss_weight,
         reuse_loss_weight=reuse_loss_weight,
         ce_loss_weight=ce_loss_weight,
         ce_target_policy=ce_target_policy,
-        candidate_scorer_mode=candidate_scorer_mode,
         reuse_distance_log_cap=reuse_distance_log_cap,
         ndcg_alpha=ndcg_alpha,
     ).to(device)

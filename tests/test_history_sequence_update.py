@@ -10,7 +10,7 @@ from cache.trie.trie_cache import TrieTrainingCache
 from model.trie_model.model import TrieParrotModel
 
 
-def assert_history_paths(actual, expected, label):
+def assert_microstep_history_paths(actual, expected, label):
     assert list(actual) == expected, f"{label}: expected {expected}, got {list(actual)}"
 
 
@@ -24,49 +24,49 @@ long_sequence = [7, 8, 9]
 # Inference path: TrieModelPredictAlgorithm.access()
 alg = TrieModelPredictAlgorithm(max_node_num=20, model=model)
 alg.access(first_sequence)
-assert_history_paths(
-    alg.history_path_window,
+assert_microstep_history_paths(
+    alg.microstep_history_path_window,
     [(1,), (1, 2)],
     "predict algorithm",
 )
 alg.access(second_sequence)
-assert_history_paths(
-    alg.history_path_window,
+assert_microstep_history_paths(
+    alg.microstep_history_path_window,
     [(1,), (1, 2), (3,), (3, 4)],
     "predict algorithm second request",
 )
-assert alg.history_state is None, "Trie-PARROT v1 should not update legacy token history state"
+assert not hasattr(alg, "history_state")
 
 # Training path: TrieTrainingCache.collect()
 train_cache = TrieTrainingCache(max_node_num=20, model=model)
 train_cache.collect(first_sequence)
-assert_history_paths(
-    train_cache.alg.history_path_window,
+assert_microstep_history_paths(
+    train_cache.alg.microstep_history_path_window,
     [(1,), (1, 2)],
     "training cache",
 )
 train_cache.collect(second_sequence)
-assert_history_paths(
-    train_cache.alg.history_path_window,
+assert_microstep_history_paths(
+    train_cache.alg.microstep_history_path_window,
     [(1,), (1, 2), (3,), (3, 4)],
     "training cache second request",
 )
-assert train_cache.alg.history_state is None
+assert not hasattr(train_cache.alg, "history_state")
 
 # Long requests should record each cache-visible prefix on both inference and
 # training paths.
 small_alg = TrieModelPredictAlgorithm(max_node_num=2, model=model)
 small_alg.access(long_sequence)
-assert_history_paths(
-    small_alg.history_path_window,
+assert_microstep_history_paths(
+    small_alg.microstep_history_path_window,
     [(7,), (7, 8)],
     "predict algorithm long request",
 )
 
 small_train_cache = TrieTrainingCache(max_node_num=2, model=model)
 small_train_cache.collect(long_sequence)
-assert_history_paths(
-    small_train_cache.alg.history_path_window,
+assert_microstep_history_paths(
+    small_train_cache.alg.microstep_history_path_window,
     [(7,), (7, 8)],
     "training cache long request",
 )

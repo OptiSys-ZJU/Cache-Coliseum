@@ -19,14 +19,25 @@ step1 = SimpleNamespace()
 step1.leaf_paths = [(1, 2, 3), (1, 2, 4), (1, 2, 5)]
 step1.oracle_target = 2
 step1.num_candidates = 3
-step1.history_paths = ((9,), (9, 9), (9, 9, 9))
+step1.microstep_history_paths = ((9,), (9, 9), (9, 9, 9))
+step1.request_history_paths = ((7,),)
+step1.lru_features = (
+    (1.0, 1.0, 1.0, 1.0, 3.0),
+    (2.0, 2.0, 2.0, 2.0, 3.0),
+    (3.0, 3.0, 3.0, 3.0, 3.0),
+)
 step1.oracle_distances = [1.0, 2.0, float("inf")]
 
 step2 = SimpleNamespace()
 step2.leaf_paths = [(1, 2, 4), (1, 2, 5)]
 step2.oracle_target = 1
 step2.num_candidates = 2
-step2.history_paths = ((8,), (8, 8))
+step2.microstep_history_paths = ((8,), (8, 8))
+step2.request_history_paths = ((6,),)
+step2.lru_features = (
+    (1.0, 1.0, 1.0, 1.0, 3.0),
+    (2.0, 2.0, 2.0, 2.0, 3.0),
+)
 step2.oracle_distances = [3.0, float("inf")]
 
 snapshot = SimpleNamespace()
@@ -68,23 +79,25 @@ for name, param in model.named_parameters():
 assert path_lstm_has_grad, "path_lstm should receive gradients through loss"
 print("  path_lstm has gradients: True")
 
-# Verify legacy history_lstm is not used in Trie-PARROT v1.
-history_lstm_has_grad = False
-for name, param in model.named_parameters():
-    if "history_lstm" in name and param.grad is not None and param.grad.abs().sum() > 0:
-        history_lstm_has_grad = True
-        break
-assert not history_lstm_has_grad, "history_lstm should not receive gradients in Trie-PARROT v1"
-print("  history_lstm has gradients: False")
+# Verify there is no legacy token-history encoder left in lru-trie.
+assert all(
+    "history_lstm" not in name and "history_proj" not in name
+    for name, _ in model.named_parameters()
+)
+print("  no legacy token-history encoder parameters")
 
-# Verify scorer gets gradients.
-scorer_has_grad = False
+# Verify score heads get gradients.
+expert_head_has_grad = False
 for name, param in model.named_parameters():
-    if "scorer" in name and param.grad is not None and param.grad.abs().sum() > 0:
-        scorer_has_grad = True
+    if (
+        name.startswith(("request_head", "micro_head", "lru_head"))
+        and param.grad is not None
+        and param.grad.abs().sum() > 0
+    ):
+        expert_head_has_grad = True
         break
-assert scorer_has_grad, "scorer should receive gradients"
-print("  scorer has gradients: True")
+assert expert_head_has_grad, "score heads should receive gradients"
+print("  score heads have gradients: True")
 
 # Test with empty snapshots.
 empty_losses = model.loss([])
