@@ -678,6 +678,22 @@ if __name__ == '__main__':
 
             microstep_count = count_microstep_steps(snapshots)
             window_count = count_microstep_windows(snapshots, sequence_length)
+            append_metric_row(metrics_path, {
+                "run_id": run_id,
+                "event": "collection",
+                "step": step,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "train_hr": train_hit_rate,
+                "model_prob": model_prob,
+                "num_snapshots": microstep_count,
+                "full_steps": window_count,
+                "batch_size": batch_size,
+            })
+            print(
+                f"\n  Collection: step={step} train_hr={train_hit_rate:.4f} "
+                f"microsteps={microstep_count} windows={window_count} "
+                f"model_prob={model_prob:.2f}"
+            )
             if window_count == 0:
                 print(
                     'WARNING: Not enough microstep snapshots for one training '
@@ -809,6 +825,15 @@ if __name__ == '__main__':
                     max_steps_per_snapshot=max_loss_steps_per_snapshot,
                 )
                 total_loss = sum(losses.values())
+                if not torch.isfinite(total_loss):
+                    raise RuntimeError(
+                        "Non-finite training loss at "
+                        f"step={step}: "
+                        + ", ".join(
+                            f"{name}={value.item()}"
+                            for name, value in losses.items()
+                        )
+                    )
                 total_loss.backward()
                 optimizer.step()
 

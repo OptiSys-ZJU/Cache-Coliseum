@@ -36,6 +36,104 @@ def make_snapshot(oracle_distances):
     return SimpleNamespace(eviction_steps=[step])
 
 
+def stepwise_reference_loss(
+    model,
+    snapshots,
+    max_candidates=None,
+    max_steps_per_snapshot=None,
+):
+    """Previous per-step loss implementation, kept as a test oracle."""
+    device = next(model.parameters()).device
+    ranking_losses = []
+    reuse_losses = []
+    ce_losses = []
+
+    for snapshot in snapshots:
+        eviction_steps = snapshot.eviction_steps
+        if (
+            max_steps_per_snapshot is not None
+            and len(eviction_steps) > max_steps_per_snapshot
+        ):
+            quota = max(1, max_steps_per_snapshot)
+            stride = len(eviction_steps) / quota
+            eviction_steps = [
+                eviction_steps[min(int(slot * stride), len(eviction_steps) - 1)]
+                for slot in range(quota)
+            ]
+
+        for step in eviction_steps:
+            if step.num_candidates < 2:
+                continue
+
+            history_paths = getattr(step, "history_paths", None)
+            if history_paths is not None:
+                history_memory = model._encode_history_paths(history_paths, device)
+            else:
+                if hasattr(step, "history_tokens"):
+                    raise ValueError(
+                        "Trie-PARROT v1 snapshots must provide history_paths; "
+                        "history_tokens is a legacy prefix/token-history format"
+                    )
+                history_memory = None
+
+            selected_indices, target_idx = model._candidate_subset(
+                step.num_candidates,
+                step.oracle_target,
+                max_candidates,
+                getattr(step, "required_candidate_indices", None),
+            )
+            candidate_paths = [step.leaf_paths[idx] for idx in selected_indices]
+            logits, pred_log_reuse = model(
+                history_memory,
+                candidate_paths=candidate_paths,
+                inference=False,
+            )
+
+            oracle_distances = getattr(step, "oracle_distances", None)
+            if oracle_distances is not None:
+                relevances = model._transform_oracle_distances(
+                    oracle_distances,
+                    selected_indices,
+                    device,
+                ).unsqueeze(0)
+                ranking_losses.append(model._approx_ndcg_loss(logits, relevances))
+
+                if model.reuse_loss_weight > 0:
+                    reuse_losses.append(torch.nn.functional.mse_loss(
+                        pred_log_reuse,
+                        relevances,
+                    ).unsqueeze(0))
+
+            if model.ce_loss_weight > 0:
+                target_distribution = model._ce_target_distribution(
+                    oracle_distances,
+                    selected_indices,
+                    target_idx,
+                    device,
+                )
+                ce_losses.append(
+                    model._distribution_cross_entropy(
+                        logits,
+                        target_distribution,
+                    ).unsqueeze(0)
+                )
+
+    losses = {}
+    if ranking_losses:
+        losses["ranking"] = model.ranking_loss_weight * torch.cat(ranking_losses).mean()
+    else:
+        losses["ranking"] = torch.tensor(0.0, device=device, requires_grad=True)
+    if reuse_losses:
+        losses["reuse"] = model.reuse_loss_weight * torch.cat(reuse_losses).mean()
+    else:
+        losses["reuse"] = torch.tensor(0.0, device=device, requires_grad=True)
+    if ce_losses:
+        losses["ce"] = model.ce_loss_weight * torch.cat(ce_losses).mean()
+    else:
+        losses["ce"] = torch.tensor(0.0, device=device, requires_grad=True)
+    return losses
+
+
 def test_relevance_transform_parrot_style():
     model = make_model()
     distances = [0.0, 1.0, 2.0, 10.0, float("inf")]
@@ -140,13 +238,16 @@ def test_loss_uses_all_candidates_by_default():
     )
     snapshot = SimpleNamespace(eviction_steps=[step])
     seen_candidate_counts = []
-    original_forward = model.forward
+    original_forward = model.forward_batched
 
-    def spy_forward(*args, **kwargs):
-        seen_candidate_counts.append(len(kwargs["candidate_paths"]))
-        return original_forward(*args, **kwargs)
+    def spy_forward_batched(history_paths_batch, candidate_paths_batch):
+        seen_candidate_counts.extend(
+            len(candidate_paths)
+            for candidate_paths in candidate_paths_batch
+        )
+        return original_forward(history_paths_batch, candidate_paths_batch)
 
-    model.forward = spy_forward
+    model.forward_batched = spy_forward_batched
     model.loss([snapshot])
 
     assert seen_candidate_counts == [num_candidates]
@@ -167,19 +268,128 @@ def test_loss_candidate_cap_keeps_current_hit_required_candidate():
     )
     snapshot = SimpleNamespace(eviction_steps=[step])
     seen_candidate_paths = []
-    original_forward = model.forward
+    original_forward = model.forward_batched
 
-    def spy_forward(*args, **kwargs):
-        seen_candidate_paths.append(tuple(kwargs["candidate_paths"]))
-        return original_forward(*args, **kwargs)
+    def spy_forward_batched(history_paths_batch, candidate_paths_batch):
+        seen_candidate_paths.extend(
+            tuple(candidate_paths)
+            for candidate_paths in candidate_paths_batch
+        )
+        return original_forward(history_paths_batch, candidate_paths_batch)
 
-    model.forward = spy_forward
+    model.forward_batched = spy_forward_batched
     model.loss([snapshot], max_candidates=2)
 
     assert seen_candidate_paths == [((1,), (6,))]
     assert model.last_loss_stats["full_steps"] == 0
     assert model.last_loss_stats["capped_steps"] == 1
     assert model.last_loss_stats["candidate_count"] == 2
+
+
+def test_batched_loss_matches_stepwise_reference_with_padding():
+    snapshots = [
+        SimpleNamespace(eviction_steps=[
+            SimpleNamespace(
+                leaf_paths=[(1,), (2, 3), (4,)],
+                oracle_distances=[1.0, 5.0, float("inf")],
+                oracle_target=2,
+                required_candidate_indices=(0,),
+                history_paths=((9,),),
+                num_candidates=3,
+            ),
+            SimpleNamespace(
+                leaf_paths=[(5,), (6, 7)],
+                oracle_distances=[2.0, float("inf")],
+                oracle_target=1,
+                history_paths=((9,), (9, 8)),
+                num_candidates=2,
+            ),
+        ]),
+        SimpleNamespace(eviction_steps=[
+            SimpleNamespace(
+                leaf_paths=[(10,), (11,), (12,), (13, 14)],
+                oracle_distances=[0.0, 3.0, float("inf"), 6.0],
+                oracle_target=2,
+                history_paths=(),
+                num_candidates=4,
+            ),
+            SimpleNamespace(
+                leaf_paths=[(15, 16), (17,), (18,)],
+                oracle_distances=[float("inf"), 4.0, 4.0],
+                oracle_target=0,
+                history_paths=((10,),),
+                num_candidates=3,
+            ),
+        ]),
+    ]
+
+    for candidate_scorer_mode in ("history_only", "candidate_history_concat"):
+        model = make_model(
+            reuse_loss_weight=0.2,
+            ce_loss_weight=0.5,
+            ce_target_policy="top_set",
+            candidate_scorer_mode=candidate_scorer_mode,
+        )
+        expected = stepwise_reference_loss(model, snapshots, max_candidates=3)
+        actual = model.loss(snapshots, max_candidates=3)
+
+        for name in ("ranking", "reuse", "ce"):
+            assert torch.allclose(actual[name], expected[name], atol=1e-6), (
+                candidate_scorer_mode,
+                name,
+            )
+
+
+def test_loss_batches_same_time_steps_across_windows():
+    model = make_model(reuse_loss_weight=0.0)
+    snapshots = [
+        SimpleNamespace(eviction_steps=[
+            SimpleNamespace(
+                leaf_paths=[(1,), (2,)],
+                oracle_distances=[1.0, float("inf")],
+                oracle_target=1,
+                history_paths=((9,),),
+                num_candidates=2,
+            ),
+            SimpleNamespace(
+                leaf_paths=[(3,), (4,), (5,)],
+                oracle_distances=[1.0, 2.0, float("inf")],
+                oracle_target=2,
+                history_paths=((9,), (10,)),
+                num_candidates=3,
+            ),
+        ]),
+        SimpleNamespace(eviction_steps=[
+            SimpleNamespace(
+                leaf_paths=[(6,), (7,), (8,)],
+                oracle_distances=[1.0, 2.0, float("inf")],
+                oracle_target=2,
+                history_paths=((11,),),
+                num_candidates=3,
+            ),
+            SimpleNamespace(
+                leaf_paths=[(9,), (10,)],
+                oracle_distances=[float("inf"), 1.0],
+                oracle_target=0,
+                history_paths=((11,), (12,)),
+                num_candidates=2,
+            ),
+        ]),
+    ]
+    seen_batches = []
+    original_forward = model.forward_batched
+
+    def spy_forward_batched(history_paths_batch, candidate_paths_batch):
+        seen_batches.append((
+            len(history_paths_batch),
+            tuple(len(paths) for paths in candidate_paths_batch),
+        ))
+        return original_forward(history_paths_batch, candidate_paths_batch)
+
+    model.forward_batched = spy_forward_batched
+    model.loss(snapshots)
+
+    assert seen_batches == [(2, (2, 3)), (2, (3, 2))]
 
 
 def test_loss_has_finite_reuse_with_inf_distance():
@@ -341,6 +551,8 @@ if __name__ == "__main__":
     test_ranking_loss_uses_all_candidates_not_only_oracle_target()
     test_loss_uses_all_candidates_by_default()
     test_loss_candidate_cap_keeps_current_hit_required_candidate()
+    test_batched_loss_matches_stepwise_reference_with_padding()
+    test_loss_batches_same_time_steps_across_windows()
     test_loss_has_finite_reuse_with_inf_distance()
     test_ce_optional_default_zero_and_enabled_path()
     test_argmax_ce_matches_single_target_cross_entropy()

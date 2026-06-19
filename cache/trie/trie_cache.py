@@ -172,14 +172,14 @@ class TrieTrainingCache:
         self.snapshots = []
         self._collected_training_steps = 0
     
-    def _reuse_distance(self, path: tuple, include_current: bool = False) -> float:
+    def _reuse_distance(self, path: tuple, include_current: bool = True) -> float:
         """
         Belady oracle: how many request steps until an access matches this leaf's path.
 
         TrieTrainingCache consumes the current request only after all snapshots,
-        evictions, and inserts for that request are processed. Microstep
-        training snapshots opt into include_current=True; executable eviction
-        diagnostics keep the default future-only view.
+        evictions, and inserts for that request are processed. While a request
+        is being handled, oracle queries should see it by default; protected
+        leaves, not strict-future labeling, prevent current-path eviction.
         
         A leaf's path matches a future sequence if the path is a prefix of that sequence.
         Returns float('inf') if this path is never re-accessed.
@@ -214,7 +214,7 @@ class TrieTrainingCache:
     def _oracle_distances(
         self,
         candidates: List[TrieNode],
-        include_current: bool = False,
+        include_current: bool = True,
     ) -> List[float]:
         """Return request-clock reuse distance for each candidate path."""
         return [
@@ -252,7 +252,7 @@ class TrieTrainingCache:
         if not candidates:
             return None
 
-        oracle_distances = self._oracle_distances(candidates, include_current=True)
+        oracle_distances = self._oracle_distances(candidates)
         required_candidate_indices = [
             idx for idx, distance in enumerate(oracle_distances)
             if distance == 0

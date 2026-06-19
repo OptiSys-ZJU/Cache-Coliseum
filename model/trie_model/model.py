@@ -225,6 +225,190 @@ class TrieParrotModel(nn.Module):
         encoded = [self._encode_path(path, device) for path in paths[-limit:]]
         return torch.cat(encoded, dim=0).to(device)
 
+    def _encode_path_batch(
+        self,
+        paths,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Encode many variable-length root-to-node paths in one LSTM pass."""
+        path_list = [tuple(path) for path in paths]
+        batch_size = len(path_list)
+        if batch_size == 0:
+            return torch.zeros(0, self.hidden_size, device=device)
+
+        lengths = torch.tensor(
+            [len(path) for path in path_list],
+            dtype=torch.long,
+            device=device,
+        )
+        max_len = int(lengths.max().item()) if batch_size else 0
+        h = torch.zeros(batch_size, self.hidden_size, device=device)
+        c = torch.zeros(batch_size, self.hidden_size, device=device)
+        if max_len == 0:
+            return h
+
+        path_ids = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
+        for idx, path in enumerate(path_list):
+            if path:
+                path_ids[idx, :len(path)] = torch.tensor(
+                    path,
+                    dtype=torch.long,
+                    device=device,
+                )
+
+        embeddings = self.node_embedder(path_ids)
+        for step_idx in range(max_len):
+            h_new, c_new = self.path_lstm(embeddings[:, step_idx, :], (h, c))
+            active = (lengths > step_idx).unsqueeze(1)
+            h = torch.where(active, h_new, h)
+            c = torch.where(active, c_new, c)
+        return h
+
+    def _encode_history_paths_batch(
+        self,
+        history_paths_batch,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return padded history memory and a valid-slot mask for a step batch."""
+        limit = max(1, self.max_attention_history)
+        prepared = []
+        flat_paths = []
+        max_history = 1
+        for history_paths in history_paths_batch:
+            if history_paths is None:
+                paths = []
+            else:
+                paths = [tuple(path) for path in history_paths][-limit:]
+            prepared.append(paths)
+            flat_paths.extend(paths)
+            max_history = max(max_history, len(paths) if paths else 1)
+
+        encoded = self._encode_path_batch(flat_paths, device)
+        memory = torch.zeros(
+            len(prepared),
+            max_history,
+            self.hidden_size,
+            device=device,
+        )
+        mask = torch.zeros(
+            len(prepared),
+            max_history,
+            dtype=torch.bool,
+            device=device,
+        )
+
+        offset = 0
+        for batch_idx, paths in enumerate(prepared):
+            if not paths:
+                mask[batch_idx, 0] = True
+                continue
+
+            count = len(paths)
+            memory[batch_idx, :count, :] = encoded[offset:offset + count]
+            positions = torch.arange(count, dtype=torch.long, device=device)
+            memory[batch_idx, :count, :] = (
+                memory[batch_idx, :count, :]
+                + self.history_pos_embed(positions)
+            )
+            mask[batch_idx, :count] = True
+            offset += count
+
+        return memory, mask
+
+    def _encode_candidate_paths_batch(
+        self,
+        candidate_paths_batch,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return padded candidate states and a valid-candidate mask."""
+        counts = [len(candidate_paths) for candidate_paths in candidate_paths_batch]
+        max_candidates = max(counts) if counts else 0
+        flat_paths = [
+            tuple(path)
+            for candidate_paths in candidate_paths_batch
+            for path in candidate_paths
+        ]
+        encoded = self._encode_path_batch(flat_paths, device)
+        candidates = torch.zeros(
+            len(candidate_paths_batch),
+            max_candidates,
+            self.hidden_size,
+            device=device,
+        )
+        mask = torch.zeros(
+            len(candidate_paths_batch),
+            max_candidates,
+            dtype=torch.bool,
+            device=device,
+        )
+
+        offset = 0
+        for batch_idx, count in enumerate(counts):
+            if count == 0:
+                continue
+            candidates[batch_idx, :count, :] = encoded[offset:offset + count]
+            mask[batch_idx, :count] = True
+            offset += count
+        return candidates, mask
+
+    def _forward_batched_encoded(
+        self,
+        history_memory: torch.Tensor,
+        history_mask: torch.Tensor,
+        candidate_states: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Score a padded batch of training steps."""
+        queries = self.query_proj(candidate_states)
+        memory_keys = self.key_proj(history_memory)
+
+        scale = self.hidden_size ** 0.5
+        attn_logits = torch.bmm(queries, memory_keys.transpose(1, 2)) / scale
+        attn_logits = attn_logits.masked_fill(~history_mask.unsqueeze(1), -1e9)
+        attn_weights = F.softmax(attn_logits, dim=-1)
+        retrieved_history = torch.bmm(attn_weights, history_memory)
+
+        if self.candidate_scorer_mode == "candidate_history_concat":
+            scorer_input = torch.cat([candidate_states, retrieved_history], dim=-1)
+        else:
+            scorer_input = retrieved_history
+
+        eviction_logits = self.scorer(scorer_input).squeeze(-1)
+        pred_reuse_dist = self.reuse_distance_estimator(scorer_input).squeeze(-1)
+
+        eviction_logits = eviction_logits.masked_fill(~candidate_mask, -1e9)
+        pred_reuse_dist = pred_reuse_dist.masked_fill(~candidate_mask, 0.0)
+        return eviction_logits, pred_reuse_dist
+
+    def forward_batched(
+        self,
+        history_paths_batch,
+        candidate_paths_batch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute training scores for a batch of microsteps.
+
+        This is the Parrot-style path used by loss(): time/windows are still
+        grouped in Python, but all steps at the same window position share one
+        tensorized candidate/history attention pass.
+        """
+        device = next(self.parameters()).device
+        history_memory, history_mask = self._encode_history_paths_batch(
+            history_paths_batch,
+            device,
+        )
+        candidate_states, candidate_mask = self._encode_candidate_paths_batch(
+            candidate_paths_batch,
+            device,
+        )
+        logits, pred_reuse = self._forward_batched_encoded(
+            history_memory,
+            history_mask,
+            candidate_states,
+            candidate_mask,
+        )
+        return logits, pred_reuse, candidate_mask
+
     def forward(
         self,
         history_memory: torch.Tensor,
@@ -441,8 +625,9 @@ class TrieParrotModel(nn.Module):
         """
         Compute training loss from snapshots collected by TrieTrainingCache.
 
-        Mirrors original Parrot: loss() calls self() (forward) directly.
-        forward(inference=False) re-encodes candidate paths with gradient.
+        Mirrors original Parrot's batching shape: time positions are grouped
+        across windows, then candidates/history are padded and scored in one
+        batched attention pass.
         The snapshot field eviction_steps is a compatibility name; entries may
         be microstep cache-state training steps rather than eviction events.
         """
@@ -456,6 +641,7 @@ class TrieParrotModel(nn.Module):
             "candidate_count": 0,
         }
 
+        step_windows = []
         for snapshot in snapshots:
             eviction_steps = snapshot.eviction_steps
             if (
@@ -469,20 +655,19 @@ class TrieParrotModel(nn.Module):
                     for slot in range(quota)
                 ]
 
+            prepared_steps = []
             for step in eviction_steps:
                 if step.num_candidates < 2:
+                    prepared_steps.append(None)
                     continue
 
                 history_paths = getattr(step, "history_paths", None)
-                if history_paths is not None:
-                    history_memory = self._encode_history_paths(history_paths, device)
-                else:
+                if history_paths is None:
                     if hasattr(step, "history_tokens"):
                         raise ValueError(
                             "Trie-PARROT v1 snapshots must provide history_paths; "
                             "history_tokens is a legacy prefix/token-history format"
                         )
-                    history_memory = None
 
                 selected_indices, target_idx = self._candidate_subset(
                     step.num_candidates,
@@ -497,34 +682,103 @@ class TrieParrotModel(nn.Module):
                 stats["candidate_count"] += len(selected_indices)
 
                 candidate_paths = [step.leaf_paths[idx] for idx in selected_indices]
-                logits, pred_log_reuse = self(
-                    history_memory,
-                    candidate_paths=candidate_paths,
-                    inference=False,
-                )
-
                 oracle_distances = getattr(step, "oracle_distances", None)
+                relevances = None
                 if oracle_distances is not None:
                     relevances = self._transform_oracle_distances(
                         oracle_distances,
                         selected_indices,
                         device,
-                    ).unsqueeze(0)
-                    ranking_losses.append(self._approx_ndcg_loss(logits, relevances))
+                    )
 
-                    if self.reuse_loss_weight > 0:
-                        reuse_losses.append(F.mse_loss(pred_log_reuse, relevances))
-
+                target_distribution = None
                 if self.ce_loss_weight > 0:
                     target_distribution = self._ce_target_distribution(
                         oracle_distances,
                         selected_indices,
                         target_idx,
                         device,
+                    ).squeeze(0)
+
+                prepared_steps.append({
+                    "history_paths": history_paths,
+                    "candidate_paths": candidate_paths,
+                    "relevances": relevances,
+                    "target_distribution": target_distribution,
+                })
+
+            step_windows.append(prepared_steps)
+
+        max_window_len = max((len(window) for window in step_windows), default=0)
+        for step_idx in range(max_window_len):
+            batch_steps = [
+                window[step_idx]
+                for window in step_windows
+                if step_idx < len(window) and window[step_idx] is not None
+            ]
+            if not batch_steps:
+                continue
+
+            logits, pred_log_reuse, candidate_mask = self.forward_batched(
+                [item["history_paths"] for item in batch_steps],
+                [item["candidate_paths"] for item in batch_steps],
+            )
+
+            max_batch_candidates = logits.size(1)
+            oracle_rows = [
+                idx for idx, item in enumerate(batch_steps)
+                if item["relevances"] is not None
+            ]
+            if oracle_rows:
+                relevances = torch.zeros(
+                    len(batch_steps),
+                    max_batch_candidates,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                for row_idx in oracle_rows:
+                    row_relevance = batch_steps[row_idx]["relevances"]
+                    relevances[row_idx, :row_relevance.numel()] = row_relevance
+
+                oracle_row_tensor = torch.tensor(
+                    oracle_rows,
+                    dtype=torch.long,
+                    device=device,
+                )
+                ranking_losses.append(
+                    self._approx_ndcg_loss(
+                        logits.index_select(0, oracle_row_tensor),
+                        relevances.index_select(0, oracle_row_tensor),
+                        candidate_mask.index_select(0, oracle_row_tensor),
                     )
-                    ce_losses.append(
-                        self._distribution_cross_entropy(logits, target_distribution)
+                )
+
+                if self.reuse_loss_weight > 0:
+                    squared_error = (pred_log_reuse - relevances).pow(2)
+                    valid_error = squared_error * candidate_mask.float()
+                    per_step_reuse = (
+                        valid_error.sum(dim=-1)
+                        / candidate_mask.float().sum(dim=-1).clamp_min(1.0)
                     )
+                    reuse_losses.append(
+                        per_step_reuse.index_select(0, oracle_row_tensor)
+                    )
+
+            if self.ce_loss_weight > 0:
+                target_distribution = torch.zeros(
+                    len(batch_steps),
+                    max_batch_candidates,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                for row_idx, item in enumerate(batch_steps):
+                    row_target = item["target_distribution"]
+                    if row_target is None:
+                        continue
+                    target_distribution[row_idx, :row_target.numel()] = row_target
+
+                log_probs = F.log_softmax(logits, dim=-1)
+                ce_losses.append(-(target_distribution * log_probs).sum(dim=-1))
 
         losses = {}
         if ranking_losses:
@@ -535,12 +789,12 @@ class TrieParrotModel(nn.Module):
             losses["ranking"] = torch.tensor(0.0, device=device, requires_grad=True)
 
         if reuse_losses:
-            losses["reuse"] = self.reuse_loss_weight * torch.stack(reuse_losses).mean()
+            losses["reuse"] = self.reuse_loss_weight * torch.cat(reuse_losses, dim=0).mean()
         else:
             losses["reuse"] = torch.tensor(0.0, device=device, requires_grad=True)
 
         if ce_losses:
-            losses["ce"] = self.ce_loss_weight * torch.stack(ce_losses).mean()
+            losses["ce"] = self.ce_loss_weight * torch.cat(ce_losses, dim=0).mean()
         else:
             losses["ce"] = torch.tensor(0.0, device=device, requires_grad=True)
 
