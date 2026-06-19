@@ -13,6 +13,7 @@ import csv
 import math
 import random
 from datetime import datetime
+from types import SimpleNamespace
 
 import torch
 import tqdm
@@ -39,7 +40,7 @@ def collect_snapshots(
     max_requests: int = None,
 ):
     """
-    Run one pass over data, collecting request-level DAgger snapshots.
+    Run one pass over data, collecting microstep DAgger snapshots.
     
     Returns:
         (snapshots, hit_rate)
@@ -57,7 +58,10 @@ def collect_snapshots(
         if max_requests is not None and request_idx >= max_requests:
             break
         cache.collect(seq)
-        if max_examples is not None and len(cache.snapshots) >= max_examples:
+        if (
+            max_examples is not None
+            and cache.collected_training_steps >= max_examples
+        ):
             break
     
     return cache.get_snapshots(), cache.hit_rate
@@ -73,6 +77,57 @@ def flatten_eviction_steps(snapshots, max_steps: int = None):
                 if max_steps is not None and len(steps) >= max_steps:
                     return steps
     return steps
+
+
+def flatten_microstep_steps(snapshots):
+    """Flatten collected microstep training steps in original collection order."""
+    return [
+        step
+        for snapshot in snapshots
+        for step in snapshot.eviction_steps
+    ]
+
+
+def count_microstep_steps(snapshots) -> int:
+    """Count microstep training steps, not request-level containers."""
+    return sum(len(snapshot.eviction_steps) for snapshot in snapshots)
+
+
+def count_microstep_windows(snapshots, sequence_length: int) -> int:
+    steps = count_microstep_steps(snapshots)
+    return max(0, steps - sequence_length + 1)
+
+
+def as_microstep_window_batches(
+    snapshots,
+    batch_size: int,
+    sequence_length: int,
+    shuffle: bool = True,
+):
+    """
+    Yield Parrot-style batches of consecutive microstep windows.
+
+    Each yielded sample is a SimpleNamespace(eviction_steps=[...]) containing
+    one contiguous window. The batch is a list of these samples, so the existing
+    TrieParrotModel.loss(batch) API remains unchanged.
+    """
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+
+    steps = flatten_microstep_steps(snapshots)
+    positions = list(range(max(0, len(steps) - sequence_length + 1)))
+    if shuffle:
+        random.shuffle(positions)
+
+    for batch_start in range(0, len(positions), batch_size):
+        batch = []
+        for start in positions[batch_start:batch_start + batch_size]:
+            batch.append(SimpleNamespace(
+                window_start=start,
+                eviction_steps=steps[start:start + sequence_length],
+            ))
+        if batch:
+            yield batch
 
 
 def collect_rank_eval_steps(
@@ -414,6 +469,7 @@ if __name__ == '__main__':
     eval_freq = config['eval_freq']
     save_freq = config['save_freq']
     batch_size = config['batch_size']
+    sequence_length = int(config.get('sequence_length', 40))
     collection_multiplier = max(1, int(config.get('collection_multiplier', 4) or 1))
     max_collection_requests = config.get('max_collection_requests')
     collection_snapshot_cap = (
@@ -443,14 +499,15 @@ if __name__ == '__main__':
     ndcg_alpha = config.get('ndcg_alpha', 10.0)
 
     print(f'TrieParrot: lr={lr}, total_steps={total_steps}, eval_freq={eval_freq}, '
-          f'save_freq={save_freq}, batch_size={batch_size}')
+          f'save_freq={save_freq}, batch_size={batch_size}, '
+          f'sequence_length={sequence_length}')
     candidate_mode = (
         "full" if max_loss_candidates is None else f"capped@{max_loss_candidates}"
     )
     print(
         "TrieParrot: collection/loss caps "
         f"max_collection_requests={max_collection_requests} "
-        f"max_collection_snapshots={collection_snapshot_cap} "
+        f"max_collection_microstep_snapshots={collection_snapshot_cap} "
         f"max_eval_requests={max_eval_requests} "
         f"rank_eval_requests={rank_eval_requests} "
         f"rank_eval_max_steps={rank_eval_max_steps} "
@@ -471,7 +528,7 @@ if __name__ == '__main__':
           f'steps={dagger_steps}, update_freq={dagger_update_freq}')
     print(
         'TrieParrot: DAgger round collection uses '
-        'round_step_budget * collection_multiplier * batch_size snapshots '
+        'round_step_budget * collection_multiplier * batch_size microstep snapshots '
         'when max_collection_snapshots=round_budget; '
         f'collection_multiplier={collection_multiplier}'
     )
@@ -619,9 +676,19 @@ if __name__ == '__main__':
                 print('WARNING: No snapshots collected, skipping batch')
                 continue
 
+            microstep_count = count_microstep_steps(snapshots)
+            window_count = count_microstep_windows(snapshots, sequence_length)
+            if window_count == 0:
+                print(
+                    'WARNING: Not enough microstep snapshots for one training '
+                    f'window: collected={microstep_count}, '
+                    f'sequence_length={sequence_length}'
+                )
+                continue
+
             if consume_all_collected_snapshots:
                 round_budget = min(
-                    math.ceil(len(snapshots) / batch_size),
+                    math.ceil(window_count / batch_size),
                     total_steps - step,
                 )
 
@@ -632,20 +699,20 @@ if __name__ == '__main__':
                     total_steps - step,
                 )
 
-            if shuffle_collected_snapshots:
-                random.shuffle(snapshots)
-            
-            # Train on collected snapshots in mini-batches
+            # Train on Parrot-style consecutive microstep windows.
             model.train()
             round_steps = 0
-            for batch_start in range(0, len(snapshots), batch_size):
+            for batch in as_microstep_window_batches(
+                snapshots,
+                batch_size,
+                sequence_length,
+                shuffle=shuffle_collected_snapshots,
+            ):
                 if step >= total_steps:
                     break
                 if round_steps >= round_budget:
                     break
-                
-                batch = snapshots[batch_start:batch_start + batch_size]
-                
+
                 # Eval
                 if should_run_periodic_event(step, eval_freq):
                     model.eval()
@@ -775,7 +842,7 @@ if __name__ == '__main__':
                     "capped_steps": capped_steps,
                     "candidate_count": candidate_count,
                     "avg_candidates": avg_candidates,
-                    "num_snapshots": len(snapshots),
+                    "num_snapshots": microstep_count,
                     "batch_size": len(batch),
                     "best_eval_hit_rate": best_eval_hit_rate,
                 })

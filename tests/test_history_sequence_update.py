@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify completed live leaf paths become path-level history slots."""
+"""Verify access prefixes become path-level history slots."""
 import os
 import sys
 
@@ -26,13 +26,13 @@ alg = TrieModelPredictAlgorithm(max_node_num=20, model=model)
 alg.access(first_sequence)
 assert_history_paths(
     alg.history_path_window,
-    [(1, 2)],
+    [(1,), (1, 2)],
     "predict algorithm",
 )
 alg.access(second_sequence)
 assert_history_paths(
     alg.history_path_window,
-    [(1, 2), (3, 4)],
+    [(1,), (1, 2), (3,), (3, 4)],
     "predict algorithm second request",
 )
 assert alg.history_state is None, "Trie-PARROT v1 should not update legacy token history state"
@@ -42,24 +42,24 @@ train_cache = TrieTrainingCache(max_node_num=20, model=model)
 train_cache.collect(first_sequence)
 assert_history_paths(
     train_cache.alg.history_path_window,
-    [(1, 2)],
+    [(1,), (1, 2)],
     "training cache",
 )
 train_cache.collect(second_sequence)
 assert_history_paths(
     train_cache.alg.history_path_window,
-    [(1, 2), (3, 4)],
+    [(1,), (1, 2), (3,), (3, 4)],
     "training cache second request",
 )
 assert train_cache.alg.history_state is None
 
-# Long requests should record only the terminal cache-visible leaf on both
-# inference and training paths.
+# Long requests should record each cache-visible prefix on both inference and
+# training paths.
 small_alg = TrieModelPredictAlgorithm(max_node_num=2, model=model)
 small_alg.access(long_sequence)
 assert_history_paths(
     small_alg.history_path_window,
-    [(7, 8)],
+    [(7,), (7, 8)],
     "predict algorithm long request",
 )
 
@@ -67,11 +67,11 @@ small_train_cache = TrieTrainingCache(max_node_num=2, model=model)
 small_train_cache.collect(long_sequence)
 assert_history_paths(
     small_train_cache.alg.history_path_window,
-    [(7, 8)],
+    [(7,), (7, 8)],
     "training cache long request",
 )
 
 print(
-    "HISTORY SEQUENCE UPDATE TEST PASSED: completed live leaves are encoded "
+    "HISTORY SEQUENCE UPDATE TEST PASSED: access prefixes are encoded "
     "as path-level history slots"
 )

@@ -107,8 +107,8 @@ class TrieTrainingCache:
     """
     Training cache for TrieParrotModel using DAgger (Dataset Aggregation).
     
-    Wraps a TrieModelPredictAlgorithm and collects request-level cache-state
-    snapshots with Belady oracle labels before each request is applied.
+    Wraps a TrieModelPredictAlgorithm and collects microstep cache-state
+    snapshots with Belady oracle labels before each access prefix is applied.
     
     Usage:
         cache = TrieTrainingCache(max_node_num=1024, model=my_model)
@@ -117,7 +117,7 @@ class TrieTrainingCache:
         
         for seq in sequences:
             snapshot, hit = cache.collect(seq)
-            # snapshot.eviction_steps contains request-level training steps.
+            # snapshot.eviction_steps contains access-prefix training steps.
     """
     
     def __init__(self, max_node_num: int, model=None):
@@ -142,6 +142,7 @@ class TrieTrainingCache:
         
         # Collected training snapshots
         self.snapshots: List[SimpleNamespace] = []
+        self._collected_training_steps = 0
         
         # Statistics
         self.total_count = 0
@@ -168,10 +169,17 @@ class TrieTrainingCache:
         )
         self._current_step = 0
         self.alg._reset_history()
+        self.snapshots = []
+        self._collected_training_steps = 0
     
     def _reuse_distance(self, path: tuple, include_current: bool = False) -> float:
         """
-        Belady oracle: how many steps until a future access matches this leaf's path.
+        Belady oracle: how many request steps until an access matches this leaf's path.
+
+        TrieTrainingCache consumes the current request only after all snapshots,
+        evictions, and inserts for that request are processed. Microstep
+        training snapshots opt into include_current=True; executable eviction
+        diagnostics keep the default future-only view.
         
         A leaf's path matches a future sequence if the path is a prefix of that sequence.
         Returns float('inf') if this path is never re-accessed.
@@ -208,7 +216,7 @@ class TrieTrainingCache:
         candidates: List[TrieNode],
         include_current: bool = False,
     ) -> List[float]:
-        """Return request-clock future reuse distance for each candidate path."""
+        """Return request-clock reuse distance for each candidate path."""
         return [
             self._reuse_distance(
                 TrieNode.get_path_tuple_from_node(leaf),
@@ -223,13 +231,15 @@ class TrieTrainingCache:
             raise ValueError("Cannot choose oracle target from an empty candidate list")
         return max(range(len(distances)), key=lambda idx: distances[idx])
 
-    def _request_state_snapshot(
+    def _microstep_access_snapshot(
         self,
         cache_sequence: List[int],
-        pre_request_history_paths,
+        current_prefix: List[int],
+        step_index: int,
+        pre_step_history_paths,
     ) -> Optional[SimpleNamespace]:
         """
-        Build a request-level cache-state snapshot before mutating the trie.
+        Build an access-prefix cache-state snapshot before mutating the trie.
 
         The field name eviction_steps is kept for compatibility with the
         existing loss/training pipeline; entries are generic training steps.
@@ -243,49 +253,56 @@ class TrieTrainingCache:
             return None
 
         oracle_distances = self._oracle_distances(candidates, include_current=True)
+        required_candidate_indices = [
+            idx for idx, distance in enumerate(oracle_distances)
+            if distance == 0
+        ]
         step_data = SimpleNamespace()
-        step_data.step_kind = "request_state"
+        step_data.step_kind = "microstep_access"
         step_data.leaf_node_ids = [c.node_id for c in candidates]
         step_data.leaf_paths = [
             TrieNode.get_node_id_path(c) for c in candidates
         ]
-        step_data.current_path = tuple(cache_sequence)
-        step_data.step_index = -1
-        step_data.history_paths = tuple(pre_request_history_paths)
+        step_data.request_path = tuple(cache_sequence)
+        step_data.current_path = tuple(current_prefix)
+        step_data.step_index = step_index
+        step_data.history_paths = tuple(pre_step_history_paths)
         step_data.oracle_distances = oracle_distances
         step_data.oracle_target = self._oracle_target_from_distances(oracle_distances)
+        step_data.required_candidate_indices = tuple(required_candidate_indices)
         step_data.num_candidates = len(candidates)
-
-        snapshot = SimpleNamespace()
-        snapshot.sequence = tuple(cache_sequence)
-        snapshot.eviction_steps = [step_data]
-        return snapshot
+        return step_data
     
     def collect(self, sequence: List[int]):
         """
-        Collect a pre-request cache-state snapshot, then process one access.
+        Collect pre-microstep cache-state snapshots, then process one request.
         
         Returns:
             (snapshot, hit): 
-                snapshot: request-level training snapshot (None if no candidates)
+                snapshot: request container with microstep training steps
+                    (None if no microstep has candidates)
                 hit: bool, whether the entire sequence was a cache hit
         """
         cache_sequence = sequence[:self.max_node_num]
-        pre_request_history_paths = tuple(self.alg.history_path_window)
-
-        snapshot = self._request_state_snapshot(
-            cache_sequence,
-            pre_request_history_paths,
-        )
-
-        if self._future_oracle is not None:
-            self._future_oracle.consume_current(cache_sequence, self._current_step)
+        snapshot = SimpleNamespace()
+        snapshot.sequence = tuple(cache_sequence)
+        snapshot.eviction_steps = []
         hit_nodes = 0
         this_node = self.alg.root_node
 
         current_prefix = []
         for step_index, node_id in enumerate(cache_sequence):
             current_prefix.append(node_id)
+            pre_step_history_paths = tuple(self.alg.history_path_window)
+            step_data = self._microstep_access_snapshot(
+                cache_sequence,
+                current_prefix,
+                step_index,
+                pre_step_history_paths,
+            )
+            if step_data is not None:
+                snapshot.eviction_steps.append(step_data)
+
             if node_id in this_node.children:
                 this_node = this_node.children[node_id]
                 self.alg.__visit_node__(this_node)
@@ -311,14 +328,20 @@ class TrieTrainingCache:
                 self.alg.cur_node_num += 1
                 self.alg.__mark_as_leaf__(this_node)
 
-        self.alg._record_history_leaf(this_node)
+            self.alg._record_history_path(current_prefix, this_node.hidden_state)
+
+        if self._future_oracle is not None:
+            self._future_oracle.consume_current(cache_sequence, self._current_step)
         hit = hit_nodes == len(sequence)
         if hit and len(cache_sequence) == len(sequence):
             self.hit_count += 1
         self.total_count += 1
 
-        if snapshot is not None:
+        if snapshot.eviction_steps:
             self.snapshots.append(snapshot)
+            self._collected_training_steps += len(snapshot.eviction_steps)
+        else:
+            snapshot = None
 
         self.alg.timestamp += 1
         self._current_step += 1
@@ -426,7 +449,13 @@ class TrieTrainingCache:
         """Return all collected training snapshots and clear the buffer."""
         result = self.snapshots
         self.snapshots = []
+        self._collected_training_steps = 0
         return result
+
+    @property
+    def collected_training_steps(self) -> int:
+        """Number of buffered microstep training steps, not request containers."""
+        return self._collected_training_steps
     
     @property
     def hit_rate(self) -> float:

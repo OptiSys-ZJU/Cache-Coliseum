@@ -155,6 +155,33 @@ def test_loss_uses_all_candidates_by_default():
     assert model.last_loss_stats["candidate_count"] == num_candidates
 
 
+def test_loss_candidate_cap_keeps_current_hit_required_candidate():
+    model = make_model(reuse_loss_weight=0.0)
+    step = SimpleNamespace(
+        leaf_paths=[(idx + 1,) for idx in range(6)],
+        oracle_distances=[0.0, 2.0, 3.0, 4.0, 5.0, float("inf")],
+        oracle_target=5,
+        required_candidate_indices=(0,),
+        history_paths=((9,),),
+        num_candidates=6,
+    )
+    snapshot = SimpleNamespace(eviction_steps=[step])
+    seen_candidate_paths = []
+    original_forward = model.forward
+
+    def spy_forward(*args, **kwargs):
+        seen_candidate_paths.append(tuple(kwargs["candidate_paths"]))
+        return original_forward(*args, **kwargs)
+
+    model.forward = spy_forward
+    model.loss([snapshot], max_candidates=2)
+
+    assert seen_candidate_paths == [((1,), (6,))]
+    assert model.last_loss_stats["full_steps"] == 0
+    assert model.last_loss_stats["capped_steps"] == 1
+    assert model.last_loss_stats["candidate_count"] == 2
+
+
 def test_loss_has_finite_reuse_with_inf_distance():
     model = make_model(reuse_loss_weight=0.1)
     losses = model.loss([make_snapshot([1.0, 10.0, float("inf")])])
@@ -313,6 +340,7 @@ if __name__ == "__main__":
     test_ndcg_gain_matches_parrot_expm1_relevance()
     test_ranking_loss_uses_all_candidates_not_only_oracle_target()
     test_loss_uses_all_candidates_by_default()
+    test_loss_candidate_cap_keeps_current_hit_required_candidate()
     test_loss_has_finite_reuse_with_inf_distance()
     test_ce_optional_default_zero_and_enabled_path()
     test_argmax_ce_matches_single_target_cross_entropy()

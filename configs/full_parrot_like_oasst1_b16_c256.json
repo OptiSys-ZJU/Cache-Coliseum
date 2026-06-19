@@ -4,6 +4,7 @@
   "eval_freq": 5000,
   "save_freq": 5000,
   "batch_size": 32,
+  "sequence_length": 40,
   "collection_multiplier": 5,
   "max_collection_requests": null,
   "max_collection_snapshots": null,

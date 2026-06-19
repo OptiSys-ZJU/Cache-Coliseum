@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify eviction-time history excludes the current request being processed."""
+"""Verify eviction-time history excludes the current microstep being processed."""
 import os
 import sys
 
@@ -35,25 +35,32 @@ class RecordingModel(TrieParrotModel):
         return logits, reuse
 
 
-def test_eviction_history_excludes_current_request():
+def test_eviction_history_excludes_current_microstep():
     model = RecordingModel()
     model.eval()
     alg = TrieModelPredictAlgorithm(max_node_num=4, model=model)
 
     alg.access([1, 2])
     alg.access([3, 4])
-    assert list(alg.history_path_window) == [(1, 2), (3, 4)]
-    assert len(alg.history_hidden_states) == 2, "first two requests should populate history"
+    assert list(alg.history_path_window) == [(1,), (1, 2), (3,), (3, 4)]
+    assert len(alg.history_hidden_states) == 4, "first two requests should populate prefix history"
 
     alg.access([5, 6])
     assert model.history_lengths, "eviction-time forward should be called"
-    assert model.history_lengths == [2, 2], (
+    assert model.history_lengths == [4, 5], (
         "both evictions for request [5,6] should see only the history that "
-        "existed before the request"
+        "exists before each microstep"
     )
-    assert list(alg.history_path_window) == [(1, 2), (3, 4), (5, 6)]
+    assert list(alg.history_path_window) == [
+        (1,),
+        (1, 2),
+        (3,),
+        (3, 4),
+        (5,),
+        (5, 6),
+    ]
 
 
 if __name__ == "__main__":
-    test_eviction_history_excludes_current_request()
-    print("HISTORY EXCLUDES CURRENT REQUEST TEST PASSED")
+    test_eviction_history_excludes_current_microstep()
+    print("HISTORY EXCLUDES CURRENT MICROSTEP TEST PASSED")

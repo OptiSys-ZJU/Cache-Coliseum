@@ -11,6 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from model.trie_model.__main__ import (
     METRIC_FIELDS,
     append_metric_row,
+    as_microstep_window_batches,
+    count_microstep_steps,
+    count_microstep_windows,
     compute_rank_eval_metrics,
     plot_loss_curves,
     round_collection_examples,
@@ -185,6 +188,34 @@ def test_rank_eval_metrics_are_logged_fields_and_finite():
     assert metrics["rank_eval_score_std"] >= 0.0
 
 
+def test_microstep_window_batches_are_32_by_40_and_consecutive():
+    steps = [
+        SimpleNamespace(step_id=idx, num_candidates=2)
+        for idx in range(80)
+    ]
+    snapshots = [
+        SimpleNamespace(eviction_steps=steps[:25]),
+        SimpleNamespace(eviction_steps=steps[25:]),
+    ]
+
+    batches = list(as_microstep_window_batches(
+        snapshots,
+        batch_size=32,
+        sequence_length=40,
+        shuffle=False,
+    ))
+
+    assert count_microstep_steps(snapshots) == 80
+    assert count_microstep_windows(snapshots, 40) == 41
+    assert len(batches) == 2
+    assert len(batches[0]) == 32
+    assert len(batches[1]) == 9
+    first_window = batches[0][0].eviction_steps
+    last_window = batches[-1][-1].eviction_steps
+    assert [step.step_id for step in first_window] == list(range(40))
+    assert [step.step_id for step in last_window] == list(range(40, 80))
+
+
 def test_full_dagger_config_uses_history_only_scorer():
     config_path = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
@@ -197,11 +228,26 @@ def test_full_dagger_config_uses_history_only_scorer():
     assert config.get("candidate_scorer_mode") == "history_only"
 
 
+def test_full_parrot_like_config_uses_parrot_window_shape():
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "configs",
+        "full_parrot_like_oasst1_b16_c256.json",
+    )
+    with open(config_path) as f:
+        config = json.load(f)
+
+    assert config.get("batch_size") == 32
+    assert config.get("sequence_length") == 40
+
+
 if __name__ == "__main__":
     test_metric_append_writes_header_and_preserves_existing_rows()
     test_plot_loss_curves_filters_run_id_and_writes_png()
     test_plot_loss_curves_handles_single_step_run()
     test_round_budget_limits_each_collect_round()
     test_rank_eval_metrics_are_logged_fields_and_finite()
+    test_microstep_window_batches_are_32_by_40_and_consecutive()
     test_full_dagger_config_uses_history_only_scorer()
+    test_full_parrot_like_config_uses_parrot_window_shape()
     print("TRIE TRAINING METRIC LOGGING TESTS PASSED")

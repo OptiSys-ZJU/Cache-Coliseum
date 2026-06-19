@@ -301,24 +301,29 @@ class TrieParrotModel(nn.Module):
         num_candidates: int,
         oracle_target: int,
         max_candidates: Optional[int],
+        required_indices: Optional[List[int]] = None,
     ) -> Tuple[List[int], int]:
         if max_candidates is None or num_candidates <= max_candidates:
             return list(range(num_candidates)), oracle_target
 
-        max_candidates = max(2, max_candidates)
-        remaining = [idx for idx in range(num_candidates) if idx != oracle_target]
-        quota = min(max_candidates - 1, len(remaining))
-        if quota <= 0:
-            return [oracle_target], 0
-
-        stride = len(remaining) / quota
+        required = {oracle_target}
+        if required_indices is not None:
+            required.update(
+                idx for idx in required_indices
+                if 0 <= idx < num_candidates
+            )
+        max_candidates = max(2, max_candidates, len(required))
+        remaining = [idx for idx in range(num_candidates) if idx not in required]
+        quota = min(max_candidates - len(required), len(remaining))
         chosen = []
-        used = {oracle_target}
-        for slot in range(quota):
-            idx = remaining[min(int(slot * stride), len(remaining) - 1)]
-            if idx not in used:
-                chosen.append(idx)
-                used.add(idx)
+        used = set(required)
+        if quota > 0:
+            stride = len(remaining) / quota
+            for slot in range(quota):
+                idx = remaining[min(int(slot * stride), len(remaining) - 1)]
+                if idx not in used:
+                    chosen.append(idx)
+                    used.add(idx)
 
         if len(chosen) < quota:
             for idx in remaining:
@@ -328,7 +333,7 @@ class TrieParrotModel(nn.Module):
                     if len(chosen) >= quota:
                         break
 
-        selected = sorted([oracle_target] + chosen)
+        selected = sorted(required | set(chosen))
         return selected, selected.index(oracle_target)
 
     def _transform_oracle_distances(
@@ -439,7 +444,7 @@ class TrieParrotModel(nn.Module):
         Mirrors original Parrot: loss() calls self() (forward) directly.
         forward(inference=False) re-encodes candidate paths with gradient.
         The snapshot field eviction_steps is a compatibility name; entries may
-        be request-level cache-state training steps rather than eviction events.
+        be microstep cache-state training steps rather than eviction events.
         """
         device = next(self.parameters()).device
         ranking_losses = []
@@ -483,6 +488,7 @@ class TrieParrotModel(nn.Module):
                     step.num_candidates,
                     step.oracle_target,
                     max_candidates,
+                    getattr(step, "required_candidate_indices", None),
                 )
                 if len(selected_indices) == step.num_candidates:
                     stats["full_steps"] += 1

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify PARROT-like request-level leaf-history timing for runtime and training."""
+"""Verify PARROT-like microstep path-history timing for runtime and training."""
 import os
 import sys
 
@@ -72,23 +72,29 @@ class SnapshotRecordingModel(TrieParrotModel):
         )
 
 
-def test_evictions_during_request_see_only_prior_leaf_history():
+def test_evictions_during_request_see_prior_microstep_history():
     model = RecordingModel()
     model.eval()
     alg = TrieModelPredictAlgorithm(max_node_num=3, model=model)
 
     alg.access([1, 2])
-    assert list(alg.history_path_window) == [(1, 2)]
+    assert list(alg.history_path_window) == [(1,), (1, 2)]
 
     alg.access([3, 4, 5])
-    assert model.runtime_history_lengths == [1, 1], (
-        "both evictions during request [3,4,5] should see only the leaf "
-        "history that existed before the request"
+    assert model.runtime_history_lengths == [3, 4], (
+        "evictions during request [3,4,5] should see the access-prefix "
+        "history available before each microstep"
     )
-    assert list(alg.history_path_window) == [(1, 2), (3, 4, 5)]
+    assert list(alg.history_path_window) == [
+        (1,),
+        (1, 2),
+        (3,),
+        (3, 4),
+        (3, 4, 5),
+    ]
 
 
-def test_collect_request_state_history_paths_exclude_current_request():
+def test_collect_microstep_history_paths_exclude_current_microstep():
     model = TrieParrotModel(
         vocab_size=256,
         node_embed_dim=16,
@@ -109,19 +115,30 @@ def test_collect_request_state_history_paths_exclude_current_request():
         cache.collect(seq)
     snapshot, _ = cache.collect(sequences[2])
 
-    assert snapshot is not None, "expected a request-level cache-state snapshot"
+    assert snapshot is not None, "expected microstep cache-state snapshots"
     step_prefixes = [tuple(step.current_path) for step in snapshot.eviction_steps]
     step_histories = [tuple(step.history_paths) for step in snapshot.eviction_steps]
 
-    assert step_prefixes == [(5, 6)]
-    assert [step.step_kind for step in snapshot.eviction_steps] == ["request_state"]
+    assert step_prefixes == [(5,), (5, 6)]
+    assert [step.step_kind for step in snapshot.eviction_steps] == [
+        "microstep_access",
+        "microstep_access",
+    ]
     assert step_histories == [
-        ((1, 2), (3, 4)),
-    ], "request-state supervision should see only pre-request leaf history"
+        ((1,), (1, 2), (3,), (3, 4)),
+        ((1,), (1, 2), (3,), (3, 4), (5,)),
+    ], "microstep supervision should see only pre-step prefix history"
     assert (5,) not in step_histories[0]
-    assert (5, 6) not in step_histories[0]
+    assert (5, 6) not in step_histories[1]
     assert cache.alg.eviction_count == 2
-    assert list(cache.alg.history_path_window) == [(1, 2), (3, 4), (5, 6)]
+    assert list(cache.alg.history_path_window) == [
+        (1,),
+        (1, 2),
+        (3,),
+        (3, 4),
+        (5,),
+        (5, 6),
+    ]
 
 
 def test_collect_to_loss_replays_same_leaf_history_snapshots():
@@ -153,7 +170,7 @@ def test_collect_to_loss_replays_same_leaf_history_snapshots():
     sum(losses.values()).backward()
 
     assert model.snapshot_history_paths == expected_histories, (
-        "loss replay should consume the same leaf-history snapshots captured at collect() time"
+        "loss replay should consume the same prefix-history snapshots captured at collect() time"
     )
 
     path_grad = 0.0
@@ -216,17 +233,17 @@ def test_train_infer_history_lengths_align_for_same_sequence():
         cache.collect(seq)
 
     snapshot, _ = cache.collect(target)
-    assert snapshot is not None, "expected training request-state snapshot for target sequence"
+    assert snapshot is not None, "expected training microstep snapshots for target sequence"
 
     alg.access(target)
 
     runtime_lengths = list(runtime_model.runtime_history_lengths)
     snapshot_lengths = [len(step.history_paths) for step in snapshot.eviction_steps]
 
-    assert snapshot_lengths == [2]
-    assert runtime_lengths == [2, 2], (
-        "runtime evictions and request-level training snapshot should share the "
-        "same pre-request history visibility"
+    assert snapshot_lengths == [4, 5]
+    assert runtime_lengths == [4, 5], (
+        "runtime evictions and microstep training snapshots should share the "
+        "same pre-step history visibility"
     )
 
 
@@ -260,8 +277,8 @@ def test_history_window_bounding_matches_runtime_and_replay():
 
 
 if __name__ == "__main__":
-    test_evictions_during_request_see_only_prior_leaf_history()
-    test_collect_request_state_history_paths_exclude_current_request()
+    test_evictions_during_request_see_prior_microstep_history()
+    test_collect_microstep_history_paths_exclude_current_microstep()
     test_collect_to_loss_replays_same_leaf_history_snapshots()
     test_protection_uses_current_prefix_not_future_suffix()
     test_train_infer_history_lengths_align_for_same_sequence()

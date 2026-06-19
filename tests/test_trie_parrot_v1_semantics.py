@@ -70,36 +70,35 @@ def test_snapshot_carries_oracle_distances_and_argmax_target():
     )
 
 
-def test_collect_buffers_request_state_snapshot_once_without_prefix_steps():
+def test_collect_buffers_microstep_access_snapshots():
     cache = TrieTrainingCache(max_node_num=4, model=None)
     sequences = [
-        [1, 2],
-        [3, 4],
-        [5, 6],
+        [9],
+        [1, 2, 3],
     ]
     cache.load_future_accesses(sequences)
     cache.set_model_prob(0.0)
 
-    returned_snapshot = None
-    for seq in sequences:
-        maybe_snapshot, _ = cache.collect(seq)
-        if maybe_snapshot is not None:
-            returned_snapshot = maybe_snapshot
+    cache.collect(sequences[0])
+    returned_snapshot, _ = cache.collect(sequences[1])
 
     assert returned_snapshot is not None
     returned_paths = [
         step.current_path for step in returned_snapshot.eviction_steps
     ]
-    assert returned_paths == [(5, 6)]
-    assert returned_snapshot.eviction_steps[0].step_kind == "request_state"
-    assert cache.alg.eviction_count == 2
+    assert returned_paths == [(1,), (1, 2), (1, 2, 3)]
+    assert all(
+        step.step_kind == "microstep_access"
+        for step in returned_snapshot.eviction_steps
+    )
+    assert cache.alg.eviction_count == 0
 
     buffered = cache.get_snapshots()
-    assert len(buffered) == 2
+    assert len(buffered) == 1
     buffered_paths = [
         step.current_path for snapshot in buffered for step in snapshot.eviction_steps
     ]
-    assert buffered_paths == [(3, 4), (5, 6)]
+    assert buffered_paths == [(1,), (1, 2), (1, 2, 3)]
 
 
 def test_request_snapshot_uses_pre_access_live_leaf_set():
@@ -113,16 +112,19 @@ def test_request_snapshot_uses_pre_access_live_leaf_set():
     cache.load_future_accesses(sequences)
 
     first_snapshot, _ = cache.collect(sequences[0])
-    assert first_snapshot is None, "empty cache has no request-level candidates"
+    assert first_snapshot is None, "empty first microstep has no candidates"
 
     second_snapshot, _ = cache.collect(sequences[1])
     assert second_snapshot is not None
-    step = second_snapshot.eviction_steps[0]
+    first_step, second_step = second_snapshot.eviction_steps
 
-    assert step.step_kind == "request_state"
-    assert [tuple(path) for path in step.leaf_paths] == [(1,)]
-    assert tuple(step.current_path) == (1, 2)
-    assert list(cache.alg.history_path_window) == [(1,), (1, 2)]
+    assert first_step.step_kind == "microstep_access"
+    assert [tuple(path) for path in first_step.leaf_paths] == [(1,)]
+    assert tuple(first_step.current_path) == (1,)
+    assert tuple(first_step.history_paths) == ((1,),)
+    assert tuple(second_step.current_path) == (1, 2)
+    assert tuple(second_step.history_paths) == ((1,), (1,))
+    assert list(cache.alg.history_path_window) == [(1,), (1,), (1, 2)]
 
 
 def test_hit_without_eviction_still_collects_request_snapshot():
@@ -141,11 +143,18 @@ def test_hit_without_eviction_still_collects_request_snapshot():
     assert hit
     assert snapshot is not None
     assert cache.alg.eviction_count == 0
-    step = snapshot.eviction_steps[0]
-    assert step.step_kind == "request_state"
-    assert tuple(step.current_path) == (1, 2)
-    assert [tuple(path) for path in step.leaf_paths] == [(1, 2)]
-    assert tuple(step.history_paths) == ((1, 2),)
+    assert [step.step_kind for step in snapshot.eviction_steps] == [
+        "microstep_access",
+        "microstep_access",
+    ]
+    assert [tuple(step.current_path) for step in snapshot.eviction_steps] == [
+        (1,),
+        (1, 2),
+    ]
+    assert [tuple(path) for path in snapshot.eviction_steps[0].leaf_paths] == [(1, 2)]
+    assert [tuple(path) for path in snapshot.eviction_steps[1].leaf_paths] == [(1, 2)]
+    assert tuple(snapshot.eviction_steps[0].history_paths) == ((1,), (1, 2))
+    assert tuple(snapshot.eviction_steps[1].history_paths) == ((1,), (1, 2), (1,))
 
 
 def test_pre_access_snapshot_labels_current_hit_as_immediate_reuse():
@@ -177,6 +186,32 @@ def test_pre_access_snapshot_labels_current_hit_as_immediate_reuse():
     assert tuple(step.leaf_paths[step.oracle_target]) == (2,)
 
 
+def test_microstep_hit_line_participates_with_zero_distance():
+    model = TrieParrotModel(vocab_size=128, node_embed_dim=16, hidden_size=32)
+    model.eval()
+    cache = TrieTrainingCache(max_node_num=10, model=model)
+    sequences = [
+        [1, 2, 3],
+        [4],
+        [1, 2, 3],
+    ]
+    cache.load_future_accesses(sequences)
+
+    cache.collect(sequences[0])
+    cache.collect(sequences[1])
+    snapshot, hit = cache.collect(sequences[2])
+
+    assert hit
+    assert snapshot is not None
+    for step in snapshot.eviction_steps:
+        distances_by_path = {
+            tuple(path): distance
+            for path, distance in zip(step.leaf_paths, step.oracle_distances)
+        }
+        assert (1, 2, 3) in distances_by_path
+        assert distances_by_path[(1, 2, 3)] == 0
+
+
 def test_continuous_eviction_adds_parent_candidate_and_recomputes_distances():
     cache = TrieTrainingCache(max_node_num=10, model=None)
     for seq in ([1, 2], [4], [5]):
@@ -194,6 +229,24 @@ def test_continuous_eviction_adds_parent_candidate_and_recomputes_distances():
     second_step_paths = [tuple(path) for path in snapshot.eviction_steps[1].leaf_paths]
     assert (1,) in second_step_paths, "deleting [1,2] should make parent [1] a candidate"
     assert len(snapshot.eviction_steps[1].oracle_distances) == len(second_step_paths)
+
+
+def test_actual_eviction_candidates_exclude_protected_current_path():
+    cache = TrieTrainingCache(max_node_num=10, model=None)
+    for seq in ([1, 2], [3], [4]):
+        _insert_raw(cache.alg, seq)
+
+    snapshot = cache._evict_and_collect(
+        evict_num=1,
+        this_node=cache.alg.root_node,
+        current_path=[1, 2],
+        step_index=1,
+    )
+
+    paths = [tuple(path) for path in snapshot.eviction_steps[0].leaf_paths]
+    assert (1, 2) not in paths
+    assert (3,) in paths
+    assert (4,) in paths
 
 
 def test_eviction_does_not_append_history():
@@ -217,14 +270,14 @@ def test_eviction_does_not_append_history():
     assert len(cache.alg.history_hidden_states) == before_len
 
 
-def test_request_touch_appends_leaf_history_slot():
+def test_request_touch_appends_microstep_history_slots():
     model = TrieParrotModel(vocab_size=128, node_embed_dim=16, hidden_size=32)
     alg = TrieModelPredictAlgorithm(max_node_num=10, model=model)
 
     alg.access([1, 2, 3])
 
-    assert list(alg.history_path_window) == [(1, 2, 3)]
-    assert len(alg.history_hidden_states) == 1
+    assert list(alg.history_path_window) == [(1,), (1, 2), (1, 2, 3)]
+    assert len(alg.history_hidden_states) == 3
 
 
 def test_candidate_is_query_only_not_direct_scorer_input():
@@ -310,13 +363,15 @@ def test_loss_handles_finite_and_inf_oracle_distances_without_nan():
 if __name__ == "__main__":
     test_prefix_oracle_remains_request_clock()
     test_snapshot_carries_oracle_distances_and_argmax_target()
-    test_collect_buffers_request_state_snapshot_once_without_prefix_steps()
+    test_collect_buffers_microstep_access_snapshots()
     test_request_snapshot_uses_pre_access_live_leaf_set()
     test_hit_without_eviction_still_collects_request_snapshot()
     test_pre_access_snapshot_labels_current_hit_as_immediate_reuse()
+    test_microstep_hit_line_participates_with_zero_distance()
     test_continuous_eviction_adds_parent_candidate_and_recomputes_distances()
+    test_actual_eviction_candidates_exclude_protected_current_path()
     test_eviction_does_not_append_history()
-    test_request_touch_appends_leaf_history_slot()
+    test_request_touch_appends_microstep_history_slots()
     test_candidate_is_query_only_not_direct_scorer_input()
     test_candidate_history_concat_scorer_uses_candidate_directly()
     test_loss_handles_finite_and_inf_oracle_distances_without_nan()

@@ -658,14 +658,15 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
         path: List[int],
         path_state: Tuple[Any, Any] = None,
     ):
+        path_tuple = tuple(path)
+        if len(path_tuple) == 0:
+            return
+        self.history_path_window.append(path_tuple)
+
         if self.model is None:
             return
         if torch is None:
             raise ImportError("TrieModelPredictAlgorithm requires torch when model is set")
-
-        path_tuple = tuple(path)
-        if len(path_tuple) == 0:
-            return
 
         with torch.no_grad():
             if path_state is not None:
@@ -673,7 +674,6 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
             else:
                 hidden = self.model._encode_path(path_tuple, next(self.model.parameters()).device)
         self.history_hidden_states.append(hidden.detach())
-        self.history_path_window.append(path_tuple)
 
     def _record_history_leaf(self, node: TrieNode):
         """Append one completed request leaf to the bounded history window."""
@@ -881,8 +881,8 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
             else:
                 self.__insert__(this_node, [node_id], current_path=current_prefix)
                 this_node = this_node.children[node_id]
+            self._record_history_path(current_prefix, this_node.hidden_state)
 
-        self._record_history_leaf(this_node)
         self.timestamp += 1
         return (len(sequence), hit_nodes, len(sequence) - hit_nodes)
 
