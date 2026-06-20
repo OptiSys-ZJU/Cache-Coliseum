@@ -649,6 +649,162 @@ def test_deduplicated_path_encoding_backward_matches_full_batch():
         ), full_name
 
 
+def test_forward_path_cache_reuses_shared_prefix_states_once():
+    model = make_model()
+    device = torch.device("cpu")
+    paths = [(1, 2, 3, 4), (1, 2, 5, 6)]
+    expected = model._encode_path_batch(paths, device)
+    cache = model._new_path_encoding_cache(device)
+    lstm_batch_rows = []
+
+    def capture_lstm_batch(module, inputs, output):
+        del module, output
+        lstm_batch_rows.append(inputs[0].shape[0])
+
+    hook = model.path_lstm.register_forward_hook(capture_lstm_batch)
+    try:
+        actual = model._encode_path_batch(paths, device, cache=cache)
+        cached_again = model._encode_path_batch([paths[0]], device, cache=cache)
+    finally:
+        hook.remove()
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+    assert torch.allclose(cached_again, expected[:1], atol=1e-6)
+    assert lstm_batch_rows == [1, 1, 2, 2]
+
+
+def test_forward_batched_cache_is_shared_across_candidate_and_histories():
+    torch.manual_seed(456)
+    reference_model = make_model()
+    cached_model = make_model()
+    cached_model.load_state_dict(reference_model.state_dict())
+    device = torch.device("cpu")
+
+    shared_path = (1, 2, 3)
+    sibling_path = (1, 2, 4)
+    microstep_history_paths_batch = [
+        (shared_path, sibling_path),
+        (shared_path,),
+    ]
+    candidate_paths_batch = [
+        [shared_path, sibling_path],
+        [shared_path, sibling_path],
+    ]
+    request_history_paths_batch = [
+        (shared_path,),
+        (shared_path, sibling_path),
+    ]
+    lru_features_batch = [
+        lru_features_for(candidate_paths)
+        for candidate_paths in candidate_paths_batch
+    ]
+
+    ref_micro, ref_micro_mask = reference_model._encode_history_paths_batch(
+        microstep_history_paths_batch,
+        device,
+        max_history=reference_model.max_microstep_history,
+    )
+    ref_request, ref_request_mask = reference_model._encode_request_history_paths_batch(
+        request_history_paths_batch,
+        device,
+    )
+    ref_candidates, ref_candidate_mask = reference_model._encode_candidate_paths_batch(
+        candidate_paths_batch,
+        device,
+    )
+    ref_lru = reference_model._prepare_lru_features_batch(
+        lru_features_batch,
+        ref_candidate_mask,
+        device,
+    )
+    ref_logits, ref_reuse = reference_model._forward_batched_encoded(
+        ref_micro,
+        ref_micro_mask,
+        ref_request,
+        ref_request_mask,
+        ref_candidates,
+        ref_candidate_mask,
+        ref_lru,
+    )
+
+    lstm_batch_rows = []
+
+    def capture_lstm_batch(module, inputs, output):
+        del module, output
+        lstm_batch_rows.append(inputs[0].shape[0])
+
+    hook = cached_model.path_lstm.register_forward_hook(capture_lstm_batch)
+    try:
+        cached_logits, cached_reuse, cached_mask = cached_model.forward_batched(
+            microstep_history_paths_batch,
+            candidate_paths_batch,
+            request_history_paths_batch,
+            lru_features_batch,
+        )
+    finally:
+        hook.remove()
+
+    assert cached_mask.tolist() == ref_candidate_mask.tolist()
+    assert torch.allclose(cached_logits, ref_logits, atol=1e-6)
+    assert torch.allclose(cached_reuse, ref_reuse, atol=1e-6)
+    assert lstm_batch_rows == [1, 1, 2]
+
+    ref_objective = (
+        ref_logits.masked_select(ref_candidate_mask).sum()
+        + ref_reuse.masked_select(ref_candidate_mask).sum()
+    )
+    cached_objective = (
+        cached_logits.masked_select(cached_mask).sum()
+        + cached_reuse.masked_select(cached_mask).sum()
+    )
+    ref_objective.backward()
+    cached_objective.backward()
+
+    for ref_name, ref_param in reference_model.named_parameters():
+        if not (
+            ref_name.startswith("node_embedder.")
+            or ref_name.startswith("path_lstm.")
+        ):
+            continue
+        cached_param = dict(cached_model.named_parameters())[ref_name]
+        assert ref_param.grad is not None, ref_name
+        assert cached_param.grad is not None, ref_name
+        assert torch.allclose(cached_param.grad, ref_param.grad, atol=1e-6), ref_name
+
+
+def test_loss_backward_keeps_path_cache_differentiable_and_forward_local():
+    model = make_model(reuse_loss_weight=0.2, ce_loss_weight=0.5)
+    snapshot = SimpleNamespace(
+        eviction_steps=[
+            make_step(
+                [(1, 2, 3), (1, 2, 4), (1, 5)],
+                [1.0, 10.0, float("inf")],
+                microstep_history_paths=((1, 2, 3), (1, 2, 4)),
+                request_history_paths=((1, 2, 3),),
+            ),
+            make_step(
+                [(1, 2, 3), (1, 6), (7,)],
+                [float("inf"), 2.0, 1.0],
+                microstep_history_paths=((1, 2, 3),),
+                request_history_paths=((1, 2, 3), (1, 6)),
+            ),
+        ]
+    )
+
+    losses = model.loss([snapshot])
+    total = sum(losses.values())
+    assert total.requires_grad
+    total.backward()
+
+    assert not hasattr(model, "_active_path_encoding_cache")
+    assert model.node_embedder.embedding.weight.grad is not None
+    assert model.path_lstm.gates.weight.grad is not None
+    assert torch.isfinite(model.node_embedder.embedding.weight.grad).all()
+    assert torch.isfinite(model.path_lstm.gates.weight.grad).all()
+    assert model.node_embedder.embedding.weight.grad.abs().sum() > 0
+    assert model.path_lstm.gates.weight.grad.abs().sum() > 0
+
+
 def test_history_batch_deduplicates_before_path_lstm_encoding():
     model = make_model()
     device = torch.device("cpu")
@@ -747,6 +903,9 @@ if __name__ == "__main__":
     test_empty_history_paths_are_not_real_history_slots()
     test_batched_path_encoding_matches_stepwise_encoding()
     test_deduplicated_path_encoding_backward_matches_full_batch()
+    test_forward_path_cache_reuses_shared_prefix_states_once()
+    test_forward_batched_cache_is_shared_across_candidate_and_histories()
+    test_loss_backward_keeps_path_cache_differentiable_and_forward_local()
     test_history_batch_deduplicates_before_path_lstm_encoding()
     test_candidate_batch_keeps_default_non_deduplicated_encoding()
     test_from_config_reads_lru_trie_fields()

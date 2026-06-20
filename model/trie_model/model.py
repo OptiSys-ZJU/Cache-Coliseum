@@ -15,6 +15,69 @@ from model.trie_model.tree_lstm import PathLSTMCell
 from model.trie_model.embed import NodeEmbedder
 
 
+class _ForwardPathEncodingCache:
+    """Forward-local differentiable prefix-state cache for trie path encoding."""
+
+    def __init__(self, model: "TrieParrotModel", device: torch.device):
+        self.model = model
+        self.device = device
+        self.states: Dict[Tuple[int, ...], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def encode_paths(self, paths) -> torch.Tensor:
+        path_list = [tuple(path) for path in paths]
+        batch_size = len(path_list)
+        if batch_size == 0:
+            return torch.zeros(0, self.model.hidden_size, device=self.device)
+
+        missing_by_depth: Dict[int, List[Tuple[int, ...]]] = {}
+        missing_seen = set()
+        for path in path_list:
+            for depth in range(1, len(path) + 1):
+                prefix = path[:depth]
+                if prefix in self.states or prefix in missing_seen:
+                    continue
+                missing_seen.add(prefix)
+                missing_by_depth.setdefault(depth, []).append(prefix)
+
+        for depth in sorted(missing_by_depth):
+            prefixes = missing_by_depth[depth]
+            node_ids = torch.tensor(
+                [prefix[-1] for prefix in prefixes],
+                dtype=torch.long,
+                device=self.device,
+            )
+            node_embeds = self.model.node_embedder(node_ids)
+            if depth == 1:
+                parent_state = None
+            else:
+                parent_h = torch.cat(
+                    [self.states[prefix[:-1]][0] for prefix in prefixes],
+                    dim=0,
+                )
+                parent_c = torch.cat(
+                    [self.states[prefix[:-1]][1] for prefix in prefixes],
+                    dim=0,
+                )
+                parent_state = (parent_h, parent_c)
+
+            h, c = self.model.path_lstm(node_embeds, parent_state)
+            for row_idx, prefix in enumerate(prefixes):
+                self.states[prefix] = (
+                    h[row_idx:row_idx + 1],
+                    c[row_idx:row_idx + 1],
+                )
+
+        encoded_rows = []
+        for path in path_list:
+            if path:
+                encoded_rows.append(self.states[path][0])
+            else:
+                encoded_rows.append(
+                    torch.zeros(1, self.model.hidden_size, device=self.device)
+                )
+        return torch.cat(encoded_rows, dim=0)
+
+
 class TrieParrotModel(nn.Module):
     """
     Tree-state aware predictor for cache eviction.
@@ -206,6 +269,14 @@ class TrieParrotModel(nn.Module):
             return buffer.device
         return torch.device("cpu")
 
+    def _new_path_encoding_cache(
+        self,
+        device: Optional[torch.device] = None,
+    ) -> _ForwardPathEncodingCache:
+        if device is None:
+            device = self._model_device()
+        return _ForwardPathEncodingCache(self, device)
+
     def compute_node_state(
         self,
         node_id: int,
@@ -283,6 +354,7 @@ class TrieParrotModel(nn.Module):
         history_paths,
         device: torch.device,
         max_history: Optional[int] = None,
+        cache: Optional[_ForwardPathEncodingCache] = None,
     ) -> Optional[torch.Tensor]:
         if history_paths is None:
             return None
@@ -292,17 +364,24 @@ class TrieParrotModel(nn.Module):
             return None
 
         limit = max(1, max_history or self.max_microstep_history)
-        return self._encode_path_batch(paths[-limit:], device, deduplicate=True)
+        return self._encode_path_batch(
+            paths[-limit:],
+            device,
+            deduplicate=True,
+            cache=cache,
+        )
 
     def _encode_request_history_paths(
         self,
         history_paths,
         device: torch.device,
+        cache: Optional[_ForwardPathEncodingCache] = None,
     ) -> Optional[torch.Tensor]:
         return self._encode_history_paths(
             history_paths,
             device,
             max_history=self.max_request_history,
+            cache=cache,
         )
 
     def _encode_path_batch(
@@ -310,12 +389,18 @@ class TrieParrotModel(nn.Module):
         paths,
         device: torch.device,
         deduplicate: bool = False,
+        cache: Optional[_ForwardPathEncodingCache] = None,
     ) -> torch.Tensor:
         """Encode many variable-length root-to-node paths in one LSTM pass."""
         path_list = [tuple(path) for path in paths]
         batch_size = len(path_list)
         if batch_size == 0:
             return torch.zeros(0, self.hidden_size, device=device)
+
+        if cache is not None:
+            if cache.device != device:
+                raise ValueError("path encoding cache device does not match encode device")
+            return cache.encode_paths(path_list)
 
         if deduplicate and batch_size > 1:
             unique_paths = []
@@ -375,6 +460,7 @@ class TrieParrotModel(nn.Module):
         history_paths_batch,
         device: torch.device,
         max_history: Optional[int] = None,
+        cache: Optional[_ForwardPathEncodingCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return padded history memory and a valid-slot mask for a step batch."""
         limit = max(1, max_history or self.max_microstep_history)
@@ -390,7 +476,12 @@ class TrieParrotModel(nn.Module):
             flat_paths.extend(paths)
             max_history = max(max_history, len(paths) if paths else 1)
 
-        encoded = self._encode_path_batch(flat_paths, device, deduplicate=True)
+        encoded = self._encode_path_batch(
+            flat_paths,
+            device,
+            deduplicate=True,
+            cache=cache,
+        )
         memory = torch.zeros(
             len(prepared),
             max_history,
@@ -426,17 +517,20 @@ class TrieParrotModel(nn.Module):
         self,
         history_paths_batch,
         device: torch.device,
+        cache: Optional[_ForwardPathEncodingCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return self._encode_history_paths_batch(
             history_paths_batch,
             device,
             max_history=self.max_request_history,
+            cache=cache,
         )
 
     def _encode_candidate_paths_batch(
         self,
         candidate_paths_batch,
         device: torch.device,
+        cache: Optional[_ForwardPathEncodingCache] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return padded candidate states and a valid-candidate mask."""
         counts = [len(candidate_paths) for candidate_paths in candidate_paths_batch]
@@ -446,7 +540,7 @@ class TrieParrotModel(nn.Module):
             for candidate_paths in candidate_paths_batch
             for path in candidate_paths
         ]
-        encoded = self._encode_path_batch(flat_paths, device)
+        encoded = self._encode_path_batch(flat_paths, device, cache=cache)
         candidates = torch.zeros(
             len(candidate_paths_batch),
             max_candidates,
@@ -644,18 +738,23 @@ class TrieParrotModel(nn.Module):
         third score head.
         """
         device = self._model_device()
+        active_cache = getattr(self, "_active_path_encoding_cache", None)
+        path_cache = active_cache or self._new_path_encoding_cache(device)
         micro_memory, micro_mask = self._encode_history_paths_batch(
             microstep_history_paths_batch,
             device,
             max_history=self.max_microstep_history,
+            cache=path_cache,
         )
         request_memory, request_mask = self._encode_request_history_paths_batch(
             request_history_paths_batch,
             device,
+            cache=path_cache,
         )
         candidate_states, candidate_mask = self._encode_candidate_paths_batch(
             candidate_paths_batch,
             device,
+            cache=path_cache,
         )
         lru_features = self._prepare_lru_features_batch(
             lru_features_batch,
@@ -747,7 +846,12 @@ class TrieParrotModel(nn.Module):
             assert candidate_paths is not None, "candidate_paths required when inference=False"
             if len(candidate_paths) == 0:
                 return torch.zeros(1, 0, device=device), torch.zeros(1, 0, device=device)
-            candidates = self._encode_path_batch(candidate_paths, device)
+            path_cache = self._new_path_encoding_cache(device)
+            candidates = self._encode_path_batch(
+                candidate_paths,
+                device,
+                cache=path_cache,
+            )
 
         candidate_batch = candidates.unsqueeze(0)
         candidate_mask = torch.ones(
@@ -1040,77 +1144,86 @@ class TrieParrotModel(nn.Module):
             step_windows.append(prepared_steps)
 
         max_window_len = max((len(window) for window in step_windows), default=0)
-        for step_idx in range(max_window_len):
-            batch_steps = [
-                window[step_idx]
-                for window in step_windows
-                if step_idx < len(window) and window[step_idx] is not None
-            ]
-            if not batch_steps:
-                continue
+        had_active_cache = hasattr(self, "_active_path_encoding_cache")
+        previous_active_cache = getattr(self, "_active_path_encoding_cache", None)
+        self._active_path_encoding_cache = self._new_path_encoding_cache(device)
+        try:
+            for step_idx in range(max_window_len):
+                batch_steps = [
+                    window[step_idx]
+                    for window in step_windows
+                    if step_idx < len(window) and window[step_idx] is not None
+                ]
+                if not batch_steps:
+                    continue
 
-            logits, pred_log_reuse, candidate_mask = self.forward_batched(
-                [item["microstep_history_paths"] for item in batch_steps],
-                [item["candidate_paths"] for item in batch_steps],
-                [item["request_history_paths"] for item in batch_steps],
-                [item["lru_features"] for item in batch_steps],
-            )
-
-            max_batch_candidates = logits.size(1)
-            oracle_rows = [
-                idx for idx, item in enumerate(batch_steps)
-                if item["relevances"] is not None
-            ]
-            if oracle_rows:
-                relevances = torch.zeros(
-                    len(batch_steps),
-                    max_batch_candidates,
-                    dtype=torch.float32,
-                    device=device,
+                logits, pred_log_reuse, candidate_mask = self.forward_batched(
+                    [item["microstep_history_paths"] for item in batch_steps],
+                    [item["candidate_paths"] for item in batch_steps],
+                    [item["request_history_paths"] for item in batch_steps],
+                    [item["lru_features"] for item in batch_steps],
                 )
-                for row_idx in oracle_rows:
-                    row_relevance = batch_steps[row_idx]["relevances"]
-                    relevances[row_idx, :row_relevance.numel()] = row_relevance
 
-                oracle_row_tensor = torch.tensor(
-                    oracle_rows,
-                    dtype=torch.long,
-                    device=device,
-                )
-                ranking_losses.append(
-                    self._approx_ndcg_loss(
-                        logits.index_select(0, oracle_row_tensor),
-                        relevances.index_select(0, oracle_row_tensor),
-                        candidate_mask.index_select(0, oracle_row_tensor),
+                max_batch_candidates = logits.size(1)
+                oracle_rows = [
+                    idx for idx, item in enumerate(batch_steps)
+                    if item["relevances"] is not None
+                ]
+                if oracle_rows:
+                    relevances = torch.zeros(
+                        len(batch_steps),
+                        max_batch_candidates,
+                        dtype=torch.float32,
+                        device=device,
                     )
-                )
+                    for row_idx in oracle_rows:
+                        row_relevance = batch_steps[row_idx]["relevances"]
+                        relevances[row_idx, :row_relevance.numel()] = row_relevance
 
-                if self.reuse_loss_weight > 0:
-                    squared_error = (pred_log_reuse - relevances).pow(2)
-                    valid_error = squared_error * candidate_mask.float()
-                    per_step_reuse = (
-                        valid_error.sum(dim=-1)
-                        / candidate_mask.float().sum(dim=-1).clamp_min(1.0)
+                    oracle_row_tensor = torch.tensor(
+                        oracle_rows,
+                        dtype=torch.long,
+                        device=device,
                     )
-                    reuse_losses.append(
-                        per_step_reuse.index_select(0, oracle_row_tensor)
+                    ranking_losses.append(
+                        self._approx_ndcg_loss(
+                            logits.index_select(0, oracle_row_tensor),
+                            relevances.index_select(0, oracle_row_tensor),
+                            candidate_mask.index_select(0, oracle_row_tensor),
+                        )
                     )
 
-            if self.ce_loss_weight > 0:
-                target_distribution = torch.zeros(
-                    len(batch_steps),
-                    max_batch_candidates,
-                    dtype=torch.float32,
-                    device=device,
-                )
-                for row_idx, item in enumerate(batch_steps):
-                    row_target = item["target_distribution"]
-                    if row_target is None:
-                        continue
-                    target_distribution[row_idx, :row_target.numel()] = row_target
+                    if self.reuse_loss_weight > 0:
+                        squared_error = (pred_log_reuse - relevances).pow(2)
+                        valid_error = squared_error * candidate_mask.float()
+                        per_step_reuse = (
+                            valid_error.sum(dim=-1)
+                            / candidate_mask.float().sum(dim=-1).clamp_min(1.0)
+                        )
+                        reuse_losses.append(
+                            per_step_reuse.index_select(0, oracle_row_tensor)
+                        )
 
-                log_probs = F.log_softmax(logits, dim=-1)
-                ce_losses.append(-(target_distribution * log_probs).sum(dim=-1))
+                if self.ce_loss_weight > 0:
+                    target_distribution = torch.zeros(
+                        len(batch_steps),
+                        max_batch_candidates,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    for row_idx, item in enumerate(batch_steps):
+                        row_target = item["target_distribution"]
+                        if row_target is None:
+                            continue
+                        target_distribution[row_idx, :row_target.numel()] = row_target
+
+                    log_probs = F.log_softmax(logits, dim=-1)
+                    ce_losses.append(-(target_distribution * log_probs).sum(dim=-1))
+        finally:
+            if had_active_cache:
+                self._active_path_encoding_cache = previous_active_cache
+            else:
+                delattr(self, "_active_path_encoding_cache")
 
         def reduce_loss_terms(terms, weight):
             values = torch.cat(terms, dim=0)
