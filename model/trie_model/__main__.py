@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import torch
 import tqdm
+from torch.nn.parallel import parallel_apply, replicate
 
 from model.trie_model.model import TrieParrotModel
 from cache.trie.trie_cache import TrieTrainingCache, SequenceTrieCache
@@ -269,6 +270,175 @@ def round_collection_examples(
     return round_step_budget(step, total_steps, dagger_update_freq) * safe_multiplier * batch_size
 
 
+def cuda_device_index(device: torch.device) -> int:
+    if device.type != "cuda":
+        raise ValueError(f"Expected a CUDA device, got {device}")
+    if device.index is None:
+        return torch.cuda.current_device() if torch.cuda.is_available() else 0
+    return int(device.index)
+
+
+def parse_train_device_ids(
+    train_devices: str,
+    primary_device: torch.device,
+    cuda_device_count: int = None,
+):
+    """Parse a comma-separated CUDA device list for loss parallelism."""
+    normalized_train_devices = (
+        train_devices.strip().lower()
+        if isinstance(train_devices, str)
+        else train_devices
+    )
+    if primary_device.type != "cuda":
+        if normalized_train_devices not in (None, "", "none", "single"):
+            raise ValueError("--train_devices requires a CUDA --device")
+        return []
+
+    if cuda_device_count is None:
+        cuda_device_count = torch.cuda.device_count()
+    primary_index = cuda_device_index(primary_device)
+
+    if normalized_train_devices in (None, "", "none", "single"):
+        device_ids = [primary_index]
+    elif normalized_train_devices == "auto":
+        device_ids = [primary_index] + [
+            idx for idx in range(cuda_device_count)
+            if idx != primary_index
+        ]
+    else:
+        device_ids = []
+        seen = set()
+        for raw_part in normalized_train_devices.split(","):
+            part = raw_part.strip().lower()
+            if not part:
+                continue
+            if part.startswith("cuda:"):
+                device_id = int(part.split(":", 1)[1])
+            elif part.startswith("gpu"):
+                device_id = int(part[3:])
+            else:
+                device_id = int(part)
+            if device_id not in seen:
+                device_ids.append(device_id)
+                seen.add(device_id)
+
+    if not device_ids:
+        raise ValueError("--train_devices did not contain any CUDA device ids")
+    invalid = [
+        device_id for device_id in device_ids
+        if device_id < 0 or device_id >= cuda_device_count
+    ]
+    if invalid:
+        raise ValueError(
+            f"CUDA device ids out of range for {cuda_device_count} visible GPUs: "
+            f"{invalid}"
+        )
+    return device_ids
+
+
+def split_batch_for_devices(batch, device_count: int):
+    """Split a list batch into non-empty, near-even shards."""
+    if device_count <= 0:
+        raise ValueError("device_count must be positive")
+    if not batch:
+        return []
+
+    shard_count = min(device_count, len(batch))
+    base = len(batch) // shard_count
+    extra = len(batch) % shard_count
+    chunks = []
+    start = 0
+    for shard_idx in range(shard_count):
+        size = base + (1 if shard_idx < extra else 0)
+        chunks.append(batch[start:start + size])
+        start += size
+    return chunks
+
+
+class TrieLossShard(torch.nn.Module):
+    """Replica wrapper that returns summed losses plus local loss statistics."""
+
+    def __init__(self, model: TrieParrotModel):
+        super().__init__()
+        self.model = model
+
+    def forward(self, snapshots, max_candidates, max_steps_per_snapshot):
+        losses = self.model.loss(
+            snapshots,
+            max_candidates=max_candidates,
+            max_steps_per_snapshot=max_steps_per_snapshot,
+            reduction="sum",
+        )
+        return losses, dict(self.model.last_loss_stats)
+
+
+def merge_loss_shard_outputs(outputs, primary_device: torch.device):
+    loss_names = ("ranking", "reuse", "ce")
+    loss_sums = {name: None for name in loss_names}
+    counts = {name: 0 for name in loss_names}
+    combined_stats = {}
+
+    for losses, stats in outputs:
+        for key, value in stats.items():
+            if isinstance(value, (int, float)):
+                combined_stats[key] = combined_stats.get(key, 0) + value
+        for name in loss_names:
+            value = losses[name].to(primary_device)
+            loss_sums[name] = value if loss_sums[name] is None else loss_sums[name] + value
+            counts[name] += int(stats.get(f"{name}_count", 0))
+
+    merged_losses = {}
+    for name in loss_names:
+        if counts[name] > 0:
+            merged_losses[name] = loss_sums[name] / counts[name]
+        else:
+            merged_losses[name] = torch.tensor(
+                0.0,
+                device=primary_device,
+                requires_grad=True,
+            )
+        combined_stats[f"{name}_count"] = counts[name]
+
+    return merged_losses, combined_stats
+
+
+def compute_training_losses(
+    model: TrieParrotModel,
+    batch,
+    max_candidates,
+    max_steps_per_snapshot,
+    train_device_ids,
+):
+    """Compute one optimizer-step loss, optionally sharded across CUDA devices."""
+    if len(train_device_ids) < 2 or len(batch) < 2:
+        return model.loss(
+            batch,
+            max_candidates=max_candidates,
+            max_steps_per_snapshot=max_steps_per_snapshot,
+        )
+
+    primary_device = next(model.parameters()).device
+    chunks = split_batch_for_devices(batch, len(train_device_ids))
+    active_device_ids = train_device_ids[:len(chunks)]
+    if len(active_device_ids) < 2:
+        return model.loss(
+            batch,
+            max_candidates=max_candidates,
+            max_steps_per_snapshot=max_steps_per_snapshot,
+        )
+
+    loss_module = TrieLossShard(model)
+    replicas = replicate(loss_module, active_device_ids)
+    inputs = tuple(
+        (chunk, max_candidates, max_steps_per_snapshot)
+        for chunk in chunks
+    )
+    outputs = parallel_apply(replicas, inputs, devices=active_device_ids)
+    losses, stats = merge_loss_shard_outputs(outputs, primary_device)
+    model.last_loss_stats = stats
+    return losses
+
+
 def evaluate(
     data_path: str,
     vocab_path: str,
@@ -324,12 +494,17 @@ def save_training_checkpoint(path: str, model, optimizer, step: int, best_eval_h
 def load_training_checkpoint(path: str, model, optimizer, device):
     checkpoint = torch.load(path, map_location=device)
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
-        if "optimizer_state_dict" in checkpoint:
+        load_info = model.load_state_dict_compatible(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint and not load_info["migrated"]:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        elif "optimizer_state_dict" in checkpoint:
+            print(
+                "TrieParrot: skipped optimizer state because checkpoint weights "
+                "were migrated to deterministic LRU-prior scoring"
+            )
         return int(checkpoint.get("step", 0)), float(checkpoint.get("best_eval_hit_rate", 0.0))
 
-    model.load_state_dict(checkpoint)
+    model.load_state_dict_compatible(checkpoint)
     return 0, 0.0
 
 
@@ -496,9 +671,28 @@ if __name__ == '__main__':
     parser.add_argument("--data_root_dir", type=str, default='data')
     parser.add_argument("--resume_checkpoint_path", type=str, default=None)
     parser.add_argument("--resume_auto", action="store_true")
+    parser.add_argument(
+        "--train_devices",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated CUDA device ids for sharding training "
+            "loss, e.g. '0,1', 'cuda:4,cuda:5', 'gpu4,gpu5', or 'auto'. "
+            "Collection and eval still run on the first device."
+        ),
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device requested but unavailable: {device}")
+        train_device_ids = parse_train_device_ids(args.train_devices, device)
+        if cuda_device_index(device) != train_device_ids[0]:
+            device = torch.device(f"cuda:{train_device_ids[0]}")
+        torch.cuda.set_device(device)
+    else:
+        train_device_ids = []
 
     # Load config
     if not os.path.exists(args.model_config_path):
@@ -538,10 +732,38 @@ if __name__ == '__main__':
     ce_target_policy = config.get('ce_target_policy', 'argmax')
     reuse_distance_log_cap = config.get('reuse_distance_log_cap', 5.0)
     ndcg_alpha = config.get('ndcg_alpha', 10.0)
+    fixed_lru_prior_alpha = config.get('lru_prior_alpha_fixed')
+    fixed_lru_prior_requested = (
+        fixed_lru_prior_alpha
+        if isinstance(fixed_lru_prior_alpha, bool)
+        else fixed_lru_prior_alpha is not None
+    )
+    default_lru_prior_alpha = (
+        1.0
+        if isinstance(fixed_lru_prior_alpha, bool)
+        or fixed_lru_prior_alpha is None
+        else fixed_lru_prior_alpha
+    )
+    lru_prior_alpha_init = config.get(
+        'lru_prior_alpha_init',
+        default_lru_prior_alpha,
+    )
+    lru_prior_alpha_learnable = config.get(
+        'lru_prior_alpha_learnable',
+        not fixed_lru_prior_requested,
+    )
 
     print(f'TrieParrot: lr={lr}, total_steps={total_steps}, eval_freq={eval_freq}, '
           f'save_freq={save_freq}, batch_size={batch_size}, '
           f'sequence_length={sequence_length}')
+    if train_device_ids:
+        print(
+            "TrieParrot: training loss devices="
+            f"{','.join(f'cuda:{device_id}' for device_id in train_device_ids)} "
+            f"mode={'multi_gpu' if len(train_device_ids) > 1 else 'single_gpu'}"
+        )
+    else:
+        print(f"TrieParrot: training device={device}")
     candidate_mode = (
         "full" if max_loss_candidates is None else f"capped@{max_loss_candidates}"
     )
@@ -563,6 +785,11 @@ if __name__ == '__main__':
         f"ranking={ranking_loss_weight} reuse={reuse_loss_weight} ce={ce_loss_weight} "
         f"ce_target_policy={ce_target_policy} "
         f"reuse_distance_log_cap={reuse_distance_log_cap} ndcg_alpha={ndcg_alpha}"
+    )
+    print(
+        "TrieParrot: LRU prior "
+        f"alpha_init={lru_prior_alpha_init} "
+        f"alpha_learnable={lru_prior_alpha_learnable}"
     )
     print(f'TrieParrot: DAgger init={dagger_init}, final={dagger_final}, '
           f'steps={dagger_steps}, update_freq={dagger_update_freq}')
@@ -593,6 +820,12 @@ if __name__ == '__main__':
 
     # Override config vocab_size with actual data vocab_size
     config['vocab_size'] = vocab_size
+    config['lru_prior_alpha_init'] = lru_prior_alpha_init
+    config['lru_prior_alpha_learnable'] = lru_prior_alpha_learnable
+    if train_device_ids:
+        config['train_devices'] = [
+            f'cuda:{device_id}' for device_id in train_device_ids
+        ]
 
     # Checkpoint dir
     checkpoint_dir = os.path.join(args.checkpoints_root_dir, 'trie_model', args.dataset)
@@ -622,6 +855,8 @@ if __name__ == '__main__':
         ce_target_policy=ce_target_policy,
         reuse_distance_log_cap=reuse_distance_log_cap,
         ndcg_alpha=ndcg_alpha,
+        lru_prior_alpha_init=lru_prior_alpha_init,
+        lru_prior_alpha_learnable=lru_prior_alpha_learnable,
     ).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
@@ -865,10 +1100,12 @@ if __name__ == '__main__':
                 
                 # Forward + backward
                 optimizer.zero_grad()
-                losses = model.loss(
+                losses = compute_training_losses(
+                    model,
                     batch,
-                    max_candidates=max_loss_candidates,
-                    max_steps_per_snapshot=max_loss_steps_per_snapshot,
+                    max_loss_candidates,
+                    max_loss_steps_per_snapshot,
+                    train_device_ids,
                 )
                 total_loss = sum(losses.values())
                 if not torch.isfinite(total_loss):

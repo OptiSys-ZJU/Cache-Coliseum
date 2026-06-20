@@ -90,7 +90,7 @@ print("  no legacy token-history encoder parameters")
 expert_head_has_grad = False
 for name, param in model.named_parameters():
     if (
-        name.startswith(("request_head", "micro_head", "lru_head"))
+        name.startswith(("request_head", "micro_head", "lru_prior_raw_alpha"))
         and param.grad is not None
         and param.grad.abs().sum() > 0
     ):

@@ -5,6 +5,7 @@ set -euo pipefail
 # host. Run this from the repository root after syncing code and data.
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export TRAIN_DEVICES="${TRAIN_DEVICES:-single}"
 
 python - <<'PY'
 import torch
@@ -20,5 +21,6 @@ python -m model.trie_model \
   --dataset oasst1_timed_global_b16 \
   --data_root_dir data \
   --device cuda:0 \
+  --train_devices "${TRAIN_DEVICES}" \
   --model_config_path configs/full_dagger_oasst1_b16_c256.json \
   --checkpoints_root_dir checkpoints/full_dagger_oasst1_b16_c256

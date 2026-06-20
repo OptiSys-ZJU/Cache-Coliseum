@@ -309,6 +309,93 @@ def test_batched_loss_matches_stepwise_reference_with_padding():
         assert torch.allclose(actual[name], expected[name], atol=1e-6), name
 
 
+def test_loss_sum_reduction_matches_mean_times_counts():
+    snapshots = [
+        SimpleNamespace(eviction_steps=[
+            make_step([(1,), (2,), (3,)], [1.0, 5.0, float("inf")]),
+            make_step([(4,), (5,)], [2.0, float("inf")]),
+        ]),
+        SimpleNamespace(eviction_steps=[
+            make_step([(6,), (7,), (8,)], [float("inf"), 4.0, 4.0]),
+        ]),
+    ]
+    model = make_model(
+        reuse_loss_weight=0.2,
+        ce_loss_weight=0.5,
+        ce_target_policy="top_set",
+    )
+
+    mean_losses = model.loss(snapshots, max_candidates=3)
+    mean_stats = dict(model.last_loss_stats)
+    sum_losses = model.loss(snapshots, max_candidates=3, reduction="sum")
+    sum_stats = dict(model.last_loss_stats)
+
+    for name in ("ranking", "reuse", "ce"):
+        count = sum_stats[f"{name}_count"]
+        assert count == mean_stats[f"{name}_count"]
+        assert count > 0
+        assert torch.allclose(
+            sum_losses[name] / count,
+            mean_losses[name],
+            atol=1e-6,
+        ), name
+
+
+def test_from_config_lru_prior_alpha_fields():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        learnable_path = os.path.join(tmpdir, "learnable.json")
+        with open(learnable_path, "w") as f:
+            json.dump(
+                {
+                    "vocab_size": 128,
+                    "node_embed_dim": 16,
+                    "hidden_size": 32,
+                    "lru_prior_alpha_init": 1.5,
+                    "lru_prior_alpha_learnable": True,
+                },
+                f,
+            )
+        learnable = TrieParrotModel.from_config(learnable_path)
+        assert math.isclose(learnable.lru_prior_alpha().item(), 1.5, abs_tol=1e-6)
+        assert "lru_prior_raw_alpha" in dict(learnable.named_parameters())
+
+        fixed_path = os.path.join(tmpdir, "fixed.json")
+        with open(fixed_path, "w") as f:
+            json.dump(
+                {
+                    "vocab_size": 128,
+                    "node_embed_dim": 16,
+                    "hidden_size": 32,
+                    "lru_prior_alpha_fixed": 0.75,
+                },
+                f,
+            )
+        fixed = TrieParrotModel.from_config(fixed_path)
+        assert math.isclose(fixed.lru_prior_alpha().item(), 0.75, abs_tol=1e-6)
+        assert "lru_prior_raw_alpha" not in dict(fixed.named_parameters())
+
+
+def test_old_lru_head_checkpoint_migrates_to_lru_prior():
+    model = make_model(lru_prior_alpha_init=1.25)
+    old_state = dict(model.state_dict())
+    old_state["score_mix_logits"] = torch.tensor([0.4, -0.2, 1.5])
+    old_state["lru_head.0.weight"] = torch.ones(5)
+    old_state["lru_head.0.bias"] = torch.zeros(5)
+    old_state.pop("lru_prior_raw_alpha")
+
+    fresh = make_model(lru_prior_alpha_init=1.25)
+    load_info = fresh.load_state_dict_compatible(old_state)
+
+    assert load_info["migrated"]
+    assert any(key.startswith("lru_head.") for key in load_info["dropped_keys"])
+    assert fresh.score_mix_logits.shape == torch.Size([2])
+    assert torch.allclose(
+        fresh.score_mix_logits.detach(),
+        torch.tensor([0.4, -0.2]),
+    )
+    assert math.isclose(fresh.lru_prior_alpha().item(), 1.25, abs_tol=1e-6)
+
+
 def test_loss_batches_same_time_steps_across_windows():
     model = make_model(reuse_loss_weight=0.0)
     snapshots = [
@@ -520,6 +607,9 @@ if __name__ == "__main__":
     test_loss_uses_all_candidates_by_default()
     test_loss_candidate_cap_keeps_current_hit_required_candidate()
     test_batched_loss_matches_stepwise_reference_with_padding()
+    test_loss_sum_reduction_matches_mean_times_counts()
+    test_from_config_lru_prior_alpha_fields()
+    test_old_lru_head_checkpoint_migrates_to_lru_prior()
     test_loss_batches_same_time_steps_across_windows()
     test_loss_has_finite_reuse_with_inf_distance()
     test_ce_optional_default_zero_and_enabled_path()

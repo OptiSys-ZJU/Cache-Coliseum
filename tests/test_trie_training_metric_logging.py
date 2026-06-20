@@ -8,6 +8,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import torch
+
 from model.trie_model.__main__ import (
     METRIC_FIELDS,
     append_metric_row,
@@ -20,6 +22,8 @@ from model.trie_model.__main__ import (
     round_step_budget,
     should_run_periodic_event,
     latest_training_checkpoint,
+    parse_train_device_ids,
+    split_batch_for_devices,
     training_checkpoint_step,
 )
 from model.trie_model.model import TrieParrotModel
@@ -117,6 +121,25 @@ def test_latest_training_checkpoint_includes_final_training_state():
         assert training_checkpoint_step(step_100) == 100
         assert training_checkpoint_step(final_300) == 300
         assert latest_training_checkpoint(tmpdir) == final_300
+
+
+def test_train_device_parser_and_batch_splitter():
+    assert parse_train_device_ids(None, torch.device("cuda:4"), 8) == [4]
+    assert parse_train_device_ids("gpu4,cuda:5,4", torch.device("cuda:4"), 8) == [4, 5]
+    assert parse_train_device_ids("auto", torch.device("cuda:4"), 6) == [4, 0, 1, 2, 3, 5]
+    assert split_batch_for_devices(list(range(10)), 4) == [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6, 7],
+        [8, 9],
+    ]
+
+    try:
+        parse_train_device_ids("0", torch.device("cpu"), 8)
+    except ValueError as exc:
+        assert "--train_devices requires" in str(exc)
+    else:
+        raise AssertionError("CPU training must reject explicit train_devices")
 
 
 def test_plot_loss_curves_filters_run_id_and_writes_png():
@@ -317,6 +340,7 @@ if __name__ == "__main__":
     test_metric_append_writes_header_and_preserves_existing_rows()
     test_metric_append_upgrades_older_header()
     test_latest_training_checkpoint_includes_final_training_state()
+    test_train_device_parser_and_batch_splitter()
     test_plot_loss_curves_filters_run_id_and_writes_png()
     test_plot_loss_curves_handles_single_step_run()
     test_round_budget_limits_each_collect_round()

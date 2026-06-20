@@ -8,7 +8,6 @@ from types import SimpleNamespace
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import torch
-import torch.nn as nn
 
 from cache.trie.oracle import PrefixFutureOracle
 from cache.trie.trie_algorithms import TrieModelPredictAlgorithm, TrieNode
@@ -312,21 +311,20 @@ def test_candidate_is_query_only_not_direct_scorer_input():
     assert torch.allclose(pred_reuse[:, 0], pred_reuse[:, 1], atol=1e-6)
 
 
-def test_lru_expert_directly_conditions_score():
-    model = TrieParrotModel(vocab_size=128, node_embed_dim=16, hidden_size=8)
+def test_lru_prior_directly_conditions_score():
+    model = TrieParrotModel(
+        vocab_size=128,
+        node_embed_dim=16,
+        hidden_size=8,
+        lru_prior_alpha_init=2.5,
+        lru_prior_alpha_learnable=False,
+    )
     model.eval()
-    model.request_head = nn.Linear(model.hidden_size, 1)
-    model.micro_head = nn.Linear(model.hidden_size, 1)
-    model.lru_head = nn.Linear(model.lru_feature_dim, 1)
     with torch.no_grad():
         model.request_head.weight.zero_()
         model.request_head.bias.zero_()
         model.micro_head.weight.zero_()
         model.micro_head.bias.zero_()
-        model.lru_head.weight.zero_()
-        model.lru_head.weight[0, 0] = 1.0
-        model.lru_head.bias.zero_()
-        model.score_mix_logits[:] = torch.tensor([-10.0, -10.0, 10.0])
 
     microstep_history_memory = torch.randn(1, model.hidden_size)
     request_history_memory = torch.randn(1, model.hidden_size)
@@ -348,8 +346,78 @@ def test_lru_expert_directly_conditions_score():
             inference=True,
         )
 
-    assert not torch.allclose(logits[:, 0], logits[:, 1], atol=1e-6)
+    expected_gap = 2.5 * (math.log1p(8.0) - math.log1p(1.0))
+    assert logits[0, 1] > logits[0, 0]
+    assert torch.allclose(logits[0, 1] - logits[0, 0], torch.tensor(expected_gap), atol=1e-6)
     assert pred_reuse.shape == logits.shape
+
+
+def test_lru_prior_alpha_initialization_and_nonnegative():
+    learnable = TrieParrotModel(
+        vocab_size=128,
+        node_embed_dim=16,
+        hidden_size=8,
+        lru_prior_alpha_init=1.75,
+    )
+    assert learnable.lru_prior_alpha().item() >= 0.0
+    assert math.isclose(learnable.lru_prior_alpha().item(), 1.75, rel_tol=0.0, abs_tol=1e-6)
+
+    with torch.no_grad():
+        learnable.lru_prior_raw_alpha.fill_(-100.0)
+    assert learnable.lru_prior_alpha().item() >= 0.0
+
+    fixed = TrieParrotModel(
+        vocab_size=128,
+        node_embed_dim=16,
+        hidden_size=8,
+        lru_prior_alpha_init=0.25,
+        lru_prior_alpha_learnable=False,
+    )
+    assert math.isclose(fixed.lru_prior_alpha().item(), 0.25, rel_tol=0.0, abs_tol=1e-6)
+    assert "lru_prior_raw_alpha" not in dict(fixed.named_parameters())
+
+
+def test_lru_prior_forward_and_batch_paths_match():
+    model = TrieParrotModel(
+        vocab_size=128,
+        node_embed_dim=16,
+        hidden_size=8,
+        lru_prior_alpha_init=1.25,
+        lru_prior_alpha_learnable=False,
+    )
+    model.eval()
+    with torch.no_grad():
+        model.request_head.weight.zero_()
+        model.request_head.bias.fill_(0.75)
+        model.micro_head.weight.zero_()
+        model.micro_head.bias.fill_(-0.25)
+        model.score_mix_logits.zero_()
+
+    candidate_paths = [(1,), (2, 3), (4,)]
+    lru_features = [
+        (1.0, 1.0, 1.0, 1.0, 1.0),
+        (4.0, 4.0, 4.0, 4.0, 2.0),
+        (9.0, 9.0, 9.0, 9.0, 1.0),
+    ]
+
+    with torch.no_grad():
+        forward_logits, forward_reuse = model.forward(
+            torch.empty(0, model.hidden_size),
+            torch.empty(0, model.hidden_size),
+            lru_features,
+            candidate_paths=candidate_paths,
+            inference=False,
+        )
+        batch_logits, batch_reuse, batch_mask = model.forward_batched(
+            [[]],
+            [candidate_paths],
+            [[]],
+            [lru_features],
+        )
+
+    assert torch.equal(batch_mask, torch.ones_like(batch_mask))
+    assert torch.allclose(batch_logits, forward_logits, atol=1e-6)
+    assert torch.allclose(batch_reuse, forward_reuse, atol=1e-6)
 
 
 def test_loss_handles_finite_and_inf_oracle_distances_without_nan():
@@ -404,6 +472,8 @@ if __name__ == "__main__":
     test_eviction_does_not_append_history()
     test_request_touch_appends_microstep_history_slots()
     test_candidate_is_query_only_not_direct_scorer_input()
-    test_lru_expert_directly_conditions_score()
+    test_lru_prior_directly_conditions_score()
+    test_lru_prior_alpha_initialization_and_nonnegative()
+    test_lru_prior_forward_and_batch_paths_match()
     test_loss_handles_finite_and_inf_oracle_distances_without_nan()
     print("TRIE-PARROT V1 SEMANTICS TESTS PASSED")

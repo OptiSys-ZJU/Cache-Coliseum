@@ -40,6 +40,8 @@ class TrieParrotModel(nn.Module):
         lru_feature_dim: int = 5,
         reuse_distance_log_cap: float = 5.0,
         ndcg_alpha: float = 10.0,
+        lru_prior_alpha_init: float = 1.0,
+        lru_prior_alpha_learnable: bool = True,
     ):
         """
         Initialize TrieParrotModel.
@@ -66,6 +68,10 @@ class TrieParrotModel(nn.Module):
             else max_microstep_history
         )
         self.lru_feature_dim = lru_feature_dim
+        self.lru_prior_alpha_init = float(lru_prior_alpha_init)
+        if self.lru_prior_alpha_init < 0:
+            raise ValueError("lru_prior_alpha_init must be nonnegative")
+        self.lru_prior_alpha_learnable = bool(lru_prior_alpha_learnable)
         self.ranking_loss_weight = ranking_loss_weight
         self.reuse_loss_weight = reuse_loss_weight
         self.ce_loss_weight = ce_loss_weight
@@ -100,20 +106,105 @@ class TrieParrotModel(nn.Module):
         self.query_proj = nn.Linear(hidden_size, hidden_size)
         self.key_proj = nn.Linear(hidden_size, hidden_size)
 
-        lru_hidden_size = max(1, hidden_size // 2)
         self.request_head = nn.Linear(hidden_size, 1)
         self.micro_head = nn.Linear(hidden_size, 1)
-        self.lru_head = nn.Sequential(
-            nn.LayerNorm(lru_feature_dim),
-            nn.Linear(lru_feature_dim, lru_hidden_size),
-            nn.GELU(),
-            nn.Linear(lru_hidden_size, 1),
-        )
-        self.score_mix_logits = nn.Parameter(torch.zeros(3))
+        if self.lru_prior_alpha_learnable:
+            raw_alpha = self._inverse_softplus(self.lru_prior_alpha_init)
+            self.lru_prior_raw_alpha = nn.Parameter(torch.tensor(raw_alpha))
+        else:
+            self.register_buffer(
+                "lru_prior_fixed_alpha",
+                torch.tensor(self.lru_prior_alpha_init, dtype=torch.float32),
+            )
+        self.score_mix_logits = nn.Parameter(torch.zeros(2))
         self.reuse_estimator = nn.Linear(
             hidden_size * 2 + lru_feature_dim,
             1,
         )
+
+    @staticmethod
+    def _inverse_softplus(value: float) -> float:
+        if value <= 0.0:
+            return -20.0
+        return math.log(math.expm1(value))
+
+    def lru_prior_alpha(self) -> torch.Tensor:
+        if self.lru_prior_alpha_learnable:
+            return F.softplus(self.lru_prior_raw_alpha)
+        return torch.clamp_min(self.lru_prior_fixed_alpha, 0.0)
+
+    def _adapt_state_dict_for_lru_prior(self, state_dict):
+        adapted = dict(state_dict)
+        dropped_keys = []
+        migrated = False
+
+        for key in list(adapted):
+            if key.startswith("lru_head."):
+                dropped_keys.append(key)
+                del adapted[key]
+                migrated = True
+
+        mix_key = "score_mix_logits"
+        if mix_key in adapted:
+            saved_mix = adapted[mix_key]
+            target_mix = self.score_mix_logits
+            if tuple(saved_mix.shape) != tuple(target_mix.shape):
+                flat_saved_mix = saved_mix.reshape(-1)
+                if flat_saved_mix.numel() == 3 and target_mix.numel() == 2:
+                    adapted[mix_key] = flat_saved_mix[:2].clone().view_as(target_mix)
+                    migrated = True
+                else:
+                    dropped_keys.append(mix_key)
+                    del adapted[mix_key]
+                    migrated = True
+
+        return adapted, migrated, dropped_keys
+
+    def load_state_dict_compatible(self, state_dict):
+        """Load current or pre-LRU-prior TrieParrot weights with narrow migration."""
+        adapted, migrated, dropped_keys = self._adapt_state_dict_for_lru_prior(
+            state_dict
+        )
+        incompatible = super().load_state_dict(adapted, strict=False)
+
+        allowed_missing = set()
+        current_state_keys = set(self.state_dict())
+        for key in ("lru_prior_raw_alpha", "lru_prior_fixed_alpha"):
+            if key in current_state_keys and key not in adapted:
+                allowed_missing.add(key)
+        if "score_mix_logits" in dropped_keys:
+            allowed_missing.add("score_mix_logits")
+
+        missing = set(incompatible.missing_keys)
+        unexpected = set(incompatible.unexpected_keys)
+        disallowed_missing = missing - allowed_missing
+        if disallowed_missing or unexpected:
+            raise RuntimeError(
+                "Unexpected TrieParrot checkpoint mismatch after LRU-prior "
+                f"migration: missing={sorted(disallowed_missing)}, "
+                f"unexpected={sorted(unexpected)}"
+            )
+
+        return {
+            "migrated": migrated or bool(missing & allowed_missing),
+            "dropped_keys": dropped_keys,
+            "missing_keys": sorted(missing),
+        }
+
+    def _model_device(self) -> torch.device:
+        """Return this module's device, including DataParallel replicas."""
+        for param in self.parameters():
+            return param.device
+
+        for module in self.modules():
+            former_parameters = getattr(module, "_former_parameters", None)
+            if former_parameters:
+                for param in former_parameters.values():
+                    return param.device
+
+        for buffer in self.buffers():
+            return buffer.device
+        return torch.device("cpu")
 
     def compute_node_state(
         self,
@@ -134,7 +225,7 @@ class TrieParrotModel(nn.Module):
         Returns:
             (h, c) tuple, each shape (1, hidden_size)
         """
-        device = next(self.parameters()).device
+        device = self._model_device()
         node_embed = self.node_embedder.embed_single(node_id, device)
         h, c = self.path_lstm(node_embed, parent_state)
         return h, c
@@ -462,14 +553,14 @@ class TrieParrotModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         request_logit = self.request_head(request_context).squeeze(-1)
         micro_logit = self.micro_head(micro_context).squeeze(-1)
-        lru_logit = self.lru_head(lru_features).squeeze(-1)
+        lru_prior = lru_features[..., 0]
 
         mix_weights = F.softmax(self.score_mix_logits, dim=0)
-        eviction_logits = (
+        context_score = (
             mix_weights[0] * request_logit
             + mix_weights[1] * micro_logit
-            + mix_weights[2] * lru_logit
         )
+        eviction_logits = context_score + self.lru_prior_alpha() * lru_prior
 
         reuse_input = torch.cat(
             [request_context, micro_context, lru_features],
@@ -526,7 +617,7 @@ class TrieParrotModel(nn.Module):
         request microstep history; explicit candidate LRU features provide the
         third score head.
         """
-        device = next(self.parameters()).device
+        device = self._model_device()
         micro_memory, micro_mask = self._encode_history_paths_batch(
             microstep_history_paths_batch,
             device,
@@ -588,7 +679,7 @@ class TrieParrotModel(nn.Module):
             eviction_logits: shape (1, N)
             pred_reuse_distances: shape (1, N)
         """
-        device = next(self.parameters()).device
+        device = self._model_device()
         micro_memory, has_micro_history = self._prepare_history_memory(
             microstep_history_memory,
             device,
@@ -797,6 +888,7 @@ class TrieParrotModel(nn.Module):
         snapshots,
         max_candidates: Optional[int] = None,
         max_steps_per_snapshot: Optional[int] = None,
+        reduction: str = "mean",
     ) -> Dict[str, torch.Tensor]:
         """
         Compute training loss from snapshots collected by TrieTrainingCache.
@@ -806,7 +898,10 @@ class TrieParrotModel(nn.Module):
         is named eviction_steps, but its entries are microstep cache-state
         training steps.
         """
-        device = next(self.parameters()).device
+        if reduction not in {"mean", "sum"}:
+            raise ValueError("reduction must be one of {'mean', 'sum'}")
+
+        device = self._model_device()
         ranking_losses = []
         reuse_losses = []
         ce_losses = []
@@ -814,6 +909,9 @@ class TrieParrotModel(nn.Module):
             "full_steps": 0,
             "capped_steps": 0,
             "candidate_count": 0,
+            "ranking_count": 0,
+            "reuse_count": 0,
+            "ce_count": 0,
         }
 
         step_windows = []
@@ -973,21 +1071,37 @@ class TrieParrotModel(nn.Module):
                 log_probs = F.log_softmax(logits, dim=-1)
                 ce_losses.append(-(target_distribution * log_probs).sum(dim=-1))
 
+        def reduce_loss_terms(terms, weight):
+            values = torch.cat(terms, dim=0)
+            if reduction == "sum":
+                return weight * values.sum()
+            return weight * values.mean()
+
         losses = {}
         if ranking_losses:
-            losses["ranking"] = (
-                self.ranking_loss_weight * torch.cat(ranking_losses, dim=0).mean()
+            stats["ranking_count"] = sum(term.numel() for term in ranking_losses)
+            losses["ranking"] = reduce_loss_terms(
+                ranking_losses,
+                self.ranking_loss_weight,
             )
         else:
             losses["ranking"] = torch.tensor(0.0, device=device, requires_grad=True)
 
         if reuse_losses:
-            losses["reuse"] = self.reuse_loss_weight * torch.cat(reuse_losses, dim=0).mean()
+            stats["reuse_count"] = sum(term.numel() for term in reuse_losses)
+            losses["reuse"] = reduce_loss_terms(
+                reuse_losses,
+                self.reuse_loss_weight,
+            )
         else:
             losses["reuse"] = torch.tensor(0.0, device=device, requires_grad=True)
 
         if ce_losses:
-            losses["ce"] = self.ce_loss_weight * torch.cat(ce_losses, dim=0).mean()
+            stats["ce_count"] = sum(term.numel() for term in ce_losses)
+            losses["ce"] = reduce_loss_terms(
+                ce_losses,
+                self.ce_loss_weight,
+            )
         else:
             losses["ce"] = torch.tensor(0.0, device=device, requires_grad=True)
 
@@ -1010,6 +1124,22 @@ class TrieParrotModel(nn.Module):
         with open(config_path, "r") as f:
             config = json.load(f)
 
+        fixed_lru_prior_alpha = config.get("lru_prior_alpha_fixed")
+        fixed_lru_prior_requested = (
+            fixed_lru_prior_alpha
+            if isinstance(fixed_lru_prior_alpha, bool)
+            else fixed_lru_prior_alpha is not None
+        )
+        default_lru_prior_alpha = (
+            1.0
+            if isinstance(fixed_lru_prior_alpha, bool)
+            or fixed_lru_prior_alpha is None
+            else fixed_lru_prior_alpha
+        )
+        lru_prior_alpha_init = config.get(
+            "lru_prior_alpha_init",
+            default_lru_prior_alpha,
+        )
         model = cls(
             vocab_size=config["vocab_size"],
             node_embed_dim=config.get("node_embed_dim", 64),
@@ -1024,10 +1154,15 @@ class TrieParrotModel(nn.Module):
             ce_target_policy=config.get("ce_target_policy", "argmax"),
             reuse_distance_log_cap=config.get("reuse_distance_log_cap", 5.0),
             ndcg_alpha=config.get("ndcg_alpha", 10.0),
+            lru_prior_alpha_init=lru_prior_alpha_init,
+            lru_prior_alpha_learnable=config.get(
+                "lru_prior_alpha_learnable",
+                not fixed_lru_prior_requested,
+            ),
         )
 
         if checkpoint_path is not None:
             state_dict = torch.load(checkpoint_path, map_location="cpu")
-            model.load_state_dict(state_dict)
+            model.load_state_dict_compatible(state_dict)
 
         return model
