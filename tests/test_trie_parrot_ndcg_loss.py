@@ -68,6 +68,7 @@ def stepwise_reference_loss(
     snapshots,
     max_candidates=None,
     max_steps_per_snapshot=None,
+    warmup_steps_per_snapshot=0,
 ):
     """Previous per-step loss shape, kept as a batching oracle."""
     device = next(model.parameters()).device
@@ -77,6 +78,9 @@ def stepwise_reference_loss(
 
     for snapshot in snapshots:
         eviction_steps = snapshot.eviction_steps
+        warmup_steps = max(0, int(warmup_steps_per_snapshot or 0))
+        if warmup_steps > 0:
+            eviction_steps = eviction_steps[warmup_steps:]
         if (
             max_steps_per_snapshot is not None
             and len(eviction_steps) > max_steps_per_snapshot
@@ -162,6 +166,35 @@ def stepwise_reference_loss(
     else:
         losses["ce"] = torch.tensor(0.0, device=device, requires_grad=True)
     return losses
+
+
+def test_loss_warmup_matches_parrot_suffix_loss():
+    model = make_model(reuse_loss_weight=0.2)
+    snapshots = [
+        SimpleNamespace(
+            eviction_steps=[
+                make_step([(1,), (2,), (3,)], [1, 2, float("inf")]),
+                make_step([(1,), (2,), (3,)], [float("inf"), 1, 2]),
+                make_step([(1,), (2,), (3,)], [1, float("inf"), 2]),
+                make_step([(1,), (2,), (3,)], [2, 1, float("inf")]),
+            ],
+        ),
+    ]
+
+    batched = model.loss(snapshots, warmup_steps_per_snapshot=2)
+    reference = stepwise_reference_loss(
+        model,
+        snapshots,
+        warmup_steps_per_snapshot=2,
+    )
+
+    for name in ("ranking", "reuse", "ce"):
+        assert torch.allclose(batched[name], reference[name], atol=1e-6), (
+            name,
+            batched[name].item(),
+            reference[name].item(),
+        )
+    assert model.last_loss_stats["loss_steps"] == 2
 
 
 def test_relevance_transform_parrot_style():
@@ -566,15 +599,107 @@ def test_empty_history_paths_are_not_real_history_slots():
 def test_batched_path_encoding_matches_stepwise_encoding():
     model = make_model()
     device = torch.device("cpu")
-    paths = [(), (1,), (1, 2), (3, 4, 5)]
+    paths = [(), (1,), (1, 2), (1,), (3, 4, 5), (1, 2)]
 
     expected = torch.cat(
         [model._encode_path(path, device) for path in paths],
         dim=0,
     )
     actual = model._encode_path_batch(paths, device)
+    deduplicated = model._encode_path_batch(paths, device, deduplicate=True)
 
     assert torch.allclose(actual, expected, atol=1e-6)
+    assert torch.allclose(deduplicated, expected, atol=1e-6)
+
+
+def test_deduplicated_path_encoding_backward_matches_full_batch():
+    torch.manual_seed(123)
+    full_model = make_model()
+    dedup_model = make_model()
+    dedup_model.load_state_dict(full_model.state_dict())
+    device = torch.device("cpu")
+    paths = [(7,), (7,), (7, 8), (9,), (7, 8), (7,)]
+
+    full_encoded = full_model._encode_path_batch(paths, device)
+    dedup_encoded = dedup_model._encode_path_batch(
+        paths,
+        device,
+        deduplicate=True,
+    )
+
+    assert torch.allclose(dedup_encoded, full_encoded, atol=1e-6)
+
+    full_encoded.pow(2).sum().backward()
+    dedup_encoded.pow(2).sum().backward()
+
+    for (full_name, full_param), (dedup_name, dedup_param) in zip(
+        full_model.named_parameters(),
+        dedup_model.named_parameters(),
+    ):
+        assert full_name == dedup_name
+        if full_param.grad is None:
+            assert dedup_param.grad is None
+            continue
+        assert dedup_param.grad is not None, full_name
+        assert torch.isfinite(dedup_param.grad).all(), full_name
+        assert torch.allclose(
+            dedup_param.grad,
+            full_param.grad,
+            atol=1e-6,
+        ), full_name
+
+
+def test_history_batch_deduplicates_before_path_lstm_encoding():
+    model = make_model()
+    device = torch.device("cpu")
+    embedded_shapes = []
+
+    def capture_embedding_input(module, inputs, output):
+        del module, output
+        embedded_shapes.append(tuple(inputs[0].shape))
+
+    hook = model.node_embedder.register_forward_hook(capture_embedding_input)
+    try:
+        memory, mask = model._encode_request_history_paths_batch(
+            [
+                ((7,),),
+                ((7,),),
+                ((8,), (7,)),
+            ],
+            device,
+        )
+    finally:
+        hook.remove()
+
+    assert memory.shape == (3, 2, model.hidden_size)
+    assert mask.tolist() == [[True, False], [True, False], [True, True]]
+    assert embedded_shapes == [(2, 1)]
+
+
+def test_candidate_batch_keeps_default_non_deduplicated_encoding():
+    model = make_model()
+    device = torch.device("cpu")
+    embedded_shapes = []
+
+    def capture_embedding_input(module, inputs, output):
+        del module, output
+        embedded_shapes.append(tuple(inputs[0].shape))
+
+    hook = model.node_embedder.register_forward_hook(capture_embedding_input)
+    try:
+        candidates, mask = model._encode_candidate_paths_batch(
+            [
+                [(7,), (7,)],
+                [(8,), (7,)],
+            ],
+            device,
+        )
+    finally:
+        hook.remove()
+
+    assert candidates.shape == (2, 2, model.hidden_size)
+    assert mask.tolist() == [[True, True], [True, True]]
+    assert embedded_shapes == [(4, 1)]
 
 
 def test_from_config_reads_lru_trie_fields():
@@ -606,6 +731,7 @@ if __name__ == "__main__":
     test_ndcg_position_sign_improving_high_relevance_score_lowers_loss()
     test_loss_uses_all_candidates_by_default()
     test_loss_candidate_cap_keeps_current_hit_required_candidate()
+    test_loss_warmup_matches_parrot_suffix_loss()
     test_batched_loss_matches_stepwise_reference_with_padding()
     test_loss_sum_reduction_matches_mean_times_counts()
     test_from_config_lru_prior_alpha_fields()
@@ -620,5 +746,8 @@ if __name__ == "__main__":
     test_lru_feature_width_is_strict()
     test_empty_history_paths_are_not_real_history_slots()
     test_batched_path_encoding_matches_stepwise_encoding()
+    test_deduplicated_path_encoding_backward_matches_full_batch()
+    test_history_batch_deduplicates_before_path_lstm_encoding()
+    test_candidate_batch_keeps_default_non_deduplicated_encoding()
     test_from_config_reads_lru_trie_fields()
     print("TRIE-PARROT NDCG LOSS TESTS PASSED")

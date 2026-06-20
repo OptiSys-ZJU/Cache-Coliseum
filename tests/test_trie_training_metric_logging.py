@@ -17,12 +17,15 @@ from model.trie_model.__main__ import (
     count_microstep_steps,
     count_microstep_windows,
     compute_rank_eval_metrics,
+    compute_training_losses,
+    iter_loss_microbatches,
     plot_loss_curves,
     round_collection_examples,
     round_step_budget,
     should_run_periodic_event,
     latest_training_checkpoint,
     parse_train_device_ids,
+    summarize_loss_batch,
     split_batch_for_devices,
     training_checkpoint_step,
 )
@@ -304,6 +307,98 @@ def test_microstep_window_batches_are_32_by_40_and_consecutive():
     assert [step.step_id for step in last_window] == list(range(40, 80))
 
 
+def make_loss_step(leaf_paths, oracle_distances, required_candidate_indices=None):
+    lru_features = []
+    for idx, path in enumerate(leaf_paths):
+        age = float(idx + 1)
+        lru_features.append((age, age, age, age, float(len(path))))
+    return SimpleNamespace(
+        leaf_paths=list(leaf_paths),
+        oracle_distances=list(oracle_distances),
+        oracle_target=max(
+            range(len(oracle_distances)),
+            key=lambda idx: oracle_distances[idx],
+        ),
+        required_candidate_indices=required_candidate_indices,
+        microstep_history_paths=((9,), (9, 8)),
+        request_history_paths=((7,),),
+        lru_features=tuple(lru_features),
+        num_candidates=len(leaf_paths),
+    )
+
+
+def test_loss_microbatch_sum_matches_full_batch_mean():
+    model = TrieParrotModel(
+        vocab_size=128,
+        node_embed_dim=16,
+        hidden_size=32,
+        reuse_loss_weight=1.0,
+    )
+    batch = [
+        SimpleNamespace(eviction_steps=[
+            make_loss_step([(1,), (2,), (3,), (4,), (5,)], [0.0, 2.0, 3.0, 4.0, float("inf")], (0,)),
+            make_loss_step([(6,), (7,), (8,)], [1.0, float("inf"), 3.0]),
+            make_loss_step([(9,), (10,)], [float("inf"), 2.0]),
+        ]),
+        SimpleNamespace(eviction_steps=[
+            make_loss_step([(11,), (12,), (13,), (14,)], [1.0, 2.0, float("inf"), 4.0]),
+            make_loss_step([(15,), (16,), (17,)], [float("inf"), 1.0, 2.0]),
+            make_loss_step([(18,), (19,), (20,)], [2.0, 3.0, float("inf")]),
+        ]),
+        SimpleNamespace(eviction_steps=[
+            make_loss_step([(21,), (22,), (23,)], [2.0, float("inf"), 1.0]),
+            make_loss_step([(24,), (25,), (26,), (27,)], [1.0, 2.0, 3.0, float("inf")]),
+            make_loss_step([(28,), (29,)], [1.0, float("inf")]),
+        ]),
+        SimpleNamespace(eviction_steps=[
+            make_loss_step([(30,), (31,), (32,), (33,), (34,)], [5.0, 4.0, 3.0, 2.0, float("inf")], (0,)),
+            make_loss_step([(35,), (36,), (37,)], [1.0, 2.0, float("inf")]),
+            make_loss_step([(38,), (39,), (40,)], [float("inf"), 2.0, 1.0]),
+        ]),
+    ]
+
+    full_losses = compute_training_losses(
+        model,
+        batch,
+        max_candidates=3,
+        max_steps_per_snapshot=None,
+        warmup_steps_per_snapshot=1,
+        train_device_ids=[],
+    )
+    full_stats = dict(model.last_loss_stats)
+    total_stats = summarize_loss_batch(
+        model,
+        batch,
+        max_candidates=3,
+        max_steps_per_snapshot=None,
+        warmup_steps_per_snapshot=1,
+    )
+    assert total_stats == full_stats
+
+    micro_losses = {
+        "ranking": torch.tensor(0.0),
+        "reuse": torch.tensor(0.0),
+        "ce": torch.tensor(0.0),
+    }
+    for micro_batch in iter_loss_microbatches(batch, 2):
+        loss_sums = compute_training_losses(
+            model,
+            micro_batch,
+            max_candidates=3,
+            max_steps_per_snapshot=None,
+            warmup_steps_per_snapshot=1,
+            train_device_ids=[],
+            reduction="sum",
+        )
+        for name in ("ranking", "reuse", "ce"):
+            count = total_stats[f"{name}_count"]
+            if count > 0:
+                micro_losses[name] = micro_losses[name] + loss_sums[name] / count
+
+    for name in ("ranking", "reuse", "ce"):
+        assert torch.allclose(micro_losses[name], full_losses[name], atol=1e-6)
+
+
 def test_full_dagger_config_uses_lru_trie_fields():
     config_path = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
@@ -346,6 +441,7 @@ if __name__ == "__main__":
     test_round_budget_limits_each_collect_round()
     test_rank_eval_metrics_are_logged_fields_and_finite()
     test_microstep_window_batches_are_32_by_40_and_consecutive()
+    test_loss_microbatch_sum_matches_full_batch_mean()
     test_full_dagger_config_uses_lru_trie_fields()
     test_full_parrot_like_config_uses_parrot_window_shape()
     print("TRIE TRAINING METRIC LOGGING TESTS PASSED")

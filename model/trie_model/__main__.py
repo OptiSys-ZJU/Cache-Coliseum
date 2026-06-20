@@ -270,6 +270,38 @@ def round_collection_examples(
     return round_step_budget(step, total_steps, dagger_update_freq) * safe_multiplier * batch_size
 
 
+def resolve_loss_warmup_steps(value, sequence_length: int) -> int:
+    """Resolve Parrot-style warmup steps for each training window."""
+    if value in (None, "", 0, "0", False):
+        return 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"half", "parrot_half"}:
+            warmup_steps = sequence_length // 2
+        else:
+            warmup_steps = int(normalized)
+    else:
+        warmup_steps = int(value)
+
+    if warmup_steps < 0:
+        raise ValueError("loss_warmup_steps must be nonnegative")
+    if warmup_steps >= sequence_length:
+        raise ValueError(
+            "loss_warmup_steps must be smaller than sequence_length, "
+            f"got {warmup_steps} for sequence_length={sequence_length}"
+        )
+    return warmup_steps
+
+
+def resolve_optional_positive_int(value, field_name: str):
+    if value in (None, "", 0, "0", False):
+        return None
+    resolved = int(value)
+    if resolved <= 0:
+        raise ValueError(f"{field_name} must be positive when set")
+    return resolved
+
+
 def cuda_device_index(device: torch.device) -> int:
     if device.type != "cuda":
         raise ValueError(f"Expected a CUDA device, got {device}")
@@ -362,17 +394,28 @@ class TrieLossShard(torch.nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, snapshots, max_candidates, max_steps_per_snapshot):
+    def forward(
+        self,
+        snapshots,
+        max_candidates,
+        max_steps_per_snapshot,
+        warmup_steps_per_snapshot,
+    ):
         losses = self.model.loss(
             snapshots,
             max_candidates=max_candidates,
             max_steps_per_snapshot=max_steps_per_snapshot,
+            warmup_steps_per_snapshot=warmup_steps_per_snapshot,
             reduction="sum",
         )
         return losses, dict(self.model.last_loss_stats)
 
 
-def merge_loss_shard_outputs(outputs, primary_device: torch.device):
+def merge_loss_shard_outputs(
+    outputs,
+    primary_device: torch.device,
+    normalize: bool = True,
+):
     loss_names = ("ranking", "reuse", "ce")
     loss_sums = {name: None for name in loss_names}
     counts = {name: 0 for name in loss_names}
@@ -390,7 +433,10 @@ def merge_loss_shard_outputs(outputs, primary_device: torch.device):
     merged_losses = {}
     for name in loss_names:
         if counts[name] > 0:
-            merged_losses[name] = loss_sums[name] / counts[name]
+            if normalize:
+                merged_losses[name] = loss_sums[name] / counts[name]
+            else:
+                merged_losses[name] = loss_sums[name]
         else:
             merged_losses[name] = torch.tensor(
                 0.0,
@@ -407,14 +453,21 @@ def compute_training_losses(
     batch,
     max_candidates,
     max_steps_per_snapshot,
+    warmup_steps_per_snapshot,
     train_device_ids,
+    reduction="mean",
 ):
     """Compute one optimizer-step loss, optionally sharded across CUDA devices."""
+    if reduction not in {"mean", "sum"}:
+        raise ValueError("reduction must be one of {'mean', 'sum'}")
+
     if len(train_device_ids) < 2 or len(batch) < 2:
         return model.loss(
             batch,
             max_candidates=max_candidates,
             max_steps_per_snapshot=max_steps_per_snapshot,
+            warmup_steps_per_snapshot=warmup_steps_per_snapshot,
+            reduction=reduction,
         )
 
     primary_device = next(model.parameters()).device
@@ -425,18 +478,108 @@ def compute_training_losses(
             batch,
             max_candidates=max_candidates,
             max_steps_per_snapshot=max_steps_per_snapshot,
+            warmup_steps_per_snapshot=warmup_steps_per_snapshot,
+            reduction=reduction,
         )
 
     loss_module = TrieLossShard(model)
     replicas = replicate(loss_module, active_device_ids)
     inputs = tuple(
-        (chunk, max_candidates, max_steps_per_snapshot)
+        (
+            chunk,
+            max_candidates,
+            max_steps_per_snapshot,
+            warmup_steps_per_snapshot,
+        )
         for chunk in chunks
     )
     outputs = parallel_apply(replicas, inputs, devices=active_device_ids)
-    losses, stats = merge_loss_shard_outputs(outputs, primary_device)
+    losses, stats = merge_loss_shard_outputs(
+        outputs,
+        primary_device,
+        normalize=(reduction == "mean"),
+    )
     model.last_loss_stats = stats
     return losses
+
+
+def iter_loss_microbatches(batch, microbatch_size):
+    if microbatch_size is None or microbatch_size <= 0 or microbatch_size >= len(batch):
+        yield batch
+        return
+
+    for start in range(0, len(batch), microbatch_size):
+        yield batch[start:start + microbatch_size]
+
+
+def summarize_loss_batch(
+    model: TrieParrotModel,
+    batch,
+    max_candidates,
+    max_steps_per_snapshot,
+    warmup_steps_per_snapshot,
+):
+    """Collect loss counts without running the neural scorer."""
+    stats = {
+        "full_steps": 0,
+        "capped_steps": 0,
+        "candidate_count": 0,
+        "ranking_count": 0,
+        "reuse_count": 0,
+        "ce_count": 0,
+        "warmup_steps": 0,
+        "loss_steps": 0,
+    }
+
+    for snapshot in batch:
+        eviction_steps = snapshot.eviction_steps
+        warmup_steps = max(0, int(warmup_steps_per_snapshot or 0))
+        if warmup_steps >= len(eviction_steps) and len(eviction_steps) > 0:
+            raise ValueError(
+                "warmup_steps_per_snapshot must be smaller than the "
+                f"number of eviction steps, got {warmup_steps} for "
+                f"{len(eviction_steps)} steps"
+            )
+        if warmup_steps > 0:
+            stats["warmup_steps"] += min(warmup_steps, len(eviction_steps))
+            eviction_steps = eviction_steps[warmup_steps:]
+
+        if (
+            max_steps_per_snapshot is not None
+            and len(eviction_steps) > max_steps_per_snapshot
+        ):
+            quota = max(1, max_steps_per_snapshot)
+            stride = len(eviction_steps) / quota
+            eviction_steps = [
+                eviction_steps[min(int(slot * stride), len(eviction_steps) - 1)]
+                for slot in range(quota)
+            ]
+
+        for step in eviction_steps:
+            if step.num_candidates < 2:
+                continue
+
+            stats["loss_steps"] += 1
+            selected_indices, _ = model._candidate_subset(
+                step.num_candidates,
+                step.oracle_target,
+                max_candidates,
+                getattr(step, "required_candidate_indices", None),
+            )
+            if len(selected_indices) == step.num_candidates:
+                stats["full_steps"] += 1
+            else:
+                stats["capped_steps"] += 1
+            stats["candidate_count"] += len(selected_indices)
+
+            if getattr(step, "oracle_distances", None) is not None:
+                stats["ranking_count"] += 1
+                if model.reuse_loss_weight > 0:
+                    stats["reuse_count"] += 1
+            if model.ce_loss_weight > 0:
+                stats["ce_count"] += 1
+
+    return stats
 
 
 def evaluate(
@@ -719,6 +862,14 @@ if __name__ == '__main__':
     rank_eval_freq = config.get('rank_eval_freq', eval_freq)
     max_loss_candidates = config.get('max_loss_candidates')
     max_loss_steps_per_snapshot = config.get('max_loss_steps_per_snapshot')
+    loss_warmup_steps = resolve_loss_warmup_steps(
+        config.get('loss_warmup_steps', 0),
+        sequence_length,
+    )
+    loss_microbatch_size = resolve_optional_positive_int(
+        config.get('loss_microbatch_size'),
+        "loss_microbatch_size",
+    )
     optimizer_steps_per_collection = config.get('optimizer_steps_per_collection')
     shuffle_collected_snapshots = config.get('shuffle_collected_snapshots', False)
     max_node_num = config['max_node_num']
@@ -777,6 +928,8 @@ if __name__ == '__main__':
         f"rank_eval_freq={rank_eval_freq} "
         f"max_loss_candidates={max_loss_candidates} ({candidate_mode}) "
         f"max_loss_steps_per_snapshot={max_loss_steps_per_snapshot} "
+        f"loss_warmup_steps={loss_warmup_steps} "
+        f"loss_microbatch_size={loss_microbatch_size} "
         f"optimizer_steps_per_collection={optimizer_steps_per_collection} "
         f"shuffle_collected_snapshots={shuffle_collected_snapshots}"
     )
@@ -1099,26 +1252,90 @@ if __name__ == '__main__':
                     )
                 
                 # Forward + backward
-                optimizer.zero_grad()
-                losses = compute_training_losses(
-                    model,
-                    batch,
-                    max_loss_candidates,
-                    max_loss_steps_per_snapshot,
-                    train_device_ids,
+                optimizer.zero_grad(set_to_none=True)
+
+                use_loss_microbatch = (
+                    loss_microbatch_size is not None
+                    and loss_microbatch_size < len(batch)
                 )
-                total_loss = sum(losses.values())
-                if not torch.isfinite(total_loss):
-                    raise RuntimeError(
-                        "Non-finite training loss at "
-                        f"step={step}: "
-                        + ", ".join(
-                            f"{name}={value.item()}"
-                            for name, value in losses.items()
-                        )
+                if use_loss_microbatch:
+                    loss_stats = summarize_loss_batch(
+                        model,
+                        batch,
+                        max_loss_candidates,
+                        max_loss_steps_per_snapshot,
+                        loss_warmup_steps,
                     )
-                total_loss.backward()
-                optimizer.step()
+                    loss_values = {"ranking": 0.0, "reuse": 0.0, "ce": 0.0}
+                    total_loss_value = 0.0
+
+                    for micro_batch in iter_loss_microbatches(
+                        batch,
+                        loss_microbatch_size,
+                    ):
+                        losses = compute_training_losses(
+                            model,
+                            micro_batch,
+                            max_loss_candidates,
+                            max_loss_steps_per_snapshot,
+                            loss_warmup_steps,
+                            train_device_ids,
+                            reduction="sum",
+                        )
+                        scaled_terms = []
+                        for name in ("ranking", "reuse", "ce"):
+                            value = losses[name]
+                            count = int(loss_stats.get(f"{name}_count", 0))
+                            scaled = value / count if count > 0 else value * 0.0
+                            scaled_terms.append(scaled)
+                            loss_values[name] += float(scaled.detach().item())
+
+                        micro_total_loss = torch.stack(scaled_terms).sum()
+                        if not torch.isfinite(micro_total_loss):
+                            raise RuntimeError(
+                                "Non-finite training loss at "
+                                f"step={step}: "
+                                + ", ".join(
+                                    f"{name}={value.detach().item()}"
+                                    for name, value in losses.items()
+                                )
+                            )
+                        total_loss_value += float(micro_total_loss.detach().item())
+                        micro_total_loss.backward()
+                        del micro_total_loss
+                        del scaled_terms
+                        del losses
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+
+                    model.last_loss_stats = loss_stats
+                    optimizer.step()
+                else:
+                    losses = compute_training_losses(
+                        model,
+                        batch,
+                        max_loss_candidates,
+                        max_loss_steps_per_snapshot,
+                        loss_warmup_steps,
+                        train_device_ids,
+                    )
+                    total_loss = sum(losses.values())
+                    if not torch.isfinite(total_loss):
+                        raise RuntimeError(
+                            "Non-finite training loss at "
+                            f"step={step}: "
+                            + ", ".join(
+                                f"{name}={value.item()}"
+                                for name, value in losses.items()
+                            )
+                        )
+                    total_loss.backward()
+                    optimizer.step()
+                    loss_values = {
+                        name: float(value.detach().item())
+                        for name, value in losses.items()
+                    }
+                    total_loss_value = float(total_loss.detach().item())
 
                 loss_stats = getattr(model, 'last_loss_stats', {})
                 full_steps = int(loss_stats.get('full_steps', 0))
@@ -1127,10 +1344,10 @@ if __name__ == '__main__':
                 step_count = full_steps + capped_steps
                 avg_candidates = candidate_count / step_count if step_count else 0.0
 
-                postfix['loss/total'] = f'{total_loss.item():.4f}'
-                postfix['loss/ranking'] = f'{losses.get("ranking").item():.4f}'
-                postfix['loss/reuse'] = f'{losses.get("reuse").item():.4f}'
-                postfix['loss/ce'] = f'{losses.get("ce").item():.4f}'
+                postfix['loss/total'] = f'{total_loss_value:.4f}'
+                postfix['loss/ranking'] = f'{loss_values.get("ranking", 0.0):.4f}'
+                postfix['loss/reuse'] = f'{loss_values.get("reuse", 0.0):.4f}'
+                postfix['loss/ce'] = f'{loss_values.get("ce", 0.0):.4f}'
                 postfix['cand'] = (
                     f'full:{full_steps}/cap:{capped_steps}/avg:{avg_candidates:.1f}'
                 )
@@ -1139,10 +1356,10 @@ if __name__ == '__main__':
                     "event": "train_step",
                     "step": step,
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    "loss_total": total_loss.item(),
-                    "loss_ranking": losses.get("ranking").item(),
-                    "loss_reuse": losses.get("reuse").item(),
-                    "loss_ce": losses.get("ce").item(),
+                    "loss_total": total_loss_value,
+                    "loss_ranking": loss_values.get("ranking", 0.0),
+                    "loss_reuse": loss_values.get("reuse", 0.0),
+                    "loss_ce": loss_values.get("ce", 0.0),
                     "train_hr": train_hit_rate,
                     "eval_hr": postfix.get('eval_hr', ""),
                     "model_prob": model_prob,
@@ -1159,6 +1376,12 @@ if __name__ == '__main__':
                 pbar.update(1)
                 step += 1
                 round_steps += 1
+                if "total_loss" in locals():
+                    del total_loss
+                if "losses" in locals():
+                    del losses
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 
                 if step >= total_steps:
                     break

@@ -292,7 +292,7 @@ class TrieParrotModel(nn.Module):
             return None
 
         limit = max(1, max_history or self.max_microstep_history)
-        return self._encode_path_batch(paths[-limit:], device)
+        return self._encode_path_batch(paths[-limit:], device, deduplicate=True)
 
     def _encode_request_history_paths(
         self,
@@ -309,12 +309,38 @@ class TrieParrotModel(nn.Module):
         self,
         paths,
         device: torch.device,
+        deduplicate: bool = False,
     ) -> torch.Tensor:
         """Encode many variable-length root-to-node paths in one LSTM pass."""
         path_list = [tuple(path) for path in paths]
         batch_size = len(path_list)
         if batch_size == 0:
             return torch.zeros(0, self.hidden_size, device=device)
+
+        if deduplicate and batch_size > 1:
+            unique_paths = []
+            inverse_indices = []
+            seen = {}
+            for path in path_list:
+                unique_idx = seen.get(path)
+                if unique_idx is None:
+                    unique_idx = len(unique_paths)
+                    seen[path] = unique_idx
+                    unique_paths.append(path)
+                inverse_indices.append(unique_idx)
+
+            if len(unique_paths) < batch_size:
+                unique_encoded = self._encode_path_batch(
+                    unique_paths,
+                    device,
+                    deduplicate=False,
+                )
+                inverse = torch.tensor(
+                    inverse_indices,
+                    dtype=torch.long,
+                    device=device,
+                )
+                return unique_encoded.index_select(0, inverse)
 
         lengths = torch.tensor(
             [len(path) for path in path_list],
@@ -364,7 +390,7 @@ class TrieParrotModel(nn.Module):
             flat_paths.extend(paths)
             max_history = max(max_history, len(paths) if paths else 1)
 
-        encoded = self._encode_path_batch(flat_paths, device)
+        encoded = self._encode_path_batch(flat_paths, device, deduplicate=True)
         memory = torch.zeros(
             len(prepared),
             max_history,
@@ -888,6 +914,7 @@ class TrieParrotModel(nn.Module):
         snapshots,
         max_candidates: Optional[int] = None,
         max_steps_per_snapshot: Optional[int] = None,
+        warmup_steps_per_snapshot: int = 0,
         reduction: str = "mean",
     ) -> Dict[str, torch.Tensor]:
         """
@@ -912,11 +939,24 @@ class TrieParrotModel(nn.Module):
             "ranking_count": 0,
             "reuse_count": 0,
             "ce_count": 0,
+            "warmup_steps": 0,
+            "loss_steps": 0,
         }
 
         step_windows = []
         for snapshot in snapshots:
             eviction_steps = snapshot.eviction_steps
+            warmup_steps = max(0, int(warmup_steps_per_snapshot or 0))
+            if warmup_steps >= len(eviction_steps) and len(eviction_steps) > 0:
+                raise ValueError(
+                    "warmup_steps_per_snapshot must be smaller than the "
+                    f"number of eviction steps, got {warmup_steps} for "
+                    f"{len(eviction_steps)} steps"
+                )
+            if warmup_steps > 0:
+                stats["warmup_steps"] += min(warmup_steps, len(eviction_steps))
+                eviction_steps = eviction_steps[warmup_steps:]
+
             if (
                 max_steps_per_snapshot is not None
                 and len(eviction_steps) > max_steps_per_snapshot
@@ -933,6 +973,7 @@ class TrieParrotModel(nn.Module):
                 if step.num_candidates < 2:
                     prepared_steps.append(None)
                     continue
+                stats["loss_steps"] += 1
 
                 microstep_history_paths = getattr(step, "microstep_history_paths", None)
                 if microstep_history_paths is None:
