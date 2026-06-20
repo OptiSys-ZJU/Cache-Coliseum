@@ -201,8 +201,7 @@ class TrieParrotModel(nn.Module):
             return None
 
         limit = max(1, max_history or self.max_microstep_history)
-        encoded = [self._encode_path(path, device) for path in paths[-limit:]]
-        return torch.cat(encoded, dim=0).to(device)
+        return self._encode_path_batch(paths[-limit:], device)
 
     def _encode_request_history_paths(
         self,
@@ -237,14 +236,14 @@ class TrieParrotModel(nn.Module):
         if max_len == 0:
             return h
 
-        path_ids = torch.zeros(batch_size, max_len, dtype=torch.long, device=device)
-        for idx, path in enumerate(path_list):
-            if path:
-                path_ids[idx, :len(path)] = torch.tensor(
-                    path,
-                    dtype=torch.long,
-                    device=device,
-                )
+        path_ids = torch.tensor(
+            [
+                list(path) + [0] * (max_len - len(path))
+                for path in path_list
+            ],
+            dtype=torch.long,
+            device=device,
+        )
 
         embeddings = self.node_embedder(path_ids)
         for step_idx in range(max_len):
@@ -631,8 +630,7 @@ class TrieParrotModel(nn.Module):
             assert candidate_paths is not None, "candidate_paths required when inference=False"
             if len(candidate_paths) == 0:
                 return torch.zeros(1, 0, device=device), torch.zeros(1, 0, device=device)
-            encoded = [self._encode_path(path, device) for path in candidate_paths]
-            candidates = torch.cat(encoded, dim=0)
+            candidates = self._encode_path_batch(candidate_paths, device)
 
         candidate_batch = candidates.unsqueeze(0)
         candidate_mask = torch.ones(

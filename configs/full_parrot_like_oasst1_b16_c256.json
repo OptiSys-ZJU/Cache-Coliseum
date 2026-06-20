@@ -3,7 +3,7 @@
   "total_steps": 25000,
   "eval_freq": 5000,
   "save_freq": 5000,
-  "batch_size": 32,
+  "batch_size": 16,
   "sequence_length": 40,
   "collection_multiplier": 5,
   "max_collection_requests": null,

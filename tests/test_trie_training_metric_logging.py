@@ -19,6 +19,8 @@ from model.trie_model.__main__ import (
     round_collection_examples,
     round_step_budget,
     should_run_periodic_event,
+    latest_training_checkpoint,
+    training_checkpoint_step,
 )
 from model.trie_model.model import TrieParrotModel
 from types import SimpleNamespace
@@ -44,6 +46,7 @@ def test_metric_append_writes_header_and_preserves_existing_rows():
             "event": "eval",
             "step": 1,
             "eval_hr": 0.25,
+            "training_checkpoint_path": "training_step_1.pt",
         })
 
         with open(path, newline="") as f:
@@ -58,6 +61,62 @@ def test_metric_append_writes_header_and_preserves_existing_rows():
         assert rows[1]["run_id"] == "run_b"
         assert rows[1]["event"] == "eval"
         assert rows[1]["eval_hr"] == "0.25"
+        assert rows[1]["training_checkpoint_path"] == "training_step_1.pt"
+
+
+def test_metric_append_upgrades_older_header():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "training_metrics.csv")
+        old_fields = [
+            field for field in METRIC_FIELDS
+            if field not in {"num_microsteps", "training_checkpoint_path"}
+        ]
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=old_fields)
+            writer.writeheader()
+            writer.writerow({
+                "run_id": "old_run",
+                "event": "train_step",
+                "step": 7,
+                "num_snapshots": 123,
+            })
+
+        append_metric_row(path, {
+            "run_id": "new_run",
+            "event": "checkpoint",
+            "step": 8,
+            "num_microsteps": 456,
+            "training_checkpoint_path": "training_step_8.pt",
+        })
+
+        with open(path, newline="") as f:
+            header = f.readline().strip().split(",")
+        rows = read_rows(path)
+
+        assert header == METRIC_FIELDS
+        assert len(rows) == 2
+        assert rows[0]["run_id"] == "old_run"
+        assert rows[0]["num_snapshots"] == "123"
+        assert rows[0]["num_microsteps"] == ""
+        assert rows[1]["run_id"] == "new_run"
+        assert rows[1]["num_microsteps"] == "456"
+        assert rows[1]["training_checkpoint_path"] == "training_step_8.pt"
+
+
+def test_latest_training_checkpoint_includes_final_training_state():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        step_100 = os.path.join(tmpdir, "training_step_100.pt")
+        step_200 = os.path.join(tmpdir, "training_step_200.pt")
+        final_300 = os.path.join(tmpdir, "training_final_300.pt")
+        model_only = os.path.join(tmpdir, "final_999.ckpt")
+
+        for path in (step_100, step_200, final_300, model_only):
+            with open(path, "wb"):
+                pass
+
+        assert training_checkpoint_step(step_100) == 100
+        assert training_checkpoint_step(final_300) == 300
+        assert latest_training_checkpoint(tmpdir) == final_300
 
 
 def test_plot_loss_curves_filters_run_id_and_writes_png():
@@ -256,6 +315,8 @@ def test_full_parrot_like_config_uses_parrot_window_shape():
 
 if __name__ == "__main__":
     test_metric_append_writes_header_and_preserves_existing_rows()
+    test_metric_append_upgrades_older_header()
+    test_latest_training_checkpoint_includes_final_training_state()
     test_plot_loss_curves_filters_run_id_and_writes_png()
     test_plot_loss_curves_handles_single_step_run()
     test_round_budget_limits_each_collect_round()

@@ -333,17 +333,24 @@ def load_training_checkpoint(path: str, model, optimizer, device):
     return 0, 0.0
 
 
+def training_checkpoint_step(path: str) -> int:
+    """Parse the optimizer-state checkpoint step from supported filenames."""
+    name = os.path.basename(path)
+    stem = os.path.splitext(name)[0]
+    for prefix in ("training_step_", "training_final_"):
+        if stem.startswith(prefix):
+            return int(stem[len(prefix):])
+    raise ValueError(f"Unsupported training checkpoint name: {name}")
+
+
 def latest_training_checkpoint(checkpoint_dir: str):
-    candidates = glob.glob(os.path.join(checkpoint_dir, "training_step_*.pt"))
+    candidates = (
+        glob.glob(os.path.join(checkpoint_dir, "training_step_*.pt"))
+        + glob.glob(os.path.join(checkpoint_dir, "training_final_*.pt"))
+    )
     if not candidates:
         return None
-
-    def step_number(path):
-        name = os.path.basename(path)
-        stem = os.path.splitext(name)[0]
-        return int(stem.rsplit("_", 1)[-1])
-
-    return max(candidates, key=step_number)
+    return max(candidates, key=training_checkpoint_step)
 
 
 METRIC_FIELDS = [
@@ -363,9 +370,11 @@ METRIC_FIELDS = [
     "candidate_count",
     "avg_candidates",
     "num_snapshots",
+    "num_microsteps",
     "batch_size",
     "best_eval_hit_rate",
     "checkpoint_path",
+    "training_checkpoint_path",
     "rank_eval_ndcg",
     "rank_eval_pairwise_acc",
     "rank_eval_top1_acc",
@@ -379,6 +388,25 @@ def make_run_id() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
+def ensure_metric_fields(metrics_path: str):
+    """Upgrade an existing metrics CSV header when new optional fields are added."""
+    if not os.path.exists(metrics_path) or os.path.getsize(metrics_path) == 0:
+        return
+
+    with open(metrics_path, newline="") as f:
+        reader = csv.DictReader(f)
+        existing_fields = reader.fieldnames or []
+        if existing_fields == METRIC_FIELDS:
+            return
+        rows = list(reader)
+
+    with open(metrics_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=METRIC_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in METRIC_FIELDS})
+
+
 def append_metric_row(metrics_path: str, row: dict):
     """Append one training metric/event row without truncating existing runs."""
     parent = os.path.dirname(metrics_path)
@@ -386,6 +414,9 @@ def append_metric_row(metrics_path: str, row: dict):
         os.makedirs(parent, exist_ok=True)
 
     file_exists = os.path.exists(metrics_path) and os.path.getsize(metrics_path) > 0
+    if file_exists:
+        ensure_metric_fields(metrics_path)
+
     clean_row = {field: row.get(field, "") for field in METRIC_FIELDS}
     with open(metrics_path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=METRIC_FIELDS)
@@ -696,6 +727,7 @@ if __name__ == '__main__':
                 "train_hr": train_hit_rate,
                 "model_prob": model_prob,
                 "num_snapshots": microstep_count,
+                "num_microsteps": microstep_count,
                 "full_steps": window_count,
                 "batch_size": batch_size,
             })
@@ -824,8 +856,12 @@ if __name__ == '__main__':
                         "timestamp": datetime.now().isoformat(timespec="seconds"),
                         "best_eval_hit_rate": best_eval_hit_rate,
                         "checkpoint_path": save_path,
+                        "training_checkpoint_path": training_state_path,
                     })
-                    print(f'\n  Checkpoint saved: {save_path}')
+                    print(
+                        f'\n  Checkpoint saved: {save_path}; '
+                        f'training state: {training_state_path}'
+                    )
                 
                 # Forward + backward
                 optimizer.zero_grad()
@@ -878,6 +914,7 @@ if __name__ == '__main__':
                     "candidate_count": candidate_count,
                     "avg_candidates": avg_candidates,
                     "num_snapshots": microstep_count,
+                    "num_microsteps": microstep_count,
                     "batch_size": len(batch),
                     "best_eval_hit_rate": best_eval_hit_rate,
                 })
@@ -907,6 +944,7 @@ if __name__ == '__main__':
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "best_eval_hit_rate": best_eval_hit_rate,
         "checkpoint_path": final_path,
+        "training_checkpoint_path": final_training_path,
     })
     plot_loss_curves(metrics_path, run_id, loss_plot_path)
     print(f'Training complete. Final checkpoint: {final_path}')

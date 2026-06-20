@@ -476,6 +476,20 @@ def test_empty_history_paths_are_not_real_history_slots():
     assert not has_history
 
 
+def test_batched_path_encoding_matches_stepwise_encoding():
+    model = make_model()
+    device = torch.device("cpu")
+    paths = [(), (1,), (1, 2), (3, 4, 5)]
+
+    expected = torch.cat(
+        [model._encode_path(path, device) for path in paths],
+        dim=0,
+    )
+    actual = model._encode_path_batch(paths, device)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
 def test_from_config_reads_lru_trie_fields():
     with tempfile.TemporaryDirectory() as tmpdir:
         config_path = os.path.join(tmpdir, "config.json")
@@ -515,5 +529,6 @@ if __name__ == "__main__":
     test_required_snapshot_fields_are_enforced()
     test_lru_feature_width_is_strict()
     test_empty_history_paths_are_not_real_history_slots()
+    test_batched_path_encoding_matches_stepwise_encoding()
     test_from_config_reads_lru_trie_fields()
     print("TRIE-PARROT NDCG LOSS TESTS PASSED")
