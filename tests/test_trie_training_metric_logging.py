@@ -5,6 +5,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -16,18 +18,27 @@ from model.trie_model.__main__ import (
     as_microstep_window_batches,
     count_microstep_steps,
     count_microstep_windows,
+    create_frozen_cpu_collection_model,
+    create_trie_parrot_model_from_config,
     compute_rank_eval_metrics,
     compute_training_losses,
+    freeze_model_state_dict_for_collection,
     iter_loss_microbatches,
     plot_loss_curves,
+    plan_collection_round,
     round_collection_examples,
     round_step_budget,
+    resolve_bool_config,
+    resolve_training_round_budget,
     should_run_periodic_event,
     latest_training_checkpoint,
     parse_train_device_ids,
     summarize_loss_batch,
+    submit_async_collection,
     split_batch_for_devices,
+    tune_collection_multiplier,
     training_checkpoint_step,
+    wait_for_async_collection,
 )
 from model.trie_model.model import TrieParrotModel
 from types import SimpleNamespace
@@ -74,9 +85,25 @@ def test_metric_append_writes_header_and_preserves_existing_rows():
 def test_metric_append_upgrades_older_header():
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, "training_metrics.csv")
+        newly_added_fields = {
+            "collection_seconds",
+            "collection_wait_seconds",
+            "train_round_seconds",
+            "collection_train_time_ratio",
+            "async_collection",
+            "collection_multiplier",
+            "collection_autotune",
+            "collection_target_train_time_ratio",
+            "max_collection_requests",
+            "max_collection_snapshots",
+            "optimizer_steps_per_collection",
+        }
         old_fields = [
             field for field in METRIC_FIELDS
-            if field not in {"num_microsteps", "training_checkpoint_path"}
+            if field not in (
+                {"num_microsteps", "training_checkpoint_path"}
+                | newly_added_fields
+            )
         ]
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=old_fields)
@@ -240,6 +267,200 @@ def test_round_budget_limits_each_collect_round():
     assert should_run_periodic_event(step=50, freq=50)
     assert not should_run_periodic_event(step=0, freq=50)
     assert not should_run_periodic_event(step=50, freq=0)
+
+
+def test_async_collection_config_and_round_planning():
+    assert resolve_bool_config({"async_collection": "true"}, "async_collection")
+    assert not resolve_bool_config({"async_collection": "false"}, "async_collection", True)
+
+    plan = plan_collection_round(
+        step=10,
+        total_steps=100,
+        dagger_update_freq=20,
+        batch_size=4,
+        collection_multiplier=3,
+        collection_snapshot_cap="round_budget",
+    )
+
+    assert plan.step == 10
+    assert plan.collection_multiplier == 3
+    assert plan.round_budget == 20
+    assert plan.max_examples == 240
+    assert not plan.consume_all_collected_snapshots
+
+    snapshots = [SimpleNamespace(eviction_steps=[object() for _ in range(12)])]
+    assert resolve_training_round_budget(
+        plan,
+        snapshots,
+        batch_size=4,
+        sequence_length=3,
+        total_steps=100,
+        optimizer_steps_per_collection=5,
+    ) == 5
+
+    capped_plan = plan_collection_round(
+        step=10,
+        total_steps=100,
+        dagger_update_freq=20,
+        batch_size=4,
+        collection_multiplier=3,
+        collection_snapshot_cap=12,
+    )
+    assert capped_plan.max_examples == 12
+    assert capped_plan.consume_all_collected_snapshots
+    assert resolve_training_round_budget(
+        capped_plan,
+        snapshots,
+        batch_size=4,
+        sequence_length=3,
+        total_steps=100,
+        optimizer_steps_per_collection=None,
+    ) == 3
+
+
+def test_collection_multiplier_autotune_moves_toward_target_ratio():
+    assert tune_collection_multiplier(
+        current_multiplier=4,
+        collection_seconds=1.0,
+        train_round_seconds=4.0,
+        target_ratio=1.0,
+        min_multiplier=1,
+        max_multiplier=16,
+        max_scale=2.0,
+    ) == 8
+    assert tune_collection_multiplier(
+        current_multiplier=8,
+        collection_seconds=8.0,
+        train_round_seconds=2.0,
+        target_ratio=1.0,
+        min_multiplier=1,
+        max_multiplier=16,
+        max_scale=2.0,
+    ) == 4
+    assert tune_collection_multiplier(
+        current_multiplier=4,
+        collection_seconds=0.0,
+        train_round_seconds=2.0,
+        target_ratio=1.0,
+        min_multiplier=1,
+        max_multiplier=16,
+    ) == 4
+    assert tune_collection_multiplier(
+        current_multiplier=4,
+        collection_seconds=1.0,
+        train_round_seconds=2.0,
+        target_ratio=None,
+        min_multiplier=1,
+        max_multiplier=16,
+    ) == 4
+
+
+def test_frozen_cpu_collection_model_is_isolated_from_training_model():
+    config = {
+        "vocab_size": 32,
+        "node_embed_dim": 8,
+        "hidden_size": 12,
+        "max_attention_history": 4,
+        "max_request_history": 4,
+        "max_microstep_history": 4,
+        "lru_feature_dim": 5,
+    }
+    model = create_trie_parrot_model_from_config(config, vocab_size=32)
+    frozen_state = freeze_model_state_dict_for_collection(model)
+    first_key = next(iter(frozen_state))
+    frozen_first_param = frozen_state[first_key].clone()
+
+    with torch.no_grad():
+        next(model.parameters()).add_(10.0)
+
+    collection_model = create_frozen_cpu_collection_model(
+        config,
+        vocab_size=32,
+        frozen_state_dict=frozen_state,
+    )
+
+    assert not collection_model.training
+    assert all(param.device.type == "cpu" for param in collection_model.parameters())
+    assert all(not param.requires_grad for param in collection_model.parameters())
+    assert torch.allclose(collection_model.state_dict()[first_key], frozen_first_param)
+    assert not torch.allclose(model.state_dict()[first_key], frozen_first_param)
+
+
+def test_async_collection_worker_uses_frozen_cpu_snapshot():
+    config = {
+        "vocab_size": 32,
+        "node_embed_dim": 8,
+        "hidden_size": 12,
+        "max_attention_history": 4,
+        "max_request_history": 4,
+        "max_microstep_history": 4,
+        "lru_feature_dim": 5,
+    }
+    model = create_trie_parrot_model_from_config(config, vocab_size=32)
+    frozen_first_param = next(model.parameters()).detach().cpu().clone()
+    started = threading.Event()
+    release = threading.Event()
+    seen = {}
+
+    def fake_collect(
+        data_path,
+        vocab_path,
+        collection_model,
+        max_node_num,
+        model_prob,
+        max_examples,
+        max_requests,
+    ):
+        seen["device"] = next(collection_model.parameters()).device.type
+        seen["requires_grad"] = any(
+            param.requires_grad for param in collection_model.parameters()
+        )
+        seen["first_param"] = next(collection_model.parameters()).detach().cpu().clone()
+        seen["model_prob"] = model_prob
+        seen["max_examples"] = max_examples
+        started.set()
+        release.wait(timeout=5)
+        return [SimpleNamespace(eviction_steps=[SimpleNamespace()])], 0.75
+
+    plan = plan_collection_round(
+        step=0,
+        total_steps=10,
+        dagger_update_freq=2,
+        batch_size=4,
+        collection_multiplier=2,
+        collection_snapshot_cap="round_budget",
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        job = submit_async_collection(
+            executor,
+            plan,
+            "train.pkl",
+            "vocab.json",
+            model,
+            config,
+            32,
+            8,
+            0.5,
+            3,
+            collect_fn=fake_collect,
+        )
+        assert started.wait(timeout=5)
+        with torch.no_grad():
+            next(model.parameters()).add_(1.0)
+        release.set()
+        result = wait_for_async_collection(job)
+
+    assert result.async_collection
+    assert result.plan is plan
+    assert result.train_hit_rate == 0.75
+    assert result.collection_seconds >= 0.0
+    assert result.collection_wait_seconds >= 0.0
+    assert seen["device"] == "cpu"
+    assert not seen["requires_grad"]
+    assert seen["model_prob"] == 0.5
+    assert seen["max_examples"] == 16
+    assert torch.allclose(seen["first_param"], frozen_first_param)
+    assert not torch.allclose(next(model.parameters()).detach().cpu(), frozen_first_param)
 
 
 def test_rank_eval_metrics_are_logged_fields_and_finite():
@@ -439,6 +660,10 @@ if __name__ == "__main__":
     test_plot_loss_curves_filters_run_id_and_writes_png()
     test_plot_loss_curves_handles_single_step_run()
     test_round_budget_limits_each_collect_round()
+    test_async_collection_config_and_round_planning()
+    test_collection_multiplier_autotune_moves_toward_target_ratio()
+    test_frozen_cpu_collection_model_is_isolated_from_training_model()
+    test_async_collection_worker_uses_frozen_cpu_snapshot()
     test_rank_eval_metrics_are_logged_fields_and_finite()
     test_microstep_window_batches_are_32_by_40_and_consecutive()
     test_loss_microbatch_sum_matches_full_batch_mean()

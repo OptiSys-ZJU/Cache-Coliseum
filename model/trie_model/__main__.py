@@ -12,6 +12,8 @@ import glob
 import csv
 import math
 import random
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -66,6 +68,300 @@ def collect_snapshots(
             break
     
     return cache.get_snapshots(), cache.hit_rate
+
+
+def resolve_bool_config(config: dict, key: str, default: bool = False) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
+def resolve_lru_prior_config(config: dict):
+    fixed_lru_prior_alpha = config.get('lru_prior_alpha_fixed')
+    fixed_lru_prior_requested = (
+        fixed_lru_prior_alpha
+        if isinstance(fixed_lru_prior_alpha, bool)
+        else fixed_lru_prior_alpha is not None
+    )
+    default_lru_prior_alpha = (
+        1.0
+        if isinstance(fixed_lru_prior_alpha, bool)
+        or fixed_lru_prior_alpha is None
+        else fixed_lru_prior_alpha
+    )
+    return (
+        config.get('lru_prior_alpha_init', default_lru_prior_alpha),
+        config.get('lru_prior_alpha_learnable', not fixed_lru_prior_requested),
+    )
+
+
+def create_trie_parrot_model_from_config(config: dict, vocab_size: int):
+    lru_prior_alpha_init, lru_prior_alpha_learnable = resolve_lru_prior_config(config)
+    return TrieParrotModel(
+        vocab_size=vocab_size,
+        node_embed_dim=config.get('node_embed_dim', 64),
+        hidden_size=config.get('hidden_size', 128),
+        max_attention_history=config.get('max_attention_history', 30),
+        max_request_history=config.get('max_request_history'),
+        max_microstep_history=config.get('max_microstep_history'),
+        lru_feature_dim=config.get('lru_feature_dim', 5),
+        ranking_loss_weight=config.get('ranking_loss_weight', 1.0),
+        reuse_loss_weight=config.get('reuse_loss_weight', 0.1),
+        ce_loss_weight=config.get('ce_loss_weight', 0.0),
+        ce_target_policy=config.get('ce_target_policy', 'argmax'),
+        reuse_distance_log_cap=config.get('reuse_distance_log_cap', 5.0),
+        ndcg_alpha=config.get('ndcg_alpha', 10.0),
+        lru_prior_alpha_init=lru_prior_alpha_init,
+        lru_prior_alpha_learnable=lru_prior_alpha_learnable,
+    )
+
+
+def freeze_model_state_dict_for_collection(model: TrieParrotModel):
+    """Detach a training model snapshot for worker-owned CPU collection."""
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def create_frozen_cpu_collection_model(
+    config: dict,
+    vocab_size: int,
+    frozen_state_dict,
+):
+    collection_model = create_trie_parrot_model_from_config(config, vocab_size)
+    collection_model.load_state_dict_compatible(frozen_state_dict)
+    collection_model.to(torch.device("cpu"))
+    collection_model.eval()
+    for parameter in collection_model.parameters():
+        parameter.requires_grad_(False)
+    return collection_model
+
+
+def plan_collection_round(
+    step: int,
+    total_steps: int,
+    dagger_update_freq: int,
+    batch_size: int,
+    collection_multiplier: int,
+    collection_snapshot_cap,
+):
+    safe_collection_multiplier = max(1, int(collection_multiplier or 1))
+    round_budget = round_step_budget(step, total_steps, dagger_update_freq)
+    consume_all_collected_snapshots = collection_snapshot_cap != 'round_budget'
+    if collection_snapshot_cap == 'round_budget':
+        max_examples = round_collection_examples(
+            step,
+            total_steps,
+            dagger_update_freq,
+            batch_size,
+            safe_collection_multiplier,
+        )
+    elif collection_snapshot_cap is None:
+        max_examples = None
+    else:
+        max_examples = int(collection_snapshot_cap)
+
+    return SimpleNamespace(
+        step=step,
+        collection_multiplier=safe_collection_multiplier,
+        round_budget=round_budget,
+        max_examples=max_examples,
+        consume_all_collected_snapshots=consume_all_collected_snapshots,
+    )
+
+
+def resolve_training_round_budget(
+    plan,
+    snapshots,
+    batch_size: int,
+    sequence_length: int,
+    total_steps: int,
+    optimizer_steps_per_collection,
+):
+    round_budget = plan.round_budget
+    if plan.consume_all_collected_snapshots:
+        window_count = count_microstep_windows(snapshots, sequence_length)
+        round_budget = min(
+            math.ceil(window_count / batch_size),
+            total_steps - plan.step,
+        )
+
+    if optimizer_steps_per_collection is not None:
+        round_budget = min(
+            round_budget,
+            max(1, int(optimizer_steps_per_collection)),
+            total_steps - plan.step,
+        )
+
+    return round_budget
+
+
+def tune_collection_multiplier(
+    current_multiplier: int,
+    collection_seconds: float,
+    train_round_seconds: float,
+    target_ratio,
+    min_multiplier: int = 1,
+    max_multiplier=None,
+    max_scale: float = 2.0,
+) -> int:
+    """
+    Adjust collection volume toward a target collection/train time ratio.
+
+    The multiplier controls collected microstep snapshots when
+    max_collection_snapshots='round_budget'. Keeping collection time close to
+    train time helps the async worker finish just as the GPU round ends.
+    """
+    current_multiplier = max(1, int(current_multiplier or 1))
+    min_multiplier = max(1, int(min_multiplier or 1))
+    if max_multiplier in (None, "", 0, "0", False):
+        max_multiplier = current_multiplier
+    max_multiplier = max(min_multiplier, int(max_multiplier))
+
+    if target_ratio in (None, "", 0, "0", False):
+        return min(max(current_multiplier, min_multiplier), max_multiplier)
+
+    target_ratio = float(target_ratio)
+    collection_seconds = float(collection_seconds or 0.0)
+    train_round_seconds = float(train_round_seconds or 0.0)
+    max_scale = max(1.0, float(max_scale or 1.0))
+    if (
+        target_ratio <= 0
+        or collection_seconds <= 0
+        or train_round_seconds <= 0
+        or not math.isfinite(collection_seconds)
+        or not math.isfinite(train_round_seconds)
+    ):
+        return min(max(current_multiplier, min_multiplier), max_multiplier)
+
+    observed_ratio = collection_seconds / train_round_seconds
+    if observed_ratio <= 0 or not math.isfinite(observed_ratio):
+        return min(max(current_multiplier, min_multiplier), max_multiplier)
+
+    scale = target_ratio / observed_ratio
+    scale = min(max(scale, 1.0 / max_scale), max_scale)
+    tuned = int(round(current_multiplier * scale))
+    return min(max(max(1, tuned), min_multiplier), max_multiplier)
+
+
+def collect_snapshots_with_frozen_state(
+    config: dict,
+    vocab_size: int,
+    frozen_state_dict,
+    data_path: str,
+    vocab_path: str,
+    max_node_num: int,
+    model_prob: float,
+    max_examples,
+    max_requests,
+    collect_fn=collect_snapshots,
+):
+    started_at = time.perf_counter()
+    collection_model = create_frozen_cpu_collection_model(
+        config,
+        vocab_size,
+        frozen_state_dict,
+    )
+    snapshots, train_hit_rate = collect_fn(
+        data_path,
+        vocab_path,
+        collection_model,
+        max_node_num,
+        model_prob,
+        max_examples,
+        max_requests,
+    )
+    finished_at = time.perf_counter()
+    return SimpleNamespace(
+        snapshots=snapshots,
+        train_hit_rate=train_hit_rate,
+        collection_seconds=finished_at - started_at,
+        collection_wait_seconds=0.0,
+        async_collection=True,
+    )
+
+
+def submit_async_collection(
+    executor,
+    plan,
+    train_path: str,
+    vocab_path: str,
+    model: TrieParrotModel,
+    config: dict,
+    vocab_size: int,
+    max_node_num: int,
+    model_prob: float,
+    max_collection_requests,
+    collect_fn=collect_snapshots,
+):
+    frozen_state_dict = freeze_model_state_dict_for_collection(model)
+    future = executor.submit(
+        collect_snapshots_with_frozen_state,
+        dict(config),
+        vocab_size,
+        frozen_state_dict,
+        train_path,
+        vocab_path,
+        max_node_num,
+        model_prob,
+        plan.max_examples,
+        max_collection_requests,
+        collect_fn,
+    )
+    return SimpleNamespace(
+        future=future,
+        plan=plan,
+        model_prob=model_prob,
+        submitted_at=time.perf_counter(),
+    )
+
+
+def wait_for_async_collection(async_job):
+    wait_start = time.perf_counter()
+    result = async_job.future.result()
+    result.collection_wait_seconds = time.perf_counter() - wait_start
+    result.plan = async_job.plan
+    result.model_prob = async_job.model_prob
+    return result
+
+
+def collect_round_sync(
+    plan,
+    train_path: str,
+    vocab_path: str,
+    model: TrieParrotModel,
+    max_node_num: int,
+    model_prob: float,
+    max_collection_requests,
+    collect_fn=collect_snapshots,
+):
+    started_at = time.perf_counter()
+    model.eval()
+    snapshots, train_hit_rate = collect_fn(
+        train_path,
+        vocab_path,
+        model,
+        max_node_num,
+        model_prob,
+        plan.max_examples,
+        max_collection_requests,
+    )
+    finished_at = time.perf_counter()
+    return SimpleNamespace(
+        snapshots=snapshots,
+        train_hit_rate=train_hit_rate,
+        collection_seconds=finished_at - started_at,
+        collection_wait_seconds=0.0,
+        async_collection=False,
+        plan=plan,
+        model_prob=model_prob,
+    )
 
 
 def flatten_eviction_steps(snapshots, max_steps: int = None):
@@ -503,6 +799,14 @@ def compute_training_losses(
     return losses
 
 
+def synchronize_training_devices_for_timing(device: torch.device, train_device_ids):
+    if device.type != "cuda":
+        return
+    device_ids = train_device_ids or [cuda_device_index(device)]
+    for device_id in device_ids:
+        torch.cuda.synchronize(device_id)
+
+
 def iter_loss_microbatches(batch, microbatch_size):
     if microbatch_size is None or microbatch_size <= 0 or microbatch_size >= len(batch):
         yield batch
@@ -699,6 +1003,17 @@ METRIC_FIELDS = [
     "rank_eval_score_std",
     "rank_eval_steps",
     "rank_eval_pairs",
+    "collection_seconds",
+    "collection_wait_seconds",
+    "train_round_seconds",
+    "collection_train_time_ratio",
+    "async_collection",
+    "collection_multiplier",
+    "collection_autotune",
+    "collection_target_train_time_ratio",
+    "max_collection_requests",
+    "max_collection_snapshots",
+    "optimizer_steps_per_collection",
 ]
 
 
@@ -872,6 +1187,30 @@ if __name__ == '__main__':
     )
     optimizer_steps_per_collection = config.get('optimizer_steps_per_collection')
     shuffle_collected_snapshots = config.get('shuffle_collected_snapshots', False)
+    async_collection = resolve_bool_config(config, 'async_collection', False)
+    collection_autotune = resolve_bool_config(config, 'collection_autotune', False)
+    collection_target_train_time_ratio = config.get(
+        'collection_target_train_time_ratio',
+        1.0,
+    )
+    collection_multiplier_min = max(
+        1,
+        int(config.get('collection_multiplier_min', 1) or 1),
+    )
+    collection_multiplier_max = resolve_optional_positive_int(
+        config.get('collection_multiplier_max'),
+        "collection_multiplier_max",
+    )
+    if collection_multiplier_max is None:
+        collection_multiplier_max = (
+            max(collection_multiplier, collection_multiplier * 4)
+            if collection_autotune
+            else collection_multiplier
+        )
+    collection_multiplier_max = max(collection_multiplier_min, collection_multiplier_max)
+    collection_autotune_max_scale = float(
+        config.get('collection_autotune_max_scale', 2.0) or 2.0
+    )
     max_node_num = config['max_node_num']
     dagger_init = config['dagger_init']
     dagger_final = config['dagger_final']
@@ -883,26 +1222,7 @@ if __name__ == '__main__':
     ce_target_policy = config.get('ce_target_policy', 'argmax')
     reuse_distance_log_cap = config.get('reuse_distance_log_cap', 5.0)
     ndcg_alpha = config.get('ndcg_alpha', 10.0)
-    fixed_lru_prior_alpha = config.get('lru_prior_alpha_fixed')
-    fixed_lru_prior_requested = (
-        fixed_lru_prior_alpha
-        if isinstance(fixed_lru_prior_alpha, bool)
-        else fixed_lru_prior_alpha is not None
-    )
-    default_lru_prior_alpha = (
-        1.0
-        if isinstance(fixed_lru_prior_alpha, bool)
-        or fixed_lru_prior_alpha is None
-        else fixed_lru_prior_alpha
-    )
-    lru_prior_alpha_init = config.get(
-        'lru_prior_alpha_init',
-        default_lru_prior_alpha,
-    )
-    lru_prior_alpha_learnable = config.get(
-        'lru_prior_alpha_learnable',
-        not fixed_lru_prior_requested,
-    )
+    lru_prior_alpha_init, lru_prior_alpha_learnable = resolve_lru_prior_config(config)
 
     print(f'TrieParrot: lr={lr}, total_steps={total_steps}, eval_freq={eval_freq}, '
           f'save_freq={save_freq}, batch_size={batch_size}, '
@@ -931,7 +1251,20 @@ if __name__ == '__main__':
         f"loss_warmup_steps={loss_warmup_steps} "
         f"loss_microbatch_size={loss_microbatch_size} "
         f"optimizer_steps_per_collection={optimizer_steps_per_collection} "
-        f"shuffle_collected_snapshots={shuffle_collected_snapshots}"
+        f"shuffle_collected_snapshots={shuffle_collected_snapshots} "
+        f"async_collection={async_collection}"
+    )
+    print(
+        "TrieParrot: collection ratio controls "
+        f"collection_multiplier={collection_multiplier} "
+        f"collection_autotune={collection_autotune} "
+        f"target_train_time_ratio={collection_target_train_time_ratio} "
+        f"multiplier_bounds=[{collection_multiplier_min},{collection_multiplier_max}] "
+        f"max_scale={collection_autotune_max_scale} "
+        f"max_collection_requests={max_collection_requests} "
+        f"max_collection_snapshots={collection_snapshot_cap} "
+        f"optimizer_steps_per_collection={optimizer_steps_per_collection}; "
+        "compare collection_seconds/train_round_seconds"
     )
     print(
         "TrieParrot: loss weights "
@@ -946,6 +1279,11 @@ if __name__ == '__main__':
     )
     print(f'TrieParrot: DAgger init={dagger_init}, final={dagger_final}, '
           f'steps={dagger_steps}, update_freq={dagger_update_freq}')
+    if async_collection:
+        print(
+            'TrieParrot: async collection enabled '
+            '(thread worker, frozen CPU model snapshots)'
+        )
     print(
         'TrieParrot: DAgger round collection uses '
         'round_step_budget * collection_multiplier * batch_size microstep snapshots '
@@ -975,6 +1313,12 @@ if __name__ == '__main__':
     config['vocab_size'] = vocab_size
     config['lru_prior_alpha_init'] = lru_prior_alpha_init
     config['lru_prior_alpha_learnable'] = lru_prior_alpha_learnable
+    config['async_collection'] = async_collection
+    config['collection_autotune'] = collection_autotune
+    config['collection_target_train_time_ratio'] = collection_target_train_time_ratio
+    config['collection_multiplier_min'] = collection_multiplier_min
+    config['collection_multiplier_max'] = collection_multiplier_max
+    config['collection_autotune_max_scale'] = collection_autotune_max_scale
     if train_device_ids:
         config['train_devices'] = [
             f'cuda:{device_id}' for device_id in train_device_ids
@@ -994,23 +1338,7 @@ if __name__ == '__main__':
         json.dump(config, f, indent=2)
 
     # Create model
-    model = TrieParrotModel(
-        vocab_size=vocab_size,
-        node_embed_dim=config.get('node_embed_dim', 64),
-        hidden_size=config.get('hidden_size', 128),
-        max_attention_history=config.get('max_attention_history', 30),
-        max_request_history=config.get('max_request_history'),
-        max_microstep_history=config.get('max_microstep_history'),
-        lru_feature_dim=config.get('lru_feature_dim', 5),
-        ranking_loss_weight=ranking_loss_weight,
-        reuse_loss_weight=reuse_loss_weight,
-        ce_loss_weight=ce_loss_weight,
-        ce_target_policy=ce_target_policy,
-        reuse_distance_log_cap=reuse_distance_log_cap,
-        ndcg_alpha=ndcg_alpha,
-        lru_prior_alpha_init=lru_prior_alpha_init,
-        lru_prior_alpha_learnable=lru_prior_alpha_learnable,
-    ).to(device)
+    model = create_trie_parrot_model_from_config(config, vocab_size).to(device)
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f'TrieParrot: {total_params} parameters')
@@ -1058,6 +1386,13 @@ if __name__ == '__main__':
 
     # Training loop
     remaining_steps = max(total_steps - step, 0)
+    effective_collection_multiplier = collection_multiplier
+    async_executor = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="trie-collection")
+        if async_collection
+        else None
+    )
+    pending_collection = None
     with tqdm.tqdm(total=remaining_steps, desc='Training') as pbar:
         postfix = {
             'loss/total': 0.0,
@@ -1068,38 +1403,69 @@ if __name__ == '__main__':
             'train_hr': 0.0,
             'eval_hr': 0.0,
             'model_prob': 0.0,
+            'collect_s': 0.0,
+            'train_s': 0.0,
+            'async': int(async_collection),
         }
         
         while step < total_steps:
+            if (
+                pending_collection is not None
+                and pending_collection.plan.step != step
+            ):
+                stale_result = wait_for_async_collection(pending_collection)
+                print(
+                    "\n  WARNING: Discarded async collection for "
+                    f"step={pending_collection.plan.step}; current step={step} "
+                    f"after training {stale_result.collection_seconds:.2f}s"
+                )
+                pending_collection = None
+
             model_prob = get_model_prob(step, dagger_init, dagger_final, dagger_steps)
             postfix['model_prob'] = f'{model_prob:.2f}'
-            round_budget = round_step_budget(step, total_steps, dagger_update_freq)
-            
-            # Collect DAgger snapshots
-            consume_all_collected_snapshots = collection_snapshot_cap != 'round_budget'
-            if collection_snapshot_cap == 'round_budget':
-                max_examples = round_collection_examples(
-                    step,
-                    total_steps,
-                    dagger_update_freq,
-                    batch_size,
-                    collection_multiplier,
-                )
-            elif collection_snapshot_cap is None:
-                max_examples = None
-            else:
-                max_examples = int(collection_snapshot_cap)
-            model.eval()
-            snapshots, train_hit_rate = collect_snapshots(
-                train_path,
-                vocab_path,
-                model,
-                max_node_num,
-                model_prob,
-                max_examples,
-                max_collection_requests,
+            plan = plan_collection_round(
+                step,
+                total_steps,
+                dagger_update_freq,
+                batch_size,
+                effective_collection_multiplier,
+                collection_snapshot_cap,
             )
+
+            if async_collection:
+                if pending_collection is None:
+                    pending_collection = submit_async_collection(
+                        async_executor,
+                        plan,
+                        train_path,
+                        vocab_path,
+                        model,
+                        config,
+                        vocab_size,
+                        max_node_num,
+                        model_prob,
+                        max_collection_requests,
+                    )
+                collection_result = wait_for_async_collection(pending_collection)
+                pending_collection = None
+            else:
+                collection_result = collect_round_sync(
+                    plan,
+                    train_path,
+                    vocab_path,
+                    model,
+                    max_node_num,
+                    model_prob,
+                    max_collection_requests,
+                )
+
+            plan = collection_result.plan
+            model_prob = collection_result.model_prob
+            snapshots = collection_result.snapshots
+            train_hit_rate = collection_result.train_hit_rate
+            round_collection_multiplier = plan.collection_multiplier
             postfix['train_hr'] = f'{train_hit_rate:.4f}'
+            postfix['collect_s'] = f'{collection_result.collection_seconds:.1f}'
             
             if not snapshots:
                 print('WARNING: No snapshots collected, skipping batch')
@@ -1118,11 +1484,24 @@ if __name__ == '__main__':
                 "num_microsteps": microstep_count,
                 "full_steps": window_count,
                 "batch_size": batch_size,
+                "collection_seconds": collection_result.collection_seconds,
+                "collection_wait_seconds": collection_result.collection_wait_seconds,
+                "async_collection": int(collection_result.async_collection),
+                "collection_multiplier": round_collection_multiplier,
+                "collection_autotune": int(collection_autotune),
+                "collection_target_train_time_ratio": collection_target_train_time_ratio,
+                "max_collection_requests": max_collection_requests,
+                "max_collection_snapshots": collection_snapshot_cap,
+                "optimizer_steps_per_collection": optimizer_steps_per_collection,
             })
             print(
                 f"\n  Collection: step={step} train_hr={train_hit_rate:.4f} "
                 f"microsteps={microstep_count} windows={window_count} "
-                f"model_prob={model_prob:.2f}"
+                f"model_prob={model_prob:.2f} "
+                f"collect_s={collection_result.collection_seconds:.2f} "
+                f"wait_s={collection_result.collection_wait_seconds:.2f} "
+                f"async={int(collection_result.async_collection)} "
+                f"multiplier={round_collection_multiplier}"
             )
             if window_count == 0:
                 print(
@@ -1132,18 +1511,53 @@ if __name__ == '__main__':
                 )
                 continue
 
-            if consume_all_collected_snapshots:
-                round_budget = min(
-                    math.ceil(window_count / batch_size),
-                    total_steps - step,
-                )
+            round_budget = resolve_training_round_budget(
+                plan,
+                snapshots,
+                batch_size,
+                sequence_length,
+                total_steps,
+                optimizer_steps_per_collection,
+            )
 
-            if optimizer_steps_per_collection is not None:
-                round_budget = min(
-                    round_budget,
-                    max(1, int(optimizer_steps_per_collection)),
-                    total_steps - step,
-                )
+            if async_collection and round_budget > 0:
+                next_step = step + round_budget
+                if next_step < total_steps:
+                    next_plan = plan_collection_round(
+                        next_step,
+                        total_steps,
+                        dagger_update_freq,
+                        batch_size,
+                        effective_collection_multiplier,
+                        collection_snapshot_cap,
+                    )
+                    next_model_prob = get_model_prob(
+                        next_step,
+                        dagger_init,
+                        dagger_final,
+                        dagger_steps,
+                    )
+                    pending_collection = submit_async_collection(
+                        async_executor,
+                        next_plan,
+                        train_path,
+                        vocab_path,
+                        model,
+                        config,
+                        vocab_size,
+                        max_node_num,
+                        next_model_prob,
+                        max_collection_requests,
+                    )
+                    print(
+                        f"  Async collection queued: step={next_step} "
+                        f"model_prob={next_model_prob:.2f} "
+                        f"max_examples={next_plan.max_examples} "
+                        f"multiplier={next_plan.collection_multiplier}"
+                    )
+
+            synchronize_training_devices_for_timing(device, train_device_ids)
+            train_round_started_at = time.perf_counter()
 
             # Train on Parrot-style consecutive microstep windows.
             model.train()
@@ -1371,6 +1785,15 @@ if __name__ == '__main__':
                     "num_microsteps": microstep_count,
                     "batch_size": len(batch),
                     "best_eval_hit_rate": best_eval_hit_rate,
+                    "collection_seconds": collection_result.collection_seconds,
+                    "collection_wait_seconds": collection_result.collection_wait_seconds,
+                    "async_collection": int(collection_result.async_collection),
+                    "collection_multiplier": round_collection_multiplier,
+                    "collection_autotune": int(collection_autotune),
+                    "collection_target_train_time_ratio": collection_target_train_time_ratio,
+                    "max_collection_requests": max_collection_requests,
+                    "max_collection_snapshots": collection_snapshot_cap,
+                    "optimizer_steps_per_collection": optimizer_steps_per_collection,
                 })
                 pbar.set_postfix(postfix)
                 pbar.update(1)
@@ -1385,7 +1808,69 @@ if __name__ == '__main__':
                 
                 if step >= total_steps:
                     break
+
+            synchronize_training_devices_for_timing(device, train_device_ids)
+            train_round_seconds = time.perf_counter() - train_round_started_at
+            collection_train_time_ratio = (
+                collection_result.collection_seconds / train_round_seconds
+                if train_round_seconds > 0
+                else 0.0
+            )
+            postfix['train_s'] = f'{train_round_seconds:.1f}'
+            pbar.set_postfix(postfix)
+            append_metric_row(metrics_path, {
+                "run_id": run_id,
+                "event": "train_round",
+                "step": step,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "train_hr": train_hit_rate,
+                "model_prob": model_prob,
+                "num_snapshots": microstep_count,
+                "num_microsteps": microstep_count,
+                "full_steps": window_count,
+                "batch_size": batch_size,
+                "collection_seconds": collection_result.collection_seconds,
+                "collection_wait_seconds": collection_result.collection_wait_seconds,
+                "train_round_seconds": train_round_seconds,
+                "collection_train_time_ratio": collection_train_time_ratio,
+                "async_collection": int(collection_result.async_collection),
+                "collection_multiplier": round_collection_multiplier,
+                "collection_autotune": int(collection_autotune),
+                "collection_target_train_time_ratio": collection_target_train_time_ratio,
+                "max_collection_requests": max_collection_requests,
+                "max_collection_snapshots": collection_snapshot_cap,
+                "optimizer_steps_per_collection": optimizer_steps_per_collection,
+            })
+            print(
+                f"  Train round: step={step} trained_steps={round_steps} "
+                f"train_s={train_round_seconds:.2f} "
+                f"collect/train={collection_train_time_ratio:.2f} "
+                f"async={int(collection_result.async_collection)}"
+            )
+            if collection_autotune:
+                tuned_multiplier = tune_collection_multiplier(
+                    effective_collection_multiplier,
+                    collection_result.collection_seconds,
+                    train_round_seconds,
+                    collection_target_train_time_ratio,
+                    collection_multiplier_min,
+                    collection_multiplier_max,
+                    collection_autotune_max_scale,
+                )
+                if tuned_multiplier != effective_collection_multiplier:
+                    print(
+                        "  Collection autotune: "
+                        f"multiplier {effective_collection_multiplier} -> "
+                        f"{tuned_multiplier} "
+                        f"(target_ratio={collection_target_train_time_ratio})"
+                    )
+                    effective_collection_multiplier = tuned_multiplier
     
+    if pending_collection is not None:
+        pending_collection.future.cancel()
+    if async_executor is not None:
+        async_executor.shutdown(wait=True)
+
     # Final save
     final_path = os.path.join(checkpoint_dir, f'final_{step}.ckpt')
     torch.save(model.state_dict(), final_path)
