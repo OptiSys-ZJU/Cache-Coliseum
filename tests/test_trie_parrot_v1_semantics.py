@@ -121,9 +121,9 @@ def test_request_snapshot_uses_pre_access_live_leaf_set():
     assert first_step.step_kind == "microstep_access"
     assert [tuple(path) for path in first_step.leaf_paths] == [(1,)]
     assert tuple(first_step.current_path) == (1,)
-    assert tuple(first_step.microstep_history_paths) == ((1,),)
+    assert tuple(first_step.microstep_history_paths) == ((1,), (1,))
     assert tuple(second_step.current_path) == (1, 2)
-    assert tuple(second_step.microstep_history_paths) == ((1,), (1,))
+    assert tuple(second_step.microstep_history_paths) == ((1,), (1,), (1, 2))
     assert list(cache.alg.microstep_history_path_window) == [(1,), (1,), (1, 2)]
 
 
@@ -153,8 +153,17 @@ def test_hit_without_eviction_still_collects_request_snapshot():
     ]
     assert [tuple(path) for path in snapshot.eviction_steps[0].leaf_paths] == [(1, 2)]
     assert [tuple(path) for path in snapshot.eviction_steps[1].leaf_paths] == [(1, 2)]
-    assert tuple(snapshot.eviction_steps[0].microstep_history_paths) == ((1,), (1, 2))
-    assert tuple(snapshot.eviction_steps[1].microstep_history_paths) == ((1,), (1, 2), (1,))
+    assert tuple(snapshot.eviction_steps[0].microstep_history_paths) == (
+        (1,),
+        (1, 2),
+        (1,),
+    )
+    assert tuple(snapshot.eviction_steps[1].microstep_history_paths) == (
+        (1,),
+        (1, 2),
+        (1,),
+        (1, 2),
+    )
 
 
 def test_pre_access_snapshot_labels_current_hit_as_immediate_reuse():
@@ -316,7 +325,8 @@ def test_lru_prior_directly_conditions_score():
         vocab_size=128,
         node_embed_dim=16,
         hidden_size=8,
-        lru_prior_alpha_init=2.5,
+        lru_prior_alpha_init=1.5,
+        lru_prior_alpha_max=1.5,
         lru_prior_alpha_learnable=False,
     )
     model.eval()
@@ -346,7 +356,7 @@ def test_lru_prior_directly_conditions_score():
             inference=True,
         )
 
-    expected_gap = 2.5 * (math.log1p(8.0) - math.log1p(1.0))
+    expected_gap = 1.5 * (math.log1p(8.0) - math.log1p(1.0))
     assert logits[0, 1] > logits[0, 0]
     assert torch.allclose(logits[0, 1] - logits[0, 0], torch.tensor(expected_gap), atol=1e-6)
     assert pred_reuse.shape == logits.shape
@@ -357,20 +367,23 @@ def test_lru_prior_alpha_initialization_and_nonnegative():
         vocab_size=128,
         node_embed_dim=16,
         hidden_size=8,
-        lru_prior_alpha_init=1.75,
+        lru_prior_alpha_init=0.75,
+        lru_prior_alpha_max=1.5,
     )
     assert learnable.lru_prior_alpha().item() >= 0.0
-    assert math.isclose(learnable.lru_prior_alpha().item(), 1.75, rel_tol=0.0, abs_tol=1e-6)
+    assert math.isclose(learnable.lru_prior_alpha().item(), 0.75, rel_tol=0.0, abs_tol=1e-6)
 
     with torch.no_grad():
-        learnable.lru_prior_raw_alpha.fill_(-100.0)
+        learnable.lru_prior_raw_alpha.fill_(100.0)
     assert learnable.lru_prior_alpha().item() >= 0.0
+    assert learnable.lru_prior_alpha().item() <= 1.5
 
     fixed = TrieParrotModel(
         vocab_size=128,
         node_embed_dim=16,
         hidden_size=8,
         lru_prior_alpha_init=0.25,
+        lru_prior_alpha_max=1.5,
         lru_prior_alpha_learnable=False,
     )
     assert math.isclose(fixed.lru_prior_alpha().item(), 0.25, rel_tol=0.0, abs_tol=1e-6)

@@ -39,14 +39,29 @@ def make_step(
     microstep_history_paths=((9,), (9, 8)),
     request_history_paths=((7,),),
     required_candidate_indices=None,
+    step_kind="microstep_access",
+    lru_target=None,
+    oracle_top_set=None,
+    lcp_diagnostics=None,
 ):
+    resolved_oracle_target = max(
+        range(len(oracle_distances)),
+        key=lambda idx: oracle_distances[idx],
+    )
+    if oracle_top_set is None:
+        max_distance = max(oracle_distances)
+        oracle_top_set = tuple(
+            idx for idx, distance in enumerate(oracle_distances)
+            if distance == max_distance
+        )
     return SimpleNamespace(
+        step_kind=step_kind,
         leaf_paths=list(leaf_paths),
         oracle_distances=list(oracle_distances),
-        oracle_target=max(
-            range(len(oracle_distances)),
-            key=lambda idx: oracle_distances[idx],
-        ),
+        oracle_target=resolved_oracle_target,
+        oracle_top_set=tuple(oracle_top_set),
+        lru_target=lru_target,
+        lcp_diagnostics=tuple(lcp_diagnostics or ()),
         required_candidate_indices=required_candidate_indices,
         microstep_history_paths=tuple(microstep_history_paths),
         request_history_paths=tuple(request_history_paths),
@@ -301,6 +316,41 @@ def test_loss_candidate_cap_keeps_current_hit_required_candidate():
     assert model.last_loss_stats["candidate_count"] == 2
 
 
+def test_loss_candidate_cap_forces_lru_and_oracle_top_set_candidates():
+    model = make_model(reuse_loss_weight=0.0)
+    step = make_step(
+        [(idx + 1,) for idx in range(8)],
+        [1.0, 2.0, float("inf"), 4.0, 5.0, 6.0, float("inf"), 0.0],
+        required_candidate_indices=(7,),
+        lru_target=0,
+    )
+    snapshot = SimpleNamespace(eviction_steps=[step])
+    seen_candidate_paths = []
+    original_forward = model.forward_batched
+
+    def spy_forward_batched(
+        microstep_history_paths_batch,
+        candidate_paths_batch,
+        request_history_paths_batch,
+        lru_features_batch,
+    ):
+        seen_candidate_paths.extend(tuple(paths) for paths in candidate_paths_batch)
+        return original_forward(
+            microstep_history_paths_batch,
+            candidate_paths_batch,
+            request_history_paths_batch,
+            lru_features_batch,
+        )
+
+    model.forward_batched = spy_forward_batched
+    model.loss([snapshot], max_candidates=3)
+
+    assert seen_candidate_paths == [((1,), (3,), (7,), (8,))]
+    assert model.last_loss_stats["candidate_count"] == 4
+    assert model.last_loss_stats["lru_target_kept_count"] == 1
+    assert model.last_loss_stats["oracle_top_set_kept_count"] == 1
+
+
 def test_batched_loss_matches_stepwise_reference_with_padding():
     snapshots = [
         SimpleNamespace(eviction_steps=[
@@ -524,6 +574,102 @@ def test_top_set_ce_targets_all_max_relevance_candidates():
         + torch.nn.functional.log_softmax(logits, dim=-1)[0, 2]
     )
     assert torch.allclose(actual, expected)
+
+
+def test_top_set_ce_loss_uses_logsumexp_top_set_formula():
+    model = make_model(
+        reuse_loss_weight=0.0,
+        ranking_loss_weight=0.0,
+        top_set_ce_weight=1.0,
+    )
+    step = make_step(
+        [(1,), (2,), (3,)],
+        [1.0, float("inf"), float("inf")],
+    )
+    logits = torch.tensor([[3.0, 1.0, 0.0]], dtype=torch.float32)
+    pred_reuse = torch.zeros_like(logits)
+    mask = torch.ones_like(logits, dtype=torch.bool)
+
+    def fake_forward_batched(*args, **kwargs):
+        del args, kwargs
+        return logits, pred_reuse, mask
+
+    model.forward_batched = fake_forward_batched
+    losses = model.loss([SimpleNamespace(eviction_steps=[step])])
+    expected = torch.logsumexp(logits, dim=-1) - torch.logsumexp(
+        logits[:, [1, 2]],
+        dim=-1,
+    )
+
+    assert torch.allclose(losses["top_set_ce"], expected.squeeze(0))
+    assert model.last_loss_stats["top_set_acc"] == 0.0
+
+
+def test_hard_lru_margin_only_active_when_lru_not_in_top_set():
+    model = make_model(
+        reuse_loss_weight=0.0,
+        ranking_loss_weight=0.0,
+        hard_lru_margin_weight=1.0,
+        hard_lru_margin=0.2,
+    )
+    hard_step = make_step(
+        [(1,), (2,), (3,)],
+        [float("inf"), 1.0, 2.0],
+        lru_target=1,
+    )
+    easy_step = make_step(
+        [(4,), (5,), (6,)],
+        [float("inf"), 1.0, 2.0],
+        lru_target=0,
+    )
+    logits_by_call = [
+        torch.tensor([[0.0, 1.5, 0.2]], dtype=torch.float32),
+        torch.tensor([[0.0, 1.5, 0.2]], dtype=torch.float32),
+    ]
+
+    def fake_forward_batched(*args, **kwargs):
+        del args, kwargs
+        row_logits = logits_by_call.pop(0)
+        return (
+            row_logits,
+            torch.zeros_like(row_logits),
+            torch.ones_like(row_logits, dtype=torch.bool),
+        )
+
+    model.forward_batched = fake_forward_batched
+    losses = model.loss([SimpleNamespace(eviction_steps=[hard_step, easy_step])])
+    expected = torch.nn.functional.softplus(
+        torch.tensor(1.5) - torch.tensor(0.0) + 0.2
+    )
+
+    assert torch.allclose(losses["hard_lru_margin"], expected)
+    assert model.last_loss_stats["hard_lru_cases_count"] == 1
+    assert model.last_loss_stats["hard_lru_margin_count"] == 1
+
+
+def test_eviction_decision_steps_train_only_when_enabled():
+    step = make_step(
+        [(1,), (2,), (3,)],
+        [1.0, 2.0, float("inf")],
+        step_kind="eviction_decision",
+    )
+    snapshot = SimpleNamespace(eviction_steps=[step])
+
+    default_model = make_model()
+    default_losses = default_model.loss([snapshot])
+    assert default_model.last_loss_stats["loss_steps"] == 0
+    assert default_model.last_loss_stats["eviction_decision_steps"] == 0
+    assert all(value.item() == 0.0 for value in default_losses.values())
+
+    enabled_model = make_model(
+        train_on_eviction_decision=True,
+        eviction_decision_loss_weight=4.0,
+    )
+    enabled_losses = enabled_model.loss([snapshot])
+    assert enabled_model.last_loss_stats["loss_steps"] == 1
+    assert enabled_model.last_loss_stats["eviction_decision_steps"] == 1
+    assert enabled_model.last_loss_stats["microstep_access_steps"] == 0
+    assert torch.isfinite(sum(enabled_losses.values()))
 
 
 def test_invalid_ce_target_policy_rejected():
@@ -887,6 +1033,7 @@ if __name__ == "__main__":
     test_ndcg_position_sign_improving_high_relevance_score_lowers_loss()
     test_loss_uses_all_candidates_by_default()
     test_loss_candidate_cap_keeps_current_hit_required_candidate()
+    test_loss_candidate_cap_forces_lru_and_oracle_top_set_candidates()
     test_loss_warmup_matches_parrot_suffix_loss()
     test_batched_loss_matches_stepwise_reference_with_padding()
     test_loss_sum_reduction_matches_mean_times_counts()
@@ -897,6 +1044,9 @@ if __name__ == "__main__":
     test_ce_optional_default_zero_and_enabled_path()
     test_argmax_ce_matches_single_target_cross_entropy()
     test_top_set_ce_targets_all_max_relevance_candidates()
+    test_top_set_ce_loss_uses_logsumexp_top_set_formula()
+    test_hard_lru_margin_only_active_when_lru_not_in_top_set()
+    test_eviction_decision_steps_train_only_when_enabled()
     test_invalid_ce_target_policy_rejected()
     test_required_snapshot_fields_are_enforced()
     test_lru_feature_width_is_strict()

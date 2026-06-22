@@ -41,6 +41,7 @@ def collect_snapshots(
     model_prob: float,
     max_examples: int = None,
     max_requests: int = None,
+    train_on_eviction_decision: bool = False,
 ):
     """
     Run one pass over data, collecting microstep DAgger snapshots.
@@ -48,7 +49,11 @@ def collect_snapshots(
     Returns:
         (snapshots, hit_rate)
     """
-    cache = TrieTrainingCache(max_node_num=max_node_num, model=model)
+    cache = TrieTrainingCache(
+        max_node_num=max_node_num,
+        model=model,
+        train_on_eviction_decision=train_on_eviction_decision,
+    )
     
     with SequenceTrieDataTrace(data_path, vocab_path) as trace:
         # Load all sequences for oracle
@@ -89,19 +94,24 @@ def resolve_lru_prior_config(config: dict):
         else fixed_lru_prior_alpha is not None
     )
     default_lru_prior_alpha = (
-        1.0
+        0.75
         if isinstance(fixed_lru_prior_alpha, bool)
         or fixed_lru_prior_alpha is None
         else fixed_lru_prior_alpha
     )
     return (
         config.get('lru_prior_alpha_init', default_lru_prior_alpha),
+        config.get('lru_prior_alpha_max', 1.5),
         config.get('lru_prior_alpha_learnable', not fixed_lru_prior_requested),
     )
 
 
 def create_trie_parrot_model_from_config(config: dict, vocab_size: int):
-    lru_prior_alpha_init, lru_prior_alpha_learnable = resolve_lru_prior_config(config)
+    (
+        lru_prior_alpha_init,
+        lru_prior_alpha_max,
+        lru_prior_alpha_learnable,
+    ) = resolve_lru_prior_config(config)
     return TrieParrotModel(
         vocab_size=vocab_size,
         node_embed_dim=config.get('node_embed_dim', 64),
@@ -114,9 +124,26 @@ def create_trie_parrot_model_from_config(config: dict, vocab_size: int):
         reuse_loss_weight=config.get('reuse_loss_weight', 0.1),
         ce_loss_weight=config.get('ce_loss_weight', 0.0),
         ce_target_policy=config.get('ce_target_policy', 'argmax'),
+        top_set_ce_weight=config.get('top_set_ce_weight', 0.0),
+        hard_lru_margin_weight=config.get('hard_lru_margin_weight', 0.0),
+        hard_lru_margin=config.get('hard_lru_margin', 0.2),
+        train_on_eviction_decision=resolve_bool_config(
+            config,
+            'train_on_eviction_decision',
+            False,
+        ),
+        eviction_decision_loss_weight=config.get(
+            'eviction_decision_loss_weight',
+            1.0,
+        ),
+        microstep_access_loss_weight=config.get(
+            'microstep_access_loss_weight',
+            1.0,
+        ),
         reuse_distance_log_cap=config.get('reuse_distance_log_cap', 5.0),
         ndcg_alpha=config.get('ndcg_alpha', 10.0),
         lru_prior_alpha_init=lru_prior_alpha_init,
+        lru_prior_alpha_max=lru_prior_alpha_max,
         lru_prior_alpha_learnable=lru_prior_alpha_learnable,
     )
 
@@ -260,6 +287,7 @@ def collect_snapshots_with_frozen_state(
     model_prob: float,
     max_examples,
     max_requests,
+    train_on_eviction_decision: bool = False,
     collect_fn=collect_snapshots,
 ):
     started_at = time.perf_counter()
@@ -276,6 +304,7 @@ def collect_snapshots_with_frozen_state(
         model_prob,
         max_examples,
         max_requests,
+        train_on_eviction_decision,
     )
     finished_at = time.perf_counter()
     return SimpleNamespace(
@@ -298,6 +327,7 @@ def submit_async_collection(
     max_node_num: int,
     model_prob: float,
     max_collection_requests,
+    train_on_eviction_decision: bool = False,
     collect_fn=collect_snapshots,
 ):
     frozen_state_dict = freeze_model_state_dict_for_collection(model)
@@ -312,6 +342,7 @@ def submit_async_collection(
         model_prob,
         plan.max_examples,
         max_collection_requests,
+        train_on_eviction_decision,
         collect_fn,
     )
     return SimpleNamespace(
@@ -339,6 +370,7 @@ def collect_round_sync(
     max_node_num: int,
     model_prob: float,
     max_collection_requests,
+    train_on_eviction_decision: bool = False,
     collect_fn=collect_snapshots,
 ):
     started_at = time.perf_counter()
@@ -351,6 +383,7 @@ def collect_round_sync(
         model_prob,
         plan.max_examples,
         max_collection_requests,
+        train_on_eviction_decision,
     )
     finished_at = time.perf_counter()
     return SimpleNamespace(
@@ -683,6 +716,74 @@ def split_batch_for_devices(batch, device_count: int):
     return chunks
 
 
+def finalize_loss_stats(stats: dict) -> dict:
+    if stats.get("loss_steps", 0):
+        stats["hard_lru_active_frac"] = (
+            stats.get("hard_lru_cases_count", 0)
+            / stats["loss_steps"]
+        )
+    else:
+        stats["hard_lru_active_frac"] = 0.0
+    if stats.get("top_set_acc_count", 0):
+        stats["top_set_acc"] = (
+            stats.get("top_set_acc_correct", 0)
+            / stats["top_set_acc_count"]
+        )
+    else:
+        stats["top_set_acc"] = 0.0
+    if stats.get("regret_count", 0):
+        stats["regret"] = stats.get("regret_sum", 0.0) / stats["regret_count"]
+    else:
+        stats["regret"] = 0.0
+
+    for prefix in (
+        "oracle_target_lcp",
+        "lru_target_lcp",
+        "model_wrong_target_lcp",
+    ):
+        count = stats.get(f"{prefix}_count", 0)
+        for field in TrieParrotModel._lcp_stat_fields():
+            sum_key = f"{prefix}_{field}_sum"
+            mean_key = f"{prefix}_{field}_mean"
+            stats[mean_key] = (
+                stats.get(sum_key, 0.0) / count
+                if count
+                else 0.0
+            )
+    return stats
+
+
+def combine_loss_stats(stats_items) -> dict:
+    combined = {}
+    derived_keys = {
+        "hard_lru_active_frac",
+        "top_set_acc",
+        "regret",
+    }
+    for prefix in (
+        "oracle_target_lcp",
+        "lru_target_lcp",
+        "model_wrong_target_lcp",
+    ):
+        for field in TrieParrotModel._lcp_stat_fields():
+            derived_keys.add(f"{prefix}_{field}_mean")
+
+    for stats in stats_items:
+        for key, value in stats.items():
+            if not isinstance(value, (int, float)):
+                continue
+            if key in derived_keys:
+                continue
+            if key == "max_loss_candidates_effective":
+                combined[key] = max(combined.get(key, 0), value)
+            elif key == "lru_prior_alpha":
+                combined[key] = value
+            else:
+                combined[key] = combined.get(key, 0) + value
+
+    return finalize_loss_stats(combined)
+
+
 class TrieLossShard(torch.nn.Module):
     """Replica wrapper that returns summed losses plus local loss statistics."""
 
@@ -712,20 +813,19 @@ def merge_loss_shard_outputs(
     primary_device: torch.device,
     normalize: bool = True,
 ):
-    loss_names = ("ranking", "reuse", "ce")
+    loss_names = TrieParrotModel.loss_names()
     loss_sums = {name: None for name in loss_names}
     counts = {name: 0 for name in loss_names}
-    combined_stats = {}
+    stats_items = []
 
     for losses, stats in outputs:
-        for key, value in stats.items():
-            if isinstance(value, (int, float)):
-                combined_stats[key] = combined_stats.get(key, 0) + value
+        stats_items.append(stats)
         for name in loss_names:
             value = losses[name].to(primary_device)
             loss_sums[name] = value if loss_sums[name] is None else loss_sums[name] + value
             counts[name] += int(stats.get(f"{name}_count", 0))
 
+    combined_stats = combine_loss_stats(stats_items)
     merged_losses = {}
     for name in loss_names:
         if counts[name] > 0:
@@ -831,8 +931,19 @@ def summarize_loss_batch(
         "ranking_count": 0,
         "reuse_count": 0,
         "ce_count": 0,
+        "top_set_ce_count": 0,
+        "hard_lru_margin_count": 0,
         "warmup_steps": 0,
         "loss_steps": 0,
+        "microstep_access_steps": 0,
+        "eviction_decision_steps": 0,
+        "lru_target_kept_count": 0,
+        "lru_target_steps": 0,
+        "oracle_top_set_kept_count": 0,
+        "oracle_top_set_steps": 0,
+        "hard_lru_cases_count": 0,
+        "hard_lru_active_frac": 0.0,
+        "max_loss_candidates_effective": 0,
     }
 
     for snapshot in batch:
@@ -862,26 +973,76 @@ def summarize_loss_batch(
         for step in eviction_steps:
             if step.num_candidates < 2:
                 continue
+            step_kind = getattr(step, "step_kind", "microstep_access")
+            if model._step_kind_loss_weight(step_kind) <= 0.0:
+                continue
 
             stats["loss_steps"] += 1
+            if step_kind == "eviction_decision":
+                stats["eviction_decision_steps"] += 1
+            else:
+                stats["microstep_access_steps"] += 1
+            oracle_distances = getattr(step, "oracle_distances", None)
+            oracle_top_set = tuple(getattr(step, "oracle_top_set", None) or ())
+            if not oracle_top_set:
+                oracle_top_set = model._oracle_top_set_from_distances(
+                    oracle_distances
+                )
+            lru_target = getattr(step, "lru_target", None)
+            required_indices = set(
+                getattr(step, "required_candidate_indices", None) or ()
+            )
+            required_indices.update(oracle_top_set)
+            if lru_target is not None:
+                required_indices.add(lru_target)
             selected_indices, _ = model._candidate_subset(
                 step.num_candidates,
                 step.oracle_target,
                 max_candidates,
-                getattr(step, "required_candidate_indices", None),
+                required_indices,
             )
+            selected_set = set(selected_indices)
             if len(selected_indices) == step.num_candidates:
                 stats["full_steps"] += 1
             else:
                 stats["capped_steps"] += 1
             stats["candidate_count"] += len(selected_indices)
+            stats["max_loss_candidates_effective"] = max(
+                stats["max_loss_candidates_effective"],
+                len(selected_indices),
+            )
+            if lru_target is not None:
+                stats["lru_target_steps"] += 1
+                if lru_target in selected_set:
+                    stats["lru_target_kept_count"] += 1
+            if oracle_top_set:
+                stats["oracle_top_set_steps"] += 1
+                if set(oracle_top_set).issubset(selected_set):
+                    stats["oracle_top_set_kept_count"] += 1
+            hard_lru_case = (
+                lru_target is not None
+                and oracle_top_set
+                and lru_target not in set(oracle_top_set)
+                and lru_target in selected_set
+            )
+            if hard_lru_case:
+                stats["hard_lru_cases_count"] += 1
 
-            if getattr(step, "oracle_distances", None) is not None:
+            if oracle_distances is not None:
                 stats["ranking_count"] += 1
                 if model.reuse_loss_weight > 0:
                     stats["reuse_count"] += 1
             if model.ce_loss_weight > 0:
                 stats["ce_count"] += 1
+            if model.top_set_ce_weight > 0:
+                stats["top_set_ce_count"] += 1
+            if model.hard_lru_margin_weight > 0 and hard_lru_case:
+                stats["hard_lru_margin_count"] += 1
+
+    if stats["loss_steps"] > 0:
+        stats["hard_lru_active_frac"] = (
+            stats["hard_lru_cases_count"] / stats["loss_steps"]
+        )
 
     return stats
 
@@ -984,6 +1145,8 @@ METRIC_FIELDS = [
     "loss_ranking",
     "loss_reuse",
     "loss_ce",
+    "loss_top_set_ce",
+    "loss_hard_lru_margin",
     "train_hr",
     "eval_hr",
     "model_prob",
@@ -991,6 +1154,33 @@ METRIC_FIELDS = [
     "capped_steps",
     "candidate_count",
     "avg_candidates",
+    "max_loss_candidates_effective",
+    "microstep_access_steps",
+    "eviction_decision_steps",
+    "hard_lru_cases_count",
+    "hard_lru_active_frac",
+    "lru_target_kept_count",
+    "lru_target_steps",
+    "oracle_top_set_kept_count",
+    "oracle_top_set_steps",
+    "top_set_acc",
+    "regret",
+    "lru_prior_alpha",
+    "oracle_target_lcp_len_mean",
+    "oracle_target_lcp_ratio_candidate_mean",
+    "oracle_target_lcp_ratio_current_mean",
+    "oracle_target_lcp_candidate_suffix_len_mean",
+    "oracle_target_lcp_current_suffix_len_mean",
+    "lru_target_lcp_len_mean",
+    "lru_target_lcp_ratio_candidate_mean",
+    "lru_target_lcp_ratio_current_mean",
+    "lru_target_lcp_candidate_suffix_len_mean",
+    "lru_target_lcp_current_suffix_len_mean",
+    "model_wrong_target_lcp_len_mean",
+    "model_wrong_target_lcp_ratio_candidate_mean",
+    "model_wrong_target_lcp_ratio_current_mean",
+    "model_wrong_target_lcp_candidate_suffix_len_mean",
+    "model_wrong_target_lcp_current_suffix_len_mean",
     "num_snapshots",
     "num_microsteps",
     "batch_size",
@@ -1096,6 +1286,12 @@ def plot_loss_curves(metrics_path: str, run_id: str, output_path: str):
             "loss_ranking": [parse_float(row.get("loss_ranking")) for row in rows],
             "loss_reuse": [parse_float(row.get("loss_reuse")) for row in rows],
             "loss_ce": [parse_float(row.get("loss_ce")) for row in rows],
+            "loss_top_set_ce": [
+                parse_float(row.get("loss_top_set_ce")) for row in rows
+            ],
+            "loss_hard_lru_margin": [
+                parse_float(row.get("loss_hard_lru_margin")) for row in rows
+            ],
         }
 
         plt.figure(figsize=(10, 6))
@@ -1220,9 +1416,23 @@ if __name__ == '__main__':
     reuse_loss_weight = config.get('reuse_loss_weight', 0.1)
     ce_loss_weight = config.get('ce_loss_weight', 0.0)
     ce_target_policy = config.get('ce_target_policy', 'argmax')
+    top_set_ce_weight = config.get('top_set_ce_weight', 0.0)
+    hard_lru_margin_weight = config.get('hard_lru_margin_weight', 0.0)
+    hard_lru_margin = config.get('hard_lru_margin', 0.2)
+    train_on_eviction_decision = resolve_bool_config(
+        config,
+        'train_on_eviction_decision',
+        False,
+    )
+    eviction_decision_loss_weight = config.get('eviction_decision_loss_weight', 1.0)
+    microstep_access_loss_weight = config.get('microstep_access_loss_weight', 1.0)
     reuse_distance_log_cap = config.get('reuse_distance_log_cap', 5.0)
     ndcg_alpha = config.get('ndcg_alpha', 10.0)
-    lru_prior_alpha_init, lru_prior_alpha_learnable = resolve_lru_prior_config(config)
+    (
+        lru_prior_alpha_init,
+        lru_prior_alpha_max,
+        lru_prior_alpha_learnable,
+    ) = resolve_lru_prior_config(config)
 
     print(f'TrieParrot: lr={lr}, total_steps={total_steps}, eval_freq={eval_freq}, '
           f'save_freq={save_freq}, batch_size={batch_size}, '
@@ -1269,12 +1479,18 @@ if __name__ == '__main__':
     print(
         "TrieParrot: loss weights "
         f"ranking={ranking_loss_weight} reuse={reuse_loss_weight} ce={ce_loss_weight} "
+        f"top_set_ce={top_set_ce_weight} "
+        f"hard_lru_margin={hard_lru_margin_weight}@{hard_lru_margin} "
+        f"train_on_eviction_decision={train_on_eviction_decision} "
+        f"eviction_decision={eviction_decision_loss_weight} "
+        f"microstep_access={microstep_access_loss_weight} "
         f"ce_target_policy={ce_target_policy} "
         f"reuse_distance_log_cap={reuse_distance_log_cap} ndcg_alpha={ndcg_alpha}"
     )
     print(
         "TrieParrot: LRU prior "
         f"alpha_init={lru_prior_alpha_init} "
+        f"alpha_max={lru_prior_alpha_max} "
         f"alpha_learnable={lru_prior_alpha_learnable}"
     )
     print(f'TrieParrot: DAgger init={dagger_init}, final={dagger_final}, '
@@ -1312,7 +1528,14 @@ if __name__ == '__main__':
     # Override config vocab_size with actual data vocab_size
     config['vocab_size'] = vocab_size
     config['lru_prior_alpha_init'] = lru_prior_alpha_init
+    config['lru_prior_alpha_max'] = lru_prior_alpha_max
     config['lru_prior_alpha_learnable'] = lru_prior_alpha_learnable
+    config['train_on_eviction_decision'] = train_on_eviction_decision
+    config['eviction_decision_loss_weight'] = eviction_decision_loss_weight
+    config['microstep_access_loss_weight'] = microstep_access_loss_weight
+    config['top_set_ce_weight'] = top_set_ce_weight
+    config['hard_lru_margin_weight'] = hard_lru_margin_weight
+    config['hard_lru_margin'] = hard_lru_margin
     config['async_collection'] = async_collection
     config['collection_autotune'] = collection_autotune
     config['collection_target_train_time_ratio'] = collection_target_train_time_ratio
@@ -1399,6 +1622,8 @@ if __name__ == '__main__':
             'loss/ranking': 0.0,
             'loss/reuse': 0.0,
             'loss/ce': 0.0,
+            'loss/top': 0.0,
+            'loss/hard_lru': 0.0,
             'cand': candidate_mode,
             'train_hr': 0.0,
             'eval_hr': 0.0,
@@ -1445,6 +1670,7 @@ if __name__ == '__main__':
                         max_node_num,
                         model_prob,
                         max_collection_requests,
+                        train_on_eviction_decision,
                     )
                 collection_result = wait_for_async_collection(pending_collection)
                 pending_collection = None
@@ -1457,6 +1683,7 @@ if __name__ == '__main__':
                     max_node_num,
                     model_prob,
                     max_collection_requests,
+                    train_on_eviction_decision,
                 )
 
             plan = collection_result.plan
@@ -1548,6 +1775,7 @@ if __name__ == '__main__':
                         max_node_num,
                         next_model_prob,
                         max_collection_requests,
+                        train_on_eviction_decision,
                     )
                     print(
                         f"  Async collection queued: step={next_step} "
@@ -1680,8 +1908,10 @@ if __name__ == '__main__':
                         max_loss_steps_per_snapshot,
                         loss_warmup_steps,
                     )
-                    loss_values = {"ranking": 0.0, "reuse": 0.0, "ce": 0.0}
+                    loss_names = TrieParrotModel.loss_names()
+                    loss_values = {name: 0.0 for name in loss_names}
                     total_loss_value = 0.0
+                    microbatch_stats = []
 
                     for micro_batch in iter_loss_microbatches(
                         batch,
@@ -1696,8 +1926,9 @@ if __name__ == '__main__':
                             train_device_ids,
                             reduction="sum",
                         )
+                        microbatch_stats.append(dict(model.last_loss_stats))
                         scaled_terms = []
-                        for name in ("ranking", "reuse", "ce"):
+                        for name in loss_names:
                             value = losses[name]
                             count = int(loss_stats.get(f"{name}_count", 0))
                             scaled = value / count if count > 0 else value * 0.0
@@ -1722,7 +1953,7 @@ if __name__ == '__main__':
                         if device.type == "cuda":
                             torch.cuda.empty_cache()
 
-                    model.last_loss_stats = loss_stats
+                    model.last_loss_stats = combine_loss_stats(microbatch_stats)
                     optimizer.step()
                 else:
                     losses = compute_training_losses(
@@ -1762,6 +1993,10 @@ if __name__ == '__main__':
                 postfix['loss/ranking'] = f'{loss_values.get("ranking", 0.0):.4f}'
                 postfix['loss/reuse'] = f'{loss_values.get("reuse", 0.0):.4f}'
                 postfix['loss/ce'] = f'{loss_values.get("ce", 0.0):.4f}'
+                postfix['loss/top'] = f'{loss_values.get("top_set_ce", 0.0):.4f}'
+                postfix['loss/hard_lru'] = (
+                    f'{loss_values.get("hard_lru_margin", 0.0):.4f}'
+                )
                 postfix['cand'] = (
                     f'full:{full_steps}/cap:{capped_steps}/avg:{avg_candidates:.1f}'
                 )
@@ -1774,6 +2009,8 @@ if __name__ == '__main__':
                     "loss_ranking": loss_values.get("ranking", 0.0),
                     "loss_reuse": loss_values.get("reuse", 0.0),
                     "loss_ce": loss_values.get("ce", 0.0),
+                    "loss_top_set_ce": loss_values.get("top_set_ce", 0.0),
+                    "loss_hard_lru_margin": loss_values.get("hard_lru_margin", 0.0),
                     "train_hr": train_hit_rate,
                     "eval_hr": postfix.get('eval_hr', ""),
                     "model_prob": model_prob,
@@ -1781,6 +2018,102 @@ if __name__ == '__main__':
                     "capped_steps": capped_steps,
                     "candidate_count": candidate_count,
                     "avg_candidates": avg_candidates,
+                    "max_loss_candidates_effective": loss_stats.get(
+                        "max_loss_candidates_effective",
+                        "",
+                    ),
+                    "microstep_access_steps": loss_stats.get(
+                        "microstep_access_steps",
+                        "",
+                    ),
+                    "eviction_decision_steps": loss_stats.get(
+                        "eviction_decision_steps",
+                        "",
+                    ),
+                    "hard_lru_cases_count": loss_stats.get(
+                        "hard_lru_cases_count",
+                        "",
+                    ),
+                    "hard_lru_active_frac": loss_stats.get(
+                        "hard_lru_active_frac",
+                        "",
+                    ),
+                    "lru_target_kept_count": loss_stats.get(
+                        "lru_target_kept_count",
+                        "",
+                    ),
+                    "lru_target_steps": loss_stats.get("lru_target_steps", ""),
+                    "oracle_top_set_kept_count": loss_stats.get(
+                        "oracle_top_set_kept_count",
+                        "",
+                    ),
+                    "oracle_top_set_steps": loss_stats.get(
+                        "oracle_top_set_steps",
+                        "",
+                    ),
+                    "top_set_acc": loss_stats.get("top_set_acc", ""),
+                    "regret": loss_stats.get("regret", ""),
+                    "lru_prior_alpha": float(model.lru_prior_alpha().detach().item()),
+                    "oracle_target_lcp_len_mean": loss_stats.get(
+                        "oracle_target_lcp_lcp_len_mean",
+                        "",
+                    ),
+                    "oracle_target_lcp_ratio_candidate_mean": loss_stats.get(
+                        "oracle_target_lcp_lcp_ratio_candidate_mean",
+                        "",
+                    ),
+                    "oracle_target_lcp_ratio_current_mean": loss_stats.get(
+                        "oracle_target_lcp_lcp_ratio_current_mean",
+                        "",
+                    ),
+                    "oracle_target_lcp_candidate_suffix_len_mean": loss_stats.get(
+                        "oracle_target_lcp_candidate_suffix_len_mean",
+                        "",
+                    ),
+                    "oracle_target_lcp_current_suffix_len_mean": loss_stats.get(
+                        "oracle_target_lcp_current_suffix_len_mean",
+                        "",
+                    ),
+                    "lru_target_lcp_len_mean": loss_stats.get(
+                        "lru_target_lcp_lcp_len_mean",
+                        "",
+                    ),
+                    "lru_target_lcp_ratio_candidate_mean": loss_stats.get(
+                        "lru_target_lcp_lcp_ratio_candidate_mean",
+                        "",
+                    ),
+                    "lru_target_lcp_ratio_current_mean": loss_stats.get(
+                        "lru_target_lcp_lcp_ratio_current_mean",
+                        "",
+                    ),
+                    "lru_target_lcp_candidate_suffix_len_mean": loss_stats.get(
+                        "lru_target_lcp_candidate_suffix_len_mean",
+                        "",
+                    ),
+                    "lru_target_lcp_current_suffix_len_mean": loss_stats.get(
+                        "lru_target_lcp_current_suffix_len_mean",
+                        "",
+                    ),
+                    "model_wrong_target_lcp_len_mean": loss_stats.get(
+                        "model_wrong_target_lcp_lcp_len_mean",
+                        "",
+                    ),
+                    "model_wrong_target_lcp_ratio_candidate_mean": loss_stats.get(
+                        "model_wrong_target_lcp_lcp_ratio_candidate_mean",
+                        "",
+                    ),
+                    "model_wrong_target_lcp_ratio_current_mean": loss_stats.get(
+                        "model_wrong_target_lcp_lcp_ratio_current_mean",
+                        "",
+                    ),
+                    "model_wrong_target_lcp_candidate_suffix_len_mean": loss_stats.get(
+                        "model_wrong_target_lcp_candidate_suffix_len_mean",
+                        "",
+                    ),
+                    "model_wrong_target_lcp_current_suffix_len_mean": loss_stats.get(
+                        "model_wrong_target_lcp_current_suffix_len_mean",
+                        "",
+                    ),
                     "num_snapshots": microstep_count,
                     "num_microsteps": microstep_count,
                     "batch_size": len(batch),

@@ -660,6 +660,43 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
             return None
         return list(self.microstep_history_hidden_states)
 
+    def _score_time_microstep_history_memory(
+        self,
+        current_prefix: List[int] = None,
+        current_prefix_state: Tuple[Any, Any] = None,
+    ):
+        memory = self._microstep_history_memory()
+        if not current_prefix:
+            return memory
+        if self.model is None:
+            return memory
+        if torch is None:
+            raise ImportError("TrieModelPredictAlgorithm requires torch when model is set")
+
+        with torch.no_grad():
+            if current_prefix_state is not None:
+                hidden = current_prefix_state[0]
+            else:
+                hidden = self.model._encode_path(
+                    tuple(current_prefix),
+                    next(self.model.parameters()).device,
+                )
+        score_memory = [] if memory is None else list(memory)
+        score_memory.append(hidden.detach())
+        maxlen = self._microstep_history_maxlen()
+        if len(score_memory) > maxlen:
+            score_memory = score_memory[-maxlen:]
+        return score_memory
+
+    def _score_time_microstep_history_paths(self, current_prefix: List[int] = None):
+        paths = list(self.microstep_history_path_window)
+        if current_prefix:
+            paths.append(tuple(current_prefix))
+        maxlen = self._microstep_history_maxlen()
+        if len(paths) > maxlen:
+            paths = paths[-maxlen:]
+        return tuple(paths)
+
     def _request_history_memory(self):
         if not self.request_history_hidden_states:
             return None
@@ -826,7 +863,7 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
                 
                 with torch.no_grad():
                     scores, _ = self.model.forward(
-                        self._microstep_history_memory(),
+                        self._score_time_microstep_history_memory(current_path),
                         self._request_history_memory(),
                         self._candidate_lru_features(candidates),
                         candidate_states=leaf_states,
@@ -994,7 +1031,7 @@ class TrieModelGuard(TrieModelPredictAlgorithm):
                 
                 with torch.no_grad():
                     scores, _ = self.model.forward(
-                        self._microstep_history_memory(),
+                        self._score_time_microstep_history_memory(current_path),
                         self._request_history_memory(),
                         self._candidate_lru_features(candidates),
                         candidate_states=leaf_states,

@@ -120,7 +120,12 @@ class TrieTrainingCache:
             # snapshot.eviction_steps contains access-prefix training steps.
     """
     
-    def __init__(self, max_node_num: int, model=None):
+    def __init__(
+        self,
+        max_node_num: int,
+        model=None,
+        train_on_eviction_decision: bool = False,
+    ):
         """
         Args:
             max_node_num: Maximum trie capacity
@@ -128,6 +133,7 @@ class TrieTrainingCache:
         """
         self.max_node_num = max_node_num
         self.model = model
+        self.train_on_eviction_decision = bool(train_on_eviction_decision)
         
         # Internal trie algorithm
         self.alg = TrieModelPredictAlgorithm(max_node_num, model)
@@ -233,12 +239,62 @@ class TrieTrainingCache:
             raise ValueError("Cannot choose oracle target from an empty candidate list")
         return max(range(len(distances)), key=lambda idx: distances[idx])
 
+    @staticmethod
+    def _oracle_top_set_from_distances(distances: List[float]):
+        if not distances:
+            return tuple()
+        max_distance = max(distances)
+        return tuple(
+            idx for idx, distance in enumerate(distances)
+            if distance == max_distance
+        )
+
+    @staticmethod
+    def _lcp_len(left_path, right_path) -> int:
+        length = 0
+        for left, right in zip(left_path, right_path):
+            if left != right:
+                break
+            length += 1
+        return length
+
+    def _lcp_diagnostics(self, candidate_paths, current_path):
+        current = tuple(current_path)
+        diagnostics = []
+        for candidate_path in candidate_paths:
+            candidate = tuple(candidate_path)
+            lcp_len = self._lcp_len(candidate, current)
+            diagnostics.append({
+                "lcp_len": lcp_len,
+                "lcp_ratio_candidate": lcp_len / len(candidate) if candidate else 0.0,
+                "lcp_ratio_current": lcp_len / len(current) if current else 0.0,
+                "candidate_suffix_len": max(0, len(candidate) - lcp_len),
+                "current_suffix_len": max(0, len(current) - lcp_len),
+            })
+        return tuple(diagnostics)
+
+    @staticmethod
+    def _lru_target_from_features(lru_features) -> Optional[int]:
+        if not lru_features:
+            return None
+        return max(range(len(lru_features)), key=lambda idx: lru_features[idx][0])
+
+    def _attach_candidate_metadata(self, step_data, current_path, oracle_distances):
+        step_data.oracle_target = self._oracle_target_from_distances(oracle_distances)
+        step_data.oracle_top_set = self._oracle_top_set_from_distances(
+            oracle_distances
+        )
+        step_data.lru_target = self._lru_target_from_features(step_data.lru_features)
+        step_data.lcp_diagnostics = self._lcp_diagnostics(
+            step_data.leaf_paths,
+            current_path,
+        )
+
     def _microstep_access_snapshot(
         self,
         cache_sequence: List[int],
         current_prefix: List[int],
         step_index: int,
-        pre_step_microstep_history_paths,
         pre_request_history_paths,
     ) -> Optional[SimpleNamespace]:
         """
@@ -269,7 +325,9 @@ class TrieTrainingCache:
         step_data.request_path = tuple(cache_sequence)
         step_data.current_path = tuple(current_prefix)
         step_data.step_index = step_index
-        step_data.microstep_history_paths = tuple(pre_step_microstep_history_paths)
+        step_data.microstep_history_paths = self.alg._score_time_microstep_history_paths(
+            current_prefix
+        )
         step_data.request_history_paths = tuple(pre_request_history_paths)
         step_data.lru_features = tuple(
             tuple(row) for row in self.alg._candidate_lru_features(candidates)
@@ -282,7 +340,7 @@ class TrieTrainingCache:
             "path_depth",
         )
         step_data.oracle_distances = oracle_distances
-        step_data.oracle_target = self._oracle_target_from_distances(oracle_distances)
+        self._attach_candidate_metadata(step_data, current_prefix, oracle_distances)
         step_data.required_candidate_indices = tuple(required_candidate_indices)
         step_data.num_candidates = len(candidates)
         return step_data
@@ -309,14 +367,10 @@ class TrieTrainingCache:
         current_prefix = []
         for step_index, node_id in enumerate(cache_sequence):
             current_prefix.append(node_id)
-            pre_step_microstep_history_paths = tuple(
-                self.alg.microstep_history_path_window
-            )
             step_data = self._microstep_access_snapshot(
                 cache_sequence,
                 current_prefix,
                 step_index,
-                pre_step_microstep_history_paths,
                 pre_request_history_paths,
             )
             if step_data is not None:
@@ -329,12 +383,17 @@ class TrieTrainingCache:
             else:
                 evict_num = self.alg.cur_node_num + 1 - self.alg.max_node_num
                 if evict_num > 0:
-                    self._evict_and_collect(
+                    step_snapshot = self._evict_and_collect(
                         evict_num,
                         this_node,
                         current_prefix,
                         step_index,
                     )
+                    if (
+                        self.train_on_eviction_decision
+                        and step_snapshot is not None
+                    ):
+                        snapshot.eviction_steps.extend(step_snapshot.eviction_steps)
 
                 new_node = TrieNode()
                 new_node.key = node_id
@@ -428,8 +487,8 @@ class TrieTrainingCache:
             ]
             step_data.current_path = tuple(current_path)
             step_data.step_index = step_index
-            step_data.microstep_history_paths = tuple(
-                self.alg.microstep_history_path_window
+            step_data.microstep_history_paths = (
+                self.alg._score_time_microstep_history_paths(current_path)
             )
             step_data.request_history_paths = tuple(
                 self.alg.request_history_path_window
@@ -445,7 +504,11 @@ class TrieTrainingCache:
                 "path_depth",
             )
             step_data.oracle_distances = oracle_distances
-            step_data.oracle_target = oracle_idx
+            self._attach_candidate_metadata(step_data, current_path, oracle_distances)
+            step_data.required_candidate_indices = tuple(
+                idx for idx, distance in enumerate(oracle_distances)
+                if distance == 0
+            )
             step_data.num_candidates = len(candidates)
             snapshot.eviction_steps.append(step_data)
             
@@ -466,7 +529,7 @@ class TrieTrainingCache:
                 
                 with torch.no_grad():
                     scores, _ = self.model.forward(
-                        self.alg._microstep_history_memory(),
+                        self.alg._score_time_microstep_history_memory(current_path),
                         self.alg._request_history_memory(),
                         self.alg._candidate_lru_features(candidates),
                         candidate_states=leaf_states,
@@ -633,4 +696,3 @@ class SequenceTrieCache:
             "evictions": getattr(self.alg, "eviction_count", 0),
             "resident_blocks": getattr(self.alg, "cur_node_num", 0),
         }
-

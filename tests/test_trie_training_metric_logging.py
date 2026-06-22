@@ -2,6 +2,7 @@
 """Tests for TrieParrot training metric logging and automatic loss plotting."""
 import csv
 import json
+import math
 import os
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from model.trie_model.__main__ import (
     as_microstep_window_batches,
     count_microstep_steps,
     count_microstep_windows,
+    combine_loss_stats,
     create_frozen_cpu_collection_model,
     create_trie_parrot_model_from_config,
     compute_rank_eval_metrics,
@@ -410,6 +412,7 @@ def test_async_collection_worker_uses_frozen_cpu_snapshot():
         model_prob,
         max_examples,
         max_requests,
+        train_on_eviction_decision=False,
     ):
         seen["device"] = next(collection_model.parameters()).device.type
         seen["requires_grad"] = any(
@@ -418,6 +421,7 @@ def test_async_collection_worker_uses_frozen_cpu_snapshot():
         seen["first_param"] = next(collection_model.parameters()).detach().cpu().clone()
         seen["model_prob"] = model_prob
         seen["max_examples"] = max_examples
+        seen["train_on_eviction_decision"] = train_on_eviction_decision
         started.set()
         release.wait(timeout=5)
         return [SimpleNamespace(eviction_steps=[SimpleNamespace()])], 0.75
@@ -459,6 +463,7 @@ def test_async_collection_worker_uses_frozen_cpu_snapshot():
     assert not seen["requires_grad"]
     assert seen["model_prob"] == 0.5
     assert seen["max_examples"] == 16
+    assert not seen["train_on_eviction_decision"]
     assert torch.allclose(seen["first_param"], frozen_first_param)
     assert not torch.allclose(next(model.parameters()).detach().cpu(), frozen_first_param)
 
@@ -594,13 +599,29 @@ def test_loss_microbatch_sum_matches_full_batch_mean():
         max_steps_per_snapshot=None,
         warmup_steps_per_snapshot=1,
     )
-    assert total_stats == full_stats
+    for key in [
+        "full_steps",
+        "capped_steps",
+        "candidate_count",
+        "ranking_count",
+        "reuse_count",
+        "ce_count",
+        "top_set_ce_count",
+        "hard_lru_margin_count",
+        "warmup_steps",
+        "loss_steps",
+        "microstep_access_steps",
+        "eviction_decision_steps",
+        "lru_target_kept_count",
+        "oracle_top_set_kept_count",
+        "hard_lru_cases_count",
+        "max_loss_candidates_effective",
+    ]:
+        assert total_stats[key] == full_stats[key], key
 
-    micro_losses = {
-        "ranking": torch.tensor(0.0),
-        "reuse": torch.tensor(0.0),
-        "ce": torch.tensor(0.0),
-    }
+    loss_names = model.loss_names()
+    micro_losses = {name: torch.tensor(0.0) for name in loss_names}
+    micro_stats = []
     for micro_batch in iter_loss_microbatches(batch, 2):
         loss_sums = compute_training_losses(
             model,
@@ -611,13 +632,27 @@ def test_loss_microbatch_sum_matches_full_batch_mean():
             train_device_ids=[],
             reduction="sum",
         )
-        for name in ("ranking", "reuse", "ce"):
+        micro_stats.append(dict(model.last_loss_stats))
+        for name in loss_names:
             count = total_stats[f"{name}_count"]
             if count > 0:
                 micro_losses[name] = micro_losses[name] + loss_sums[name] / count
 
-    for name in ("ranking", "reuse", "ce"):
+    for name in loss_names:
         assert torch.allclose(micro_losses[name], full_losses[name], atol=1e-6)
+
+    combined_stats = combine_loss_stats(micro_stats)
+    for key in [
+        "top_set_acc",
+        "regret",
+    ]:
+        assert math.isclose(combined_stats[key], full_stats[key], abs_tol=1e-8), key
+    for key in [
+        "lru_target_kept_count",
+        "oracle_top_set_kept_count",
+        "max_loss_candidates_effective",
+    ]:
+        assert combined_stats[key] == full_stats[key], key
 
 
 def test_full_dagger_config_uses_lru_trie_fields():
@@ -652,6 +687,34 @@ def test_full_parrot_like_config_uses_parrot_window_shape():
     assert config.get("lru_feature_dim") == 5
 
 
+def test_phase_configs_capture_hard_lru_ablation_knobs():
+    config_dir = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "configs",
+    )
+    with open(os.path.join(config_dir, "full_parrot_like_phase1_oasst1_b16_c256.json")) as f:
+        phase1 = json.load(f)
+    with open(os.path.join(config_dir, "full_parrot_like_phase2_oasst1_b16_c256.json")) as f:
+        phase2 = json.load(f)
+
+    for config in (phase1, phase2):
+        assert config["max_loss_candidates"] == 32
+        assert config["lru_prior_alpha_init"] == 0.75
+        assert config["lru_prior_alpha_max"] == 1.5
+        assert config["lru_prior_alpha_learnable"] is True
+
+    assert phase1["train_on_eviction_decision"] is False
+    assert phase1["top_set_ce_weight"] == 0.0
+    assert phase1["hard_lru_margin_weight"] == 0.0
+
+    assert phase2["train_on_eviction_decision"] is True
+    assert phase2["eviction_decision_loss_weight"] == 4.0
+    assert phase2["microstep_access_loss_weight"] == 0.25
+    assert phase2["top_set_ce_weight"] == 1.0
+    assert phase2["hard_lru_margin_weight"] == 1.0
+    assert phase2["hard_lru_margin"] == 0.2
+
+
 if __name__ == "__main__":
     test_metric_append_writes_header_and_preserves_existing_rows()
     test_metric_append_upgrades_older_header()
@@ -669,4 +732,5 @@ if __name__ == "__main__":
     test_loss_microbatch_sum_matches_full_batch_mean()
     test_full_dagger_config_uses_lru_trie_fields()
     test_full_parrot_like_config_uses_parrot_window_shape()
+    test_phase_configs_capture_hard_lru_ablation_knobs()
     print("TRIE TRAINING METRIC LOGGING TESTS PASSED")

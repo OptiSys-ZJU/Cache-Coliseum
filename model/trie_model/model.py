@@ -98,12 +98,19 @@ class TrieParrotModel(nn.Module):
         reuse_loss_weight: float = 0.1,
         ce_loss_weight: float = 0.0,
         ce_target_policy: str = "argmax",
+        top_set_ce_weight: float = 0.0,
+        hard_lru_margin_weight: float = 0.0,
+        hard_lru_margin: float = 0.2,
+        train_on_eviction_decision: bool = False,
+        eviction_decision_loss_weight: float = 1.0,
+        microstep_access_loss_weight: float = 1.0,
         max_request_history: Optional[int] = None,
         max_microstep_history: Optional[int] = None,
         lru_feature_dim: int = 5,
         reuse_distance_log_cap: float = 5.0,
         ndcg_alpha: float = 10.0,
-        lru_prior_alpha_init: float = 1.0,
+        lru_prior_alpha_init: float = 0.75,
+        lru_prior_alpha_max: float = 1.5,
         lru_prior_alpha_learnable: bool = True,
     ):
         """
@@ -131,13 +138,26 @@ class TrieParrotModel(nn.Module):
             else max_microstep_history
         )
         self.lru_feature_dim = lru_feature_dim
-        self.lru_prior_alpha_init = float(lru_prior_alpha_init)
-        if self.lru_prior_alpha_init < 0:
+        requested_lru_prior_alpha_init = float(lru_prior_alpha_init)
+        self.lru_prior_alpha_max = float(lru_prior_alpha_max)
+        if self.lru_prior_alpha_max <= 0:
+            raise ValueError("lru_prior_alpha_max must be positive")
+        if requested_lru_prior_alpha_init < 0:
             raise ValueError("lru_prior_alpha_init must be nonnegative")
+        self.lru_prior_alpha_init = min(
+            requested_lru_prior_alpha_init,
+            self.lru_prior_alpha_max,
+        )
         self.lru_prior_alpha_learnable = bool(lru_prior_alpha_learnable)
         self.ranking_loss_weight = ranking_loss_weight
         self.reuse_loss_weight = reuse_loss_weight
         self.ce_loss_weight = ce_loss_weight
+        self.top_set_ce_weight = float(top_set_ce_weight)
+        self.hard_lru_margin_weight = float(hard_lru_margin_weight)
+        self.hard_lru_margin = float(hard_lru_margin)
+        self.train_on_eviction_decision = bool(train_on_eviction_decision)
+        self.eviction_decision_loss_weight = float(eviction_decision_loss_weight)
+        self.microstep_access_loss_weight = float(microstep_access_loss_weight)
         if ce_target_policy not in {"argmax", "top_set"}:
             raise ValueError(
                 "ce_target_policy must be one of {'argmax', 'top_set'}, "
@@ -172,7 +192,9 @@ class TrieParrotModel(nn.Module):
         self.request_head = nn.Linear(hidden_size, 1)
         self.micro_head = nn.Linear(hidden_size, 1)
         if self.lru_prior_alpha_learnable:
-            raw_alpha = self._inverse_softplus(self.lru_prior_alpha_init)
+            raw_alpha = self._inverse_sigmoid(
+                self.lru_prior_alpha_init / self.lru_prior_alpha_max
+            )
             self.lru_prior_raw_alpha = nn.Parameter(torch.tensor(raw_alpha))
         else:
             self.register_buffer(
@@ -191,10 +213,21 @@ class TrieParrotModel(nn.Module):
             return -20.0
         return math.log(math.expm1(value))
 
+    @staticmethod
+    def _inverse_sigmoid(value: float) -> float:
+        value = min(max(float(value), 1e-7), 1.0 - 1e-7)
+        return math.log(value / (1.0 - value))
+
     def lru_prior_alpha(self) -> torch.Tensor:
         if self.lru_prior_alpha_learnable:
-            return F.softplus(self.lru_prior_raw_alpha)
-        return torch.clamp_min(self.lru_prior_fixed_alpha, 0.0)
+            return self.lru_prior_alpha_max * torch.sigmoid(
+                self.lru_prior_raw_alpha
+            )
+        return torch.clamp(
+            self.lru_prior_fixed_alpha,
+            min=0.0,
+            max=self.lru_prior_alpha_max,
+        )
 
     def _adapt_state_dict_for_lru_prior(self, state_dict):
         adapted = dict(state_dict)
@@ -1013,6 +1046,53 @@ class TrieParrotModel(nn.Module):
         idcg = sorted_gains / torch.log2(ideal_positions + 1.0)
         return -(dcg.sum(dim=-1) / (idcg.sum(dim=-1) + 1e-8))
 
+    @staticmethod
+    def loss_names() -> Tuple[str, ...]:
+        return ("ranking", "reuse", "ce", "top_set_ce", "hard_lru_margin")
+
+    @staticmethod
+    def _oracle_top_set_from_distances(oracle_distances) -> Tuple[int, ...]:
+        if oracle_distances is None or len(oracle_distances) == 0:
+            return tuple()
+        max_distance = max(float(distance) for distance in oracle_distances)
+        return tuple(
+            idx for idx, distance in enumerate(oracle_distances)
+            if float(distance) == max_distance
+        )
+
+    def _step_kind_loss_weight(self, step_kind: str) -> float:
+        if step_kind == "eviction_decision":
+            if not self.train_on_eviction_decision:
+                return 0.0
+            return self.eviction_decision_loss_weight
+        return self.microstep_access_loss_weight
+
+    @staticmethod
+    def _lcp_stat_fields() -> Tuple[str, ...]:
+        return (
+            "lcp_len",
+            "lcp_ratio_candidate",
+            "lcp_ratio_current",
+            "candidate_suffix_len",
+            "current_suffix_len",
+        )
+
+    @classmethod
+    def _accumulate_lcp_stats(cls, stats: dict, prefix: str, diagnostic):
+        if diagnostic is None:
+            return
+        for field in cls._lcp_stat_fields():
+            stats[f"{prefix}_{field}_sum"] += float(diagnostic.get(field, 0.0))
+        stats[f"{prefix}_count"] += 1
+
+    @classmethod
+    def _finalize_lcp_stats(cls, stats: dict, prefix: str):
+        count = int(stats.get(f"{prefix}_count", 0))
+        for field in cls._lcp_stat_fields():
+            sum_key = f"{prefix}_{field}_sum"
+            mean_key = f"{prefix}_{field}_mean"
+            stats[mean_key] = stats.get(sum_key, 0.0) / count if count else 0.0
+
     def loss(
         self,
         snapshots,
@@ -1026,8 +1106,8 @@ class TrieParrotModel(nn.Module):
 
         Time positions are grouped across windows, then candidates/history are
         padded and scored in one batched attention pass. The surrounding field
-        is named eviction_steps, but its entries are microstep cache-state
-        training steps.
+        is named eviction_steps; entries can be microstep access states and,
+        when enabled, true eviction-decision states.
         """
         if reduction not in {"mean", "sum"}:
             raise ValueError("reduction must be one of {'mean', 'sum'}")
@@ -1036,6 +1116,8 @@ class TrieParrotModel(nn.Module):
         ranking_losses = []
         reuse_losses = []
         ce_losses = []
+        top_set_ce_losses = []
+        hard_lru_margin_losses = []
         stats = {
             "full_steps": 0,
             "capped_steps": 0,
@@ -1043,9 +1125,36 @@ class TrieParrotModel(nn.Module):
             "ranking_count": 0,
             "reuse_count": 0,
             "ce_count": 0,
+            "top_set_ce_count": 0,
+            "hard_lru_margin_count": 0,
             "warmup_steps": 0,
             "loss_steps": 0,
+            "microstep_access_steps": 0,
+            "eviction_decision_steps": 0,
+            "lru_target_kept_count": 0,
+            "lru_target_steps": 0,
+            "oracle_top_set_kept_count": 0,
+            "oracle_top_set_steps": 0,
+            "hard_lru_cases_count": 0,
+            "hard_lru_active_frac": 0.0,
+            "max_loss_candidates_effective": 0,
+            "top_set_acc_correct": 0,
+            "top_set_acc_count": 0,
+            "top_set_acc": 0.0,
+            "regret_sum": 0.0,
+            "regret_count": 0,
+            "regret": 0.0,
+            "lru_prior_alpha": float(self.lru_prior_alpha().detach().item()),
         }
+        for prefix in (
+            "oracle_target_lcp",
+            "lru_target_lcp",
+            "model_wrong_target_lcp",
+        ):
+            stats[f"{prefix}_count"] = 0
+            for field in self._lcp_stat_fields():
+                stats[f"{prefix}_{field}_sum"] = 0.0
+                stats[f"{prefix}_{field}_mean"] = 0.0
 
         step_windows = []
         for snapshot in snapshots:
@@ -1077,7 +1186,17 @@ class TrieParrotModel(nn.Module):
                 if step.num_candidates < 2:
                     prepared_steps.append(None)
                     continue
+
+                step_kind = getattr(step, "step_kind", "microstep_access")
+                step_loss_weight = self._step_kind_loss_weight(step_kind)
+                if step_loss_weight <= 0.0:
+                    prepared_steps.append(None)
+                    continue
                 stats["loss_steps"] += 1
+                if step_kind == "eviction_decision":
+                    stats["eviction_decision_steps"] += 1
+                else:
+                    stats["microstep_access_steps"] += 1
 
                 microstep_history_paths = getattr(step, "microstep_history_paths", None)
                 if microstep_history_paths is None:
@@ -1098,23 +1217,59 @@ class TrieParrotModel(nn.Module):
                         "lru_features"
                     )
 
+                oracle_distances = getattr(step, "oracle_distances", None)
+                oracle_top_set = tuple(
+                    getattr(step, "oracle_top_set", None) or ()
+                )
+                if not oracle_top_set:
+                    oracle_top_set = self._oracle_top_set_from_distances(
+                        oracle_distances
+                    )
+                lru_target = getattr(step, "lru_target", None)
+                required_indices = set(
+                    getattr(step, "required_candidate_indices", None) or ()
+                )
+                required_indices.update(oracle_top_set)
+                if lru_target is not None:
+                    required_indices.add(lru_target)
+
                 selected_indices, target_idx = self._candidate_subset(
                     step.num_candidates,
                     step.oracle_target,
                     max_candidates,
-                    getattr(step, "required_candidate_indices", None),
+                    required_indices,
                 )
+                selected_set = set(selected_indices)
                 if len(selected_indices) == step.num_candidates:
                     stats["full_steps"] += 1
                 else:
                     stats["capped_steps"] += 1
                 stats["candidate_count"] += len(selected_indices)
+                stats["max_loss_candidates_effective"] = max(
+                    stats["max_loss_candidates_effective"],
+                    len(selected_indices),
+                )
+                if lru_target is not None:
+                    stats["lru_target_steps"] += 1
+                    if lru_target in selected_set:
+                        stats["lru_target_kept_count"] += 1
+                if oracle_top_set:
+                    stats["oracle_top_set_steps"] += 1
+                    if set(oracle_top_set).issubset(selected_set):
+                        stats["oracle_top_set_kept_count"] += 1
+                hard_lru_case = (
+                    lru_target is not None
+                    and oracle_top_set
+                    and lru_target not in set(oracle_top_set)
+                    and lru_target in selected_set
+                )
+                if hard_lru_case:
+                    stats["hard_lru_cases_count"] += 1
 
                 candidate_paths = [step.leaf_paths[idx] for idx in selected_indices]
                 lru_features = [
                     raw_lru_features[idx] for idx in selected_indices
                 ]
-                oracle_distances = getattr(step, "oracle_distances", None)
                 relevances = None
                 if oracle_distances is not None:
                     relevances = self._transform_oracle_distances(
@@ -1132,6 +1287,38 @@ class TrieParrotModel(nn.Module):
                         device,
                     ).squeeze(0)
 
+                selected_top_positions = [
+                    pos for pos, idx in enumerate(selected_indices)
+                    if idx in oracle_top_set
+                ]
+                if not selected_top_positions:
+                    selected_top_positions = [target_idx]
+                lru_target_pos = (
+                    selected_indices.index(lru_target)
+                    if lru_target in selected_set
+                    else None
+                )
+
+                lcp_diagnostics = tuple(
+                    getattr(step, "lcp_diagnostics", None) or ()
+                )
+                if lcp_diagnostics:
+                    if 0 <= step.oracle_target < len(lcp_diagnostics):
+                        self._accumulate_lcp_stats(
+                            stats,
+                            "oracle_target_lcp",
+                            lcp_diagnostics[step.oracle_target],
+                        )
+                    if (
+                        lru_target is not None
+                        and 0 <= lru_target < len(lcp_diagnostics)
+                    ):
+                        self._accumulate_lcp_stats(
+                            stats,
+                            "lru_target_lcp",
+                            lcp_diagnostics[lru_target],
+                        )
+
                 prepared_steps.append({
                     "microstep_history_paths": microstep_history_paths,
                     "request_history_paths": request_history_paths,
@@ -1139,6 +1326,13 @@ class TrieParrotModel(nn.Module):
                     "lru_features": lru_features,
                     "relevances": relevances,
                     "target_distribution": target_distribution,
+                    "step_weight": float(step_loss_weight),
+                    "selected_indices": selected_indices,
+                    "oracle_top_set": oracle_top_set,
+                    "top_positions": selected_top_positions,
+                    "lru_target_pos": lru_target_pos,
+                    "hard_lru_case": hard_lru_case,
+                    "lcp_diagnostics": lcp_diagnostics,
                 })
 
             step_windows.append(prepared_steps)
@@ -1165,6 +1359,11 @@ class TrieParrotModel(nn.Module):
                 )
 
                 max_batch_candidates = logits.size(1)
+                step_weights = torch.tensor(
+                    [item["step_weight"] for item in batch_steps],
+                    dtype=torch.float32,
+                    device=device,
+                )
                 oracle_rows = [
                     idx for idx, item in enumerate(batch_steps)
                     if item["relevances"] is not None
@@ -1185,12 +1384,14 @@ class TrieParrotModel(nn.Module):
                         dtype=torch.long,
                         device=device,
                     )
+                    per_step_ranking = self._approx_ndcg_loss(
+                        logits.index_select(0, oracle_row_tensor),
+                        relevances.index_select(0, oracle_row_tensor),
+                        candidate_mask.index_select(0, oracle_row_tensor),
+                    )
                     ranking_losses.append(
-                        self._approx_ndcg_loss(
-                            logits.index_select(0, oracle_row_tensor),
-                            relevances.index_select(0, oracle_row_tensor),
-                            candidate_mask.index_select(0, oracle_row_tensor),
-                        )
+                        per_step_ranking
+                        * step_weights.index_select(0, oracle_row_tensor)
                     )
 
                     if self.reuse_loss_weight > 0:
@@ -1202,6 +1403,7 @@ class TrieParrotModel(nn.Module):
                         )
                         reuse_losses.append(
                             per_step_reuse.index_select(0, oracle_row_tensor)
+                            * step_weights.index_select(0, oracle_row_tensor)
                         )
 
                 if self.ce_loss_weight > 0:
@@ -1218,7 +1420,93 @@ class TrieParrotModel(nn.Module):
                         target_distribution[row_idx, :row_target.numel()] = row_target
 
                     log_probs = F.log_softmax(logits, dim=-1)
-                    ce_losses.append(-(target_distribution * log_probs).sum(dim=-1))
+                    ce_losses.append(
+                        -(target_distribution * log_probs).sum(dim=-1)
+                        * step_weights
+                    )
+
+                if self.top_set_ce_weight > 0 or self.hard_lru_margin_weight > 0:
+                    for row_idx, item in enumerate(batch_steps):
+                        row_valid_count = int(candidate_mask[row_idx].sum().item())
+                        row_logits = logits[row_idx, :row_valid_count]
+                        top_positions = [
+                            pos for pos in item["top_positions"]
+                            if pos < row_valid_count
+                        ]
+                        if not top_positions:
+                            continue
+                        top_position_tensor = torch.tensor(
+                            top_positions,
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        top_score = torch.logsumexp(
+                            row_logits.index_select(0, top_position_tensor),
+                            dim=0,
+                        )
+                        all_score = torch.logsumexp(row_logits, dim=0)
+                        weight = item["step_weight"]
+
+                        if self.top_set_ce_weight > 0:
+                            top_set_ce_losses.append(
+                                (all_score - top_score).unsqueeze(0) * weight
+                            )
+
+                        lru_target_pos = item["lru_target_pos"]
+                        if (
+                            self.hard_lru_margin_weight > 0
+                            and item["hard_lru_case"]
+                            and lru_target_pos is not None
+                            and lru_target_pos < row_valid_count
+                        ):
+                            hard_lru_margin_losses.append(
+                                F.softplus(
+                                    row_logits[lru_target_pos]
+                                    - top_score
+                                    + self.hard_lru_margin
+                                ).unsqueeze(0)
+                                * weight
+                            )
+
+                for row_idx, item in enumerate(batch_steps):
+                    if item["relevances"] is None:
+                        continue
+                    row_valid_count = int(candidate_mask[row_idx].sum().item())
+                    if row_valid_count <= 0:
+                        continue
+                    row_scores = logits[row_idx, :row_valid_count]
+                    pred_pos = int(torch.argmax(row_scores).detach().item())
+                    top_positions = [
+                        pos for pos in item["top_positions"]
+                        if pos < row_valid_count
+                    ]
+                    if not top_positions:
+                        continue
+                    stats["top_set_acc_count"] += 1
+                    if pred_pos in top_positions:
+                        stats["top_set_acc_correct"] += 1
+
+                    row_relevances = item["relevances"].detach()
+                    top_relevance = row_relevances[
+                        torch.tensor(top_positions, dtype=torch.long, device=device)
+                    ].max()
+                    pred_relevance = row_relevances[pred_pos]
+                    stats["regret_sum"] += float(
+                        torch.clamp_min(top_relevance - pred_relevance, 0.0).item()
+                    )
+                    stats["regret_count"] += 1
+
+                    original_pred_idx = item["selected_indices"][pred_pos]
+                    if (
+                        original_pred_idx not in set(item["oracle_top_set"])
+                        and item["lcp_diagnostics"]
+                        and 0 <= original_pred_idx < len(item["lcp_diagnostics"])
+                    ):
+                        self._accumulate_lcp_stats(
+                            stats,
+                            "model_wrong_target_lcp",
+                            item["lcp_diagnostics"][original_pred_idx],
+                        )
         finally:
             if had_active_cache:
                 self._active_path_encoding_cache = previous_active_cache
@@ -1259,6 +1547,54 @@ class TrieParrotModel(nn.Module):
         else:
             losses["ce"] = torch.tensor(0.0, device=device, requires_grad=True)
 
+        if top_set_ce_losses:
+            stats["top_set_ce_count"] = sum(
+                term.numel() for term in top_set_ce_losses
+            )
+            losses["top_set_ce"] = reduce_loss_terms(
+                top_set_ce_losses,
+                self.top_set_ce_weight,
+            )
+        else:
+            losses["top_set_ce"] = torch.tensor(
+                0.0,
+                device=device,
+                requires_grad=True,
+            )
+
+        if hard_lru_margin_losses:
+            stats["hard_lru_margin_count"] = sum(
+                term.numel() for term in hard_lru_margin_losses
+            )
+            losses["hard_lru_margin"] = reduce_loss_terms(
+                hard_lru_margin_losses,
+                self.hard_lru_margin_weight,
+            )
+        else:
+            losses["hard_lru_margin"] = torch.tensor(
+                0.0,
+                device=device,
+                requires_grad=True,
+            )
+
+        if stats["loss_steps"] > 0:
+            stats["hard_lru_active_frac"] = (
+                stats["hard_lru_cases_count"] / stats["loss_steps"]
+            )
+        if stats["top_set_acc_count"] > 0:
+            stats["top_set_acc"] = (
+                stats["top_set_acc_correct"] / stats["top_set_acc_count"]
+            )
+        if stats["regret_count"] > 0:
+            stats["regret"] = stats["regret_sum"] / stats["regret_count"]
+
+        for prefix in (
+            "oracle_target_lcp",
+            "lru_target_lcp",
+            "model_wrong_target_lcp",
+        ):
+            self._finalize_lcp_stats(stats, prefix)
+
         self.last_loss_stats = stats
         return losses
 
@@ -1285,7 +1621,7 @@ class TrieParrotModel(nn.Module):
             else fixed_lru_prior_alpha is not None
         )
         default_lru_prior_alpha = (
-            1.0
+            0.75
             if isinstance(fixed_lru_prior_alpha, bool)
             or fixed_lru_prior_alpha is None
             else fixed_lru_prior_alpha
@@ -1306,9 +1642,22 @@ class TrieParrotModel(nn.Module):
             reuse_loss_weight=config.get("reuse_loss_weight", 0.1),
             ce_loss_weight=config.get("ce_loss_weight", 0.0),
             ce_target_policy=config.get("ce_target_policy", "argmax"),
+            top_set_ce_weight=config.get("top_set_ce_weight", 0.0),
+            hard_lru_margin_weight=config.get("hard_lru_margin_weight", 0.0),
+            hard_lru_margin=config.get("hard_lru_margin", 0.2),
+            train_on_eviction_decision=config.get("train_on_eviction_decision", False),
+            eviction_decision_loss_weight=config.get(
+                "eviction_decision_loss_weight",
+                1.0,
+            ),
+            microstep_access_loss_weight=config.get(
+                "microstep_access_loss_weight",
+                1.0,
+            ),
             reuse_distance_log_cap=config.get("reuse_distance_log_cap", 5.0),
             ndcg_alpha=config.get("ndcg_alpha", 10.0),
             lru_prior_alpha_init=lru_prior_alpha_init,
+            lru_prior_alpha_max=config.get("lru_prior_alpha_max", 1.5),
             lru_prior_alpha_learnable=config.get(
                 "lru_prior_alpha_learnable",
                 not fixed_lru_prior_requested,

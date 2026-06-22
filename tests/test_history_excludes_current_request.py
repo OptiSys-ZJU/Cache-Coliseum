@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify eviction-time history excludes the current microstep being processed."""
+"""Verify eviction-time scoring sees old history plus the current prefix."""
 import os
 import sys
 
@@ -39,7 +39,7 @@ class RecordingModel(TrieParrotModel):
         return logits, reuse
 
 
-def test_eviction_history_excludes_current_microstep():
+def test_eviction_history_includes_current_prefix_for_scoring():
     model = RecordingModel()
     model.eval()
     alg = TrieModelPredictAlgorithm(max_node_num=4, model=model)
@@ -51,9 +51,9 @@ def test_eviction_history_excludes_current_microstep():
 
     alg.access([5, 6])
     assert model.history_lengths, "eviction-time forward should be called"
-    assert model.history_lengths == [4, 5], (
-        "both evictions for request [5,6] should see only the history that "
-        "exists before each microstep"
+    assert model.history_lengths == [5, 6], (
+        "both evictions for request [5,6] should see old history plus the "
+        "current prefix used for scoring"
     )
     assert list(alg.microstep_history_path_window) == [
         (1,),
@@ -66,5 +66,5 @@ def test_eviction_history_excludes_current_microstep():
 
 
 if __name__ == "__main__":
-    test_eviction_history_excludes_current_microstep()
-    print("HISTORY EXCLUDES CURRENT MICROSTEP TEST PASSED")
+    test_eviction_history_includes_current_prefix_for_scoring()
+    print("HISTORY INCLUDES CURRENT PREFIX TEST PASSED")
