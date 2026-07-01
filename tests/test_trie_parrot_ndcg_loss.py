@@ -434,12 +434,23 @@ def test_from_config_lru_prior_alpha_fields():
                     "node_embed_dim": 16,
                     "hidden_size": 32,
                     "lru_prior_alpha_init": 1.5,
+                    "lru_prior_alpha_min": 0.25,
                     "lru_prior_alpha_learnable": True,
+                    "use_lcp_features": True,
+                    "lcp_wrong_margin_weight": 0.15,
+                    "lcp_wrong_margin": 0.3,
+                    "lcp_wrong_ratio_threshold": 0.6,
                 },
                 f,
             )
         learnable = TrieParrotModel.from_config(learnable_path)
         assert math.isclose(learnable.lru_prior_alpha().item(), 1.5, abs_tol=1e-6)
+        assert learnable.lru_prior_alpha_min == 0.25
+        assert learnable.use_lcp_features
+        assert hasattr(learnable, "lcp_head")
+        assert learnable.lcp_wrong_margin_weight == 0.15
+        assert learnable.lcp_wrong_margin == 0.3
+        assert learnable.lcp_wrong_ratio_threshold == 0.6
         assert "lru_prior_raw_alpha" in dict(learnable.named_parameters())
 
         fixed_path = os.path.join(tmpdir, "fixed.json")
@@ -449,12 +460,13 @@ def test_from_config_lru_prior_alpha_fields():
                     "vocab_size": 128,
                     "node_embed_dim": 16,
                     "hidden_size": 32,
-                    "lru_prior_alpha_fixed": 0.75,
+                    "lru_prior_alpha_fixed": 0.1,
+                    "lru_prior_alpha_min": 0.25,
                 },
                 f,
             )
         fixed = TrieParrotModel.from_config(fixed_path)
-        assert math.isclose(fixed.lru_prior_alpha().item(), 0.75, abs_tol=1e-6)
+        assert math.isclose(fixed.lru_prior_alpha().item(), 0.25, abs_tol=1e-6)
         assert "lru_prior_raw_alpha" not in dict(fixed.named_parameters())
 
 
@@ -645,6 +657,107 @@ def test_hard_lru_margin_only_active_when_lru_not_in_top_set():
     assert torch.allclose(losses["hard_lru_margin"], expected)
     assert model.last_loss_stats["hard_lru_cases_count"] == 1
     assert model.last_loss_stats["hard_lru_margin_count"] == 1
+
+
+def test_lcp_wrong_margin_only_active_for_high_lcp_wrong_target():
+    model = make_model(
+        reuse_loss_weight=0.0,
+        ranking_loss_weight=0.0,
+        lcp_wrong_margin_weight=1.0,
+        lcp_wrong_margin=0.2,
+        lcp_wrong_ratio_threshold=0.5,
+    )
+
+    def lcp_rows(wrong_ratio):
+        return (
+            {
+                "lcp_len": 0,
+                "lcp_ratio_candidate": 0.0,
+                "lcp_ratio_current": 0.0,
+                "candidate_suffix_len": 1,
+                "current_suffix_len": 1,
+            },
+            {
+                "lcp_len": 1,
+                "lcp_ratio_candidate": 1.0,
+                "lcp_ratio_current": wrong_ratio,
+                "candidate_suffix_len": 0,
+                "current_suffix_len": 1,
+            },
+            {
+                "lcp_len": 0,
+                "lcp_ratio_candidate": 0.0,
+                "lcp_ratio_current": 0.0,
+                "candidate_suffix_len": 1,
+                "current_suffix_len": 1,
+            },
+        )
+
+    high_wrong = make_step(
+        [(1,), (2,), (3,)],
+        [float("inf"), 1.0, 2.0],
+        lcp_diagnostics=lcp_rows(0.7),
+    )
+    low_wrong = make_step(
+        [(4,), (5,), (6,)],
+        [float("inf"), 1.0, 2.0],
+        lcp_diagnostics=lcp_rows(0.4),
+    )
+    top_correct = make_step(
+        [(7,), (8,), (9,)],
+        [float("inf"), 1.0, 2.0],
+        lcp_diagnostics=lcp_rows(0.9),
+    )
+    logits = torch.tensor(
+        [
+            [0.0, 1.5, 0.2],
+            [0.0, 1.5, 0.2],
+            [1.5, 0.0, 0.2],
+        ],
+        dtype=torch.float32,
+    )
+
+    def fake_forward_batched(*args, **kwargs):
+        del args, kwargs
+        return (
+            logits,
+            torch.zeros_like(logits),
+            torch.ones_like(logits, dtype=torch.bool),
+        )
+
+    model.forward_batched = fake_forward_batched
+    losses = model.loss([
+        SimpleNamespace(eviction_steps=[high_wrong]),
+        SimpleNamespace(eviction_steps=[low_wrong]),
+        SimpleNamespace(eviction_steps=[top_correct]),
+    ])
+    expected = torch.nn.functional.softplus(
+        torch.tensor(1.5) - torch.tensor(0.0) + 0.2
+    )
+
+    assert torch.allclose(losses["lcp_wrong_margin"], expected)
+    assert model.last_loss_stats["lcp_wrong_cases_count"] == 2
+    assert model.last_loss_stats["lcp_wrong_high_lcp_count"] == 1
+    assert model.last_loss_stats["lcp_wrong_margin_count"] == 1
+
+
+def test_loss_accepts_tuple_lcp_diagnostics_for_stats():
+    model = make_model(reuse_loss_weight=0.0)
+    leaf_paths = [(1, 2, 3), (4,), (1, 2, 8)]
+    step = make_step(
+        leaf_paths,
+        [float("inf"), 1.0, 2.0],
+        lcp_diagnostics=TrieParrotModel.lcp_features_from_paths(
+            leaf_paths,
+            (1, 2, 9),
+        ),
+    )
+
+    losses = model.loss([SimpleNamespace(eviction_steps=[step])])
+
+    assert torch.isfinite(sum(losses.values()))
+    assert model.last_loss_stats["oracle_target_lcp_lcp_len_mean"] == 2.0
+    assert model.last_loss_stats["oracle_target_lcp_count"] == 1
 
 
 def test_eviction_decision_steps_train_only_when_enabled():
@@ -1046,6 +1159,8 @@ if __name__ == "__main__":
     test_top_set_ce_targets_all_max_relevance_candidates()
     test_top_set_ce_loss_uses_logsumexp_top_set_formula()
     test_hard_lru_margin_only_active_when_lru_not_in_top_set()
+    test_lcp_wrong_margin_only_active_for_high_lcp_wrong_target()
+    test_loss_accepts_tuple_lcp_diagnostics_for_stats()
     test_eviction_decision_steps_train_only_when_enabled()
     test_invalid_ce_target_policy_rejected()
     test_required_snapshot_fields_are_enforced()

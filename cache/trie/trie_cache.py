@@ -18,6 +18,7 @@ from cache.evict.evictor import ReuseDistanceEvictor
 from cache.evict.predictor import OracleReuseDistancePredictor
 from cache.hash import HashFunction, OneHashFunction
 from cache.trie.trie_algorithms import (
+    candidate_lcp_diagnostics,
     TrieEvictAlgorithm, TrieGuard, TrieLRUAlgorithm, 
     TrieModelPredictAlgorithm, TrieModelGuard, TrieNode, 
     TrieOracleAlgorithm, TriePredictAlgorithm, TrieRandAlgorithm,
@@ -249,29 +250,8 @@ class TrieTrainingCache:
             if distance == max_distance
         )
 
-    @staticmethod
-    def _lcp_len(left_path, right_path) -> int:
-        length = 0
-        for left, right in zip(left_path, right_path):
-            if left != right:
-                break
-            length += 1
-        return length
-
     def _lcp_diagnostics(self, candidate_paths, current_path):
-        current = tuple(current_path)
-        diagnostics = []
-        for candidate_path in candidate_paths:
-            candidate = tuple(candidate_path)
-            lcp_len = self._lcp_len(candidate, current)
-            diagnostics.append({
-                "lcp_len": lcp_len,
-                "lcp_ratio_candidate": lcp_len / len(candidate) if candidate else 0.0,
-                "lcp_ratio_current": lcp_len / len(current) if current else 0.0,
-                "candidate_suffix_len": max(0, len(candidate) - lcp_len),
-                "current_suffix_len": max(0, len(current) - lcp_len),
-            })
-        return tuple(diagnostics)
+        return candidate_lcp_diagnostics(candidate_paths, current_path)
 
     @staticmethod
     def _lru_target_from_features(lru_features) -> Optional[int]:
@@ -527,12 +507,17 @@ class TrieTrainingCache:
                     else:
                         leaf_states.append(torch.zeros(1, self.model.hidden_size))
                 
+                forward_kwargs = {"candidate_states": leaf_states}
+                if getattr(self.model, "use_lcp_features", False):
+                    forward_kwargs["lcp_features"] = (
+                        self.alg._candidate_lcp_features(candidates, current_path)
+                    )
                 with torch.no_grad():
                     scores, _ = self.model.forward(
                         self.alg._score_time_microstep_history_memory(current_path),
                         self.alg._request_history_memory(),
                         self.alg._candidate_lru_features(candidates),
-                        candidate_states=leaf_states,
+                        **forward_kwargs,
                     )
                 target_idx = scores.squeeze(0).argmax().item()
             else:

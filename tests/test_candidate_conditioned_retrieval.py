@@ -62,8 +62,10 @@ def test_predict_algorithm_passes_microstep_history_memory_to_model():
             lru_features,
             candidate_states=None,
             candidate_paths=None,
+            lcp_features=None,
             inference=True,
         ):
+            del lcp_features
             if isinstance(microstep_history_memory, list):
                 microstep_shape = (
                     len(microstep_history_memory),

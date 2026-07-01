@@ -110,8 +110,13 @@ class TrieParrotModel(nn.Module):
         reuse_distance_log_cap: float = 5.0,
         ndcg_alpha: float = 10.0,
         lru_prior_alpha_init: float = 0.75,
+        lru_prior_alpha_min: float = 0.0,
         lru_prior_alpha_max: float = 1.5,
         lru_prior_alpha_learnable: bool = True,
+        use_lcp_features: bool = False,
+        lcp_wrong_margin_weight: float = 0.0,
+        lcp_wrong_margin: float = 0.2,
+        lcp_wrong_ratio_threshold: float = 0.5,
     ):
         """
         Initialize TrieParrotModel.
@@ -139,13 +144,22 @@ class TrieParrotModel(nn.Module):
         )
         self.lru_feature_dim = lru_feature_dim
         requested_lru_prior_alpha_init = float(lru_prior_alpha_init)
+        self.lru_prior_alpha_min = float(lru_prior_alpha_min)
         self.lru_prior_alpha_max = float(lru_prior_alpha_max)
+        if self.lru_prior_alpha_min < 0:
+            raise ValueError("lru_prior_alpha_min must be nonnegative")
         if self.lru_prior_alpha_max <= 0:
             raise ValueError("lru_prior_alpha_max must be positive")
-        if requested_lru_prior_alpha_init < 0:
-            raise ValueError("lru_prior_alpha_init must be nonnegative")
+        if self.lru_prior_alpha_max < self.lru_prior_alpha_min:
+            raise ValueError(
+                "lru_prior_alpha_max must be greater than or equal to "
+                "lru_prior_alpha_min"
+            )
+        self.lru_prior_alpha_range = (
+            self.lru_prior_alpha_max - self.lru_prior_alpha_min
+        )
         self.lru_prior_alpha_init = min(
-            requested_lru_prior_alpha_init,
+            max(requested_lru_prior_alpha_init, self.lru_prior_alpha_min),
             self.lru_prior_alpha_max,
         )
         self.lru_prior_alpha_learnable = bool(lru_prior_alpha_learnable)
@@ -155,6 +169,11 @@ class TrieParrotModel(nn.Module):
         self.top_set_ce_weight = float(top_set_ce_weight)
         self.hard_lru_margin_weight = float(hard_lru_margin_weight)
         self.hard_lru_margin = float(hard_lru_margin)
+        self.use_lcp_features = bool(use_lcp_features)
+        self.lcp_feature_dim = len(self._lcp_stat_fields())
+        self.lcp_wrong_margin_weight = float(lcp_wrong_margin_weight)
+        self.lcp_wrong_margin = float(lcp_wrong_margin)
+        self.lcp_wrong_ratio_threshold = float(lcp_wrong_ratio_threshold)
         self.train_on_eviction_decision = bool(train_on_eviction_decision)
         self.eviction_decision_loss_weight = float(eviction_decision_loss_weight)
         self.microstep_access_loss_weight = float(microstep_access_loss_weight)
@@ -192,16 +211,32 @@ class TrieParrotModel(nn.Module):
         self.request_head = nn.Linear(hidden_size, 1)
         self.micro_head = nn.Linear(hidden_size, 1)
         if self.lru_prior_alpha_learnable:
-            raw_alpha = self._inverse_sigmoid(
-                self.lru_prior_alpha_init / self.lru_prior_alpha_max
-            )
+            if self.lru_prior_alpha_range > 0:
+                alpha_position = (
+                    (self.lru_prior_alpha_init - self.lru_prior_alpha_min)
+                    / self.lru_prior_alpha_range
+                )
+                raw_alpha = self._inverse_sigmoid(alpha_position)
+            else:
+                raw_alpha = 0.0
             self.lru_prior_raw_alpha = nn.Parameter(torch.tensor(raw_alpha))
         else:
             self.register_buffer(
                 "lru_prior_fixed_alpha",
                 torch.tensor(self.lru_prior_alpha_init, dtype=torch.float32),
             )
+        self.register_buffer(
+            "lru_prior_alpha_encoding_version",
+            torch.tensor(2, dtype=torch.long),
+        )
         self.score_mix_logits = nn.Parameter(torch.zeros(2))
+        if self.use_lcp_features:
+            lcp_hidden = max(4, min(hidden_size, 16))
+            self.lcp_head = nn.Sequential(
+                nn.Linear(self.lcp_feature_dim, lcp_hidden),
+                nn.ReLU(),
+                nn.Linear(lcp_hidden, 1),
+            )
         self.reuse_estimator = nn.Linear(
             hidden_size * 2 + lru_feature_dim,
             1,
@@ -218,14 +253,19 @@ class TrieParrotModel(nn.Module):
         value = min(max(float(value), 1e-7), 1.0 - 1e-7)
         return math.log(value / (1.0 - value))
 
+    @staticmethod
+    def _inverse_sigmoid_tensor(value: torch.Tensor) -> torch.Tensor:
+        value = value.clamp(1e-7, 1.0 - 1e-7)
+        return torch.log(value / (1.0 - value))
+
     def lru_prior_alpha(self) -> torch.Tensor:
         if self.lru_prior_alpha_learnable:
-            return self.lru_prior_alpha_max * torch.sigmoid(
-                self.lru_prior_raw_alpha
+            return self.lru_prior_alpha_min + self.lru_prior_alpha_range * (
+                torch.sigmoid(self.lru_prior_raw_alpha)
             )
         return torch.clamp(
             self.lru_prior_fixed_alpha,
-            min=0.0,
+            min=self.lru_prior_alpha_min,
             max=self.lru_prior_alpha_max,
         )
 
@@ -236,6 +276,10 @@ class TrieParrotModel(nn.Module):
 
         for key in list(adapted):
             if key.startswith("lru_head."):
+                dropped_keys.append(key)
+                del adapted[key]
+                migrated = True
+            elif key.startswith("lcp_head.") and not self.use_lcp_features:
                 dropped_keys.append(key)
                 del adapted[key]
                 migrated = True
@@ -254,6 +298,27 @@ class TrieParrotModel(nn.Module):
                     del adapted[mix_key]
                     migrated = True
 
+        version_key = "lru_prior_alpha_encoding_version"
+        raw_key = "lru_prior_raw_alpha"
+        if (
+            raw_key in adapted
+            and version_key not in adapted
+            and self.lru_prior_alpha_learnable
+            and self.lru_prior_alpha_range > 0
+        ):
+            saved_raw = adapted[raw_key].detach().float()
+            old_alpha = self.lru_prior_alpha_max * torch.sigmoid(saved_raw)
+            new_position = (
+                (old_alpha - self.lru_prior_alpha_min)
+                / self.lru_prior_alpha_range
+            )
+            adapted[raw_key] = self._inverse_sigmoid_tensor(new_position).to(
+                dtype=adapted[raw_key].dtype,
+                device=adapted[raw_key].device,
+            )
+            migrated = True
+        adapted.setdefault(version_key, self.lru_prior_alpha_encoding_version)
+
         return adapted, migrated, dropped_keys
 
     def load_state_dict_compatible(self, state_dict):
@@ -268,6 +333,10 @@ class TrieParrotModel(nn.Module):
         for key in ("lru_prior_raw_alpha", "lru_prior_fixed_alpha"):
             if key in current_state_keys and key not in adapted:
                 allowed_missing.add(key)
+        if self.use_lcp_features:
+            for key in current_state_keys:
+                if key.startswith("lcp_head.") and key not in adapted:
+                    allowed_missing.add(key)
         if "score_mix_logits" in dropped_keys:
             allowed_missing.add("score_mix_logits")
 
@@ -683,6 +752,105 @@ class TrieParrotModel(nn.Module):
             ))
         return scaled
 
+    def _scale_lcp_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Scale LCP feature rows in the same order as _lcp_stat_fields()."""
+        if features.size(-1) == 0:
+            return features
+        scaled = features.clone()
+        scaled[..., 0] = torch.log1p(torch.clamp_min(scaled[..., 0], 0.0))
+        scaled[..., 1] = torch.clamp(scaled[..., 1], 0.0, 1.0)
+        scaled[..., 2] = torch.clamp(scaled[..., 2], 0.0, 1.0)
+        scaled[..., 3] = torch.log1p(torch.clamp_min(scaled[..., 3], 0.0))
+        scaled[..., 4] = torch.log1p(torch.clamp_min(scaled[..., 4], 0.0))
+        return scaled
+
+    def _diagnostics_to_lcp_tensor(self, diagnostics, device: torch.device):
+        if diagnostics is None:
+            return None
+        if isinstance(diagnostics, torch.Tensor):
+            row = diagnostics.to(device=device, dtype=torch.float32)
+            if row.dim() == 1:
+                row = row.unsqueeze(0)
+            return row
+        rows = [
+            self._lcp_feature_row_from_diagnostic(diagnostic)
+            for diagnostic in diagnostics
+        ]
+        if not rows:
+            return torch.zeros(
+                0,
+                self.lcp_feature_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+        return torch.tensor(rows, dtype=torch.float32, device=device)
+
+    def _prepare_lcp_features_batch(
+        self,
+        lcp_features_batch,
+        candidate_mask: torch.Tensor,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Return padded, scaled LCP feature tensor of shape (B, N, 5)."""
+        if not self.use_lcp_features:
+            return None
+        batch_size, max_candidates = candidate_mask.shape
+        features = torch.zeros(
+            batch_size,
+            max_candidates,
+            self.lcp_feature_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        if lcp_features_batch is None:
+            return self._scale_lcp_features(features)
+
+        for batch_idx, row_features in enumerate(lcp_features_batch):
+            if row_features is None:
+                continue
+            row = self._diagnostics_to_lcp_tensor(row_features, device)
+            expected = int(candidate_mask[batch_idx].sum().item())
+            if row is None:
+                continue
+            if row.size(0) < expected:
+                raise ValueError(
+                    "lcp_features must have one row per selected candidate"
+                )
+            if row.size(1) != self.lcp_feature_dim:
+                raise ValueError(
+                    "lcp_features width must match model.lcp_feature_dim"
+                )
+            if expected > 0:
+                features[batch_idx, :expected, :] = row[:expected, :]
+
+        return self._scale_lcp_features(features)
+
+    def _prepare_lcp_features(
+        self,
+        lcp_features,
+        num_candidates: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not self.use_lcp_features:
+            return None
+        features = torch.zeros(
+            1,
+            num_candidates,
+            self.lcp_feature_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        if lcp_features is not None and num_candidates > 0:
+            row = self._diagnostics_to_lcp_tensor(lcp_features, device)
+            if row.size(0) < num_candidates:
+                raise ValueError("lcp_features must have one row per candidate")
+            if row.size(1) != self.lcp_feature_dim:
+                raise ValueError(
+                    "lcp_features width must match model.lcp_feature_dim"
+                )
+            features[0, :num_candidates, :] = row[:num_candidates, :]
+        return self._scale_lcp_features(features)
+
     def _attend_encoded_history(
         self,
         candidate_states: torch.Tensor,
@@ -703,6 +871,7 @@ class TrieParrotModel(nn.Module):
         request_context: torch.Tensor,
         micro_context: torch.Tensor,
         lru_features: torch.Tensor,
+        lcp_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         request_logit = self.request_head(request_context).squeeze(-1)
         micro_logit = self.micro_head(micro_context).squeeze(-1)
@@ -713,6 +882,15 @@ class TrieParrotModel(nn.Module):
             mix_weights[0] * request_logit
             + mix_weights[1] * micro_logit
         )
+        if self.use_lcp_features:
+            if lcp_features is None:
+                lcp_features = torch.zeros(
+                    *lru_features.shape[:-1],
+                    self.lcp_feature_dim,
+                    dtype=lru_features.dtype,
+                    device=lru_features.device,
+                )
+            context_score = context_score + self.lcp_head(lcp_features).squeeze(-1)
         eviction_logits = context_score + self.lru_prior_alpha() * lru_prior
 
         reuse_input = torch.cat(
@@ -733,6 +911,7 @@ class TrieParrotModel(nn.Module):
         candidate_states: torch.Tensor,
         candidate_mask: torch.Tensor,
         lru_features: torch.Tensor,
+        lcp_features: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Score a padded batch of training steps."""
         micro_context = self._attend_encoded_history(
@@ -749,6 +928,7 @@ class TrieParrotModel(nn.Module):
             request_context,
             micro_context,
             lru_features,
+            lcp_features,
         )
 
         eviction_logits = eviction_logits.masked_fill(~candidate_mask, -1e9)
@@ -761,6 +941,7 @@ class TrieParrotModel(nn.Module):
         candidate_paths_batch,
         request_history_paths_batch,
         lru_features_batch,
+        lcp_features_batch=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute training scores for a batch of microsteps.
@@ -794,6 +975,11 @@ class TrieParrotModel(nn.Module):
             candidate_mask,
             device,
         )
+        lcp_features = self._prepare_lcp_features_batch(
+            lcp_features_batch,
+            candidate_mask,
+            device,
+        )
         logits, pred_reuse = self._forward_batched_encoded(
             micro_memory,
             micro_mask,
@@ -802,6 +988,7 @@ class TrieParrotModel(nn.Module):
             candidate_states,
             candidate_mask,
             lru_features,
+            lcp_features,
         )
         return logits, pred_reuse, candidate_mask
 
@@ -812,6 +999,7 @@ class TrieParrotModel(nn.Module):
         lru_features,
         candidate_states: List[torch.Tensor] = None,
         candidate_paths: List[Tuple[int, ...]] = None,
+        lcp_features=None,
         inference: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -830,6 +1018,7 @@ class TrieParrotModel(nn.Module):
             request_history_memory: Completed-request leaf memory,
                 oldest-to-newest, shape (R, hidden_size).
             lru_features: Raw per-candidate LRU feature rows.
+            lcp_features: Optional raw per-candidate LCP feature rows.
             inference: If True, use cached candidate_states; otherwise re-encode
                 candidate_paths with gradient.
 
@@ -898,6 +1087,11 @@ class TrieParrotModel(nn.Module):
             candidates.size(0),
             device,
         )
+        lcp_feature_tensor = self._prepare_lcp_features(
+            lcp_features,
+            candidates.size(0),
+            device,
+        )
         eviction_logits, pred_reuse_dist = self._forward_batched_encoded(
             micro_memory.unsqueeze(0),
             micro_mask,
@@ -906,6 +1100,7 @@ class TrieParrotModel(nn.Module):
             candidate_batch,
             candidate_mask,
             lru_feature_tensor,
+            lcp_feature_tensor,
         )
 
         return eviction_logits, pred_reuse_dist
@@ -1048,7 +1243,14 @@ class TrieParrotModel(nn.Module):
 
     @staticmethod
     def loss_names() -> Tuple[str, ...]:
-        return ("ranking", "reuse", "ce", "top_set_ce", "hard_lru_margin")
+        return (
+            "ranking",
+            "reuse",
+            "ce",
+            "top_set_ce",
+            "hard_lru_margin",
+            "lcp_wrong_margin",
+        )
 
     @staticmethod
     def _oracle_top_set_from_distances(oracle_distances) -> Tuple[int, ...]:
@@ -1077,12 +1279,59 @@ class TrieParrotModel(nn.Module):
             "current_suffix_len",
         )
 
+    @staticmethod
+    def _lcp_len(left_path, right_path) -> int:
+        length = 0
+        for left, right in zip(left_path, right_path):
+            if left != right:
+                break
+            length += 1
+        return length
+
+    @classmethod
+    def lcp_features_from_paths(cls, candidate_paths, current_path):
+        current = tuple(current_path or ())
+        rows = []
+        for candidate_path in candidate_paths:
+            candidate = tuple(candidate_path or ())
+            lcp_len = cls._lcp_len(candidate, current)
+            rows.append((
+                float(lcp_len),
+                lcp_len / len(candidate) if candidate else 0.0,
+                lcp_len / len(current) if current else 0.0,
+                float(max(0, len(candidate) - lcp_len)),
+                float(max(0, len(current) - lcp_len)),
+            ))
+        return tuple(rows)
+
+    @classmethod
+    def _lcp_feature_row_from_diagnostic(cls, diagnostic):
+        if diagnostic is None:
+            return [0.0] * len(cls._lcp_stat_fields())
+        if isinstance(diagnostic, dict):
+            return [
+                float(diagnostic.get(field, 0.0))
+                for field in cls._lcp_stat_fields()
+            ]
+        row = list(diagnostic)
+        if len(row) != len(cls._lcp_stat_fields()):
+            raise ValueError(
+                "lcp_features width must match TrieParrotModel lcp fields"
+            )
+        return [float(value) for value in row]
+
+    @classmethod
+    def _lcp_ratio_current_from_diagnostic(cls, diagnostic) -> float:
+        row = cls._lcp_feature_row_from_diagnostic(diagnostic)
+        return min(max(float(row[2]), 0.0), 1.0)
+
     @classmethod
     def _accumulate_lcp_stats(cls, stats: dict, prefix: str, diagnostic):
         if diagnostic is None:
             return
-        for field in cls._lcp_stat_fields():
-            stats[f"{prefix}_{field}_sum"] += float(diagnostic.get(field, 0.0))
+        row = cls._lcp_feature_row_from_diagnostic(diagnostic)
+        for field, value in zip(cls._lcp_stat_fields(), row):
+            stats[f"{prefix}_{field}_sum"] += float(value)
         stats[f"{prefix}_count"] += 1
 
     @classmethod
@@ -1118,6 +1367,7 @@ class TrieParrotModel(nn.Module):
         ce_losses = []
         top_set_ce_losses = []
         hard_lru_margin_losses = []
+        lcp_wrong_margin_losses = []
         stats = {
             "full_steps": 0,
             "capped_steps": 0,
@@ -1127,6 +1377,7 @@ class TrieParrotModel(nn.Module):
             "ce_count": 0,
             "top_set_ce_count": 0,
             "hard_lru_margin_count": 0,
+            "lcp_wrong_margin_count": 0,
             "warmup_steps": 0,
             "loss_steps": 0,
             "microstep_access_steps": 0,
@@ -1137,6 +1388,9 @@ class TrieParrotModel(nn.Module):
             "oracle_top_set_steps": 0,
             "hard_lru_cases_count": 0,
             "hard_lru_active_frac": 0.0,
+            "lcp_wrong_cases_count": 0,
+            "lcp_wrong_high_lcp_count": 0,
+            "lcp_wrong_margin_active_frac": 0.0,
             "max_loss_candidates_effective": 0,
             "top_set_acc_correct": 0,
             "top_set_acc_count": 0,
@@ -1270,6 +1524,7 @@ class TrieParrotModel(nn.Module):
                 lru_features = [
                     raw_lru_features[idx] for idx in selected_indices
                 ]
+                lcp_features = None
                 relevances = None
                 if oracle_distances is not None:
                     relevances = self._transform_oracle_distances(
@@ -1303,6 +1558,9 @@ class TrieParrotModel(nn.Module):
                     getattr(step, "lcp_diagnostics", None) or ()
                 )
                 if lcp_diagnostics:
+                    lcp_features = [
+                        lcp_diagnostics[idx] for idx in selected_indices
+                    ]
                     if 0 <= step.oracle_target < len(lcp_diagnostics):
                         self._accumulate_lcp_stats(
                             stats,
@@ -1324,6 +1582,7 @@ class TrieParrotModel(nn.Module):
                     "request_history_paths": request_history_paths,
                     "candidate_paths": candidate_paths,
                     "lru_features": lru_features,
+                    "lcp_features": lcp_features,
                     "relevances": relevances,
                     "target_distribution": target_distribution,
                     "step_weight": float(step_loss_weight),
@@ -1351,12 +1610,21 @@ class TrieParrotModel(nn.Module):
                 if not batch_steps:
                     continue
 
-                logits, pred_log_reuse, candidate_mask = self.forward_batched(
+                forward_args = (
                     [item["microstep_history_paths"] for item in batch_steps],
                     [item["candidate_paths"] for item in batch_steps],
                     [item["request_history_paths"] for item in batch_steps],
                     [item["lru_features"] for item in batch_steps],
                 )
+                if self.use_lcp_features:
+                    logits, pred_log_reuse, candidate_mask = self.forward_batched(
+                        *forward_args,
+                        [item["lcp_features"] for item in batch_steps],
+                    )
+                else:
+                    logits, pred_log_reuse, candidate_mask = self.forward_batched(
+                        *forward_args
+                    )
 
                 max_batch_candidates = logits.size(1)
                 step_weights = torch.tensor(
@@ -1425,7 +1693,11 @@ class TrieParrotModel(nn.Module):
                         * step_weights
                     )
 
-                if self.top_set_ce_weight > 0 or self.hard_lru_margin_weight > 0:
+                if (
+                    self.top_set_ce_weight > 0
+                    or self.hard_lru_margin_weight > 0
+                    or self.lcp_wrong_margin_weight > 0
+                ):
                     for row_idx, item in enumerate(batch_steps):
                         row_valid_count = int(candidate_mask[row_idx].sum().item())
                         row_logits = logits[row_idx, :row_valid_count]
@@ -1467,6 +1739,34 @@ class TrieParrotModel(nn.Module):
                                 ).unsqueeze(0)
                                 * weight
                             )
+
+                        if (
+                            self.lcp_wrong_margin_weight > 0
+                            and item["oracle_top_set"]
+                            and item["lcp_diagnostics"]
+                        ):
+                            pred_pos = int(torch.argmax(row_logits.detach()).item())
+                            original_pred_idx = item["selected_indices"][pred_pos]
+                            if original_pred_idx not in set(item["oracle_top_set"]):
+                                stats["lcp_wrong_cases_count"] += 1
+                                if 0 <= original_pred_idx < len(item["lcp_diagnostics"]):
+                                    ratio_current = (
+                                        self._lcp_ratio_current_from_diagnostic(
+                                            item["lcp_diagnostics"][original_pred_idx]
+                                        )
+                                    )
+                                else:
+                                    ratio_current = 0.0
+                                if ratio_current >= self.lcp_wrong_ratio_threshold:
+                                    stats["lcp_wrong_high_lcp_count"] += 1
+                                    lcp_wrong_margin_losses.append(
+                                        F.softplus(
+                                            row_logits[pred_pos]
+                                            - top_score
+                                            + self.lcp_wrong_margin
+                                        ).unsqueeze(0)
+                                        * weight
+                                    )
 
                 for row_idx, item in enumerate(batch_steps):
                     if item["relevances"] is None:
@@ -1577,9 +1877,27 @@ class TrieParrotModel(nn.Module):
                 requires_grad=True,
             )
 
+        if lcp_wrong_margin_losses:
+            stats["lcp_wrong_margin_count"] = sum(
+                term.numel() for term in lcp_wrong_margin_losses
+            )
+            losses["lcp_wrong_margin"] = reduce_loss_terms(
+                lcp_wrong_margin_losses,
+                self.lcp_wrong_margin_weight,
+            )
+        else:
+            losses["lcp_wrong_margin"] = torch.tensor(
+                0.0,
+                device=device,
+                requires_grad=True,
+            )
+
         if stats["loss_steps"] > 0:
             stats["hard_lru_active_frac"] = (
                 stats["hard_lru_cases_count"] / stats["loss_steps"]
+            )
+            stats["lcp_wrong_margin_active_frac"] = (
+                stats["lcp_wrong_high_lcp_count"] / stats["loss_steps"]
             )
         if stats["top_set_acc_count"] > 0:
             stats["top_set_acc"] = (
@@ -1657,10 +1975,18 @@ class TrieParrotModel(nn.Module):
             reuse_distance_log_cap=config.get("reuse_distance_log_cap", 5.0),
             ndcg_alpha=config.get("ndcg_alpha", 10.0),
             lru_prior_alpha_init=lru_prior_alpha_init,
+            lru_prior_alpha_min=config.get("lru_prior_alpha_min", 0.0),
             lru_prior_alpha_max=config.get("lru_prior_alpha_max", 1.5),
             lru_prior_alpha_learnable=config.get(
                 "lru_prior_alpha_learnable",
                 not fixed_lru_prior_requested,
+            ),
+            use_lcp_features=config.get("use_lcp_features", False),
+            lcp_wrong_margin_weight=config.get("lcp_wrong_margin_weight", 0.0),
+            lcp_wrong_margin=config.get("lcp_wrong_margin", 0.2),
+            lcp_wrong_ratio_threshold=config.get(
+                "lcp_wrong_ratio_threshold",
+                0.5,
             ),
         )
 

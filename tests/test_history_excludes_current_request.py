@@ -23,8 +23,10 @@ class RecordingModel(TrieParrotModel):
         lru_features,
         candidate_states=None,
         candidate_paths=None,
+        lcp_features=None,
         inference=True,
     ):
+        del lcp_features
         if isinstance(microstep_history_memory, list):
             self.history_lengths.append(len(microstep_history_memory))
         elif microstep_history_memory is None:

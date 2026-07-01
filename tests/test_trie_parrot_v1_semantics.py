@@ -367,27 +367,127 @@ def test_lru_prior_alpha_initialization_and_nonnegative():
         vocab_size=128,
         node_embed_dim=16,
         hidden_size=8,
-        lru_prior_alpha_init=0.75,
+        lru_prior_alpha_init=0.25,
+        lru_prior_alpha_min=0.25,
         lru_prior_alpha_max=1.5,
     )
-    assert learnable.lru_prior_alpha().item() >= 0.0
-    assert math.isclose(learnable.lru_prior_alpha().item(), 0.75, rel_tol=0.0, abs_tol=1e-6)
+    assert learnable.lru_prior_alpha().item() >= 0.25
+    assert math.isclose(learnable.lru_prior_alpha().item(), 0.25, rel_tol=0.0, abs_tol=1e-6)
+
+    with torch.no_grad():
+        learnable.lru_prior_raw_alpha.fill_(-100.0)
+    assert learnable.lru_prior_alpha().item() >= 0.25
 
     with torch.no_grad():
         learnable.lru_prior_raw_alpha.fill_(100.0)
-    assert learnable.lru_prior_alpha().item() >= 0.0
+    assert learnable.lru_prior_alpha().item() >= 0.25
     assert learnable.lru_prior_alpha().item() <= 1.5
 
     fixed = TrieParrotModel(
         vocab_size=128,
         node_embed_dim=16,
         hidden_size=8,
-        lru_prior_alpha_init=0.25,
+        lru_prior_alpha_init=0.1,
+        lru_prior_alpha_min=0.25,
         lru_prior_alpha_max=1.5,
         lru_prior_alpha_learnable=False,
     )
     assert math.isclose(fixed.lru_prior_alpha().item(), 0.25, rel_tol=0.0, abs_tol=1e-6)
     assert "lru_prior_raw_alpha" not in dict(fixed.named_parameters())
+
+    fixed_high = TrieParrotModel(
+        vocab_size=128,
+        node_embed_dim=16,
+        hidden_size=8,
+        lru_prior_alpha_init=2.5,
+        lru_prior_alpha_min=0.25,
+        lru_prior_alpha_max=1.5,
+        lru_prior_alpha_learnable=False,
+    )
+    assert math.isclose(fixed_high.lru_prior_alpha().item(), 1.5, rel_tol=0.0, abs_tol=1e-6)
+
+
+def test_old_lru_prior_raw_alpha_checkpoint_preserves_alpha_with_min_bound():
+    old_model = TrieParrotModel(
+        vocab_size=128,
+        node_embed_dim=16,
+        hidden_size=8,
+        lru_prior_alpha_init=0.75,
+        lru_prior_alpha_max=1.5,
+    )
+    old_alpha = old_model.lru_prior_alpha().detach().item()
+    old_state = {
+        key: value.clone()
+        for key, value in old_model.state_dict().items()
+        if key != "lru_prior_alpha_encoding_version"
+    }
+
+    new_model = TrieParrotModel(
+        vocab_size=128,
+        node_embed_dim=16,
+        hidden_size=8,
+        lru_prior_alpha_init=0.25,
+        lru_prior_alpha_min=0.25,
+        lru_prior_alpha_max=1.5,
+    )
+    migration = new_model.load_state_dict_compatible(old_state)
+
+    assert migration["migrated"]
+    assert math.isclose(
+        new_model.lru_prior_alpha().detach().item(),
+        old_alpha,
+        rel_tol=0.0,
+        abs_tol=1e-6,
+    )
+
+
+def test_lcp_feature_head_affects_forward_when_enabled():
+    model = TrieParrotModel(
+        vocab_size=128,
+        node_embed_dim=16,
+        hidden_size=8,
+        lru_prior_alpha_init=0.0,
+        lru_prior_alpha_learnable=False,
+        use_lcp_features=True,
+    )
+    model.eval()
+    with torch.no_grad():
+        model.request_head.weight.zero_()
+        model.request_head.bias.zero_()
+        model.micro_head.weight.zero_()
+        model.micro_head.bias.zero_()
+        for parameter in model.lcp_head.parameters():
+            parameter.zero_()
+        model.lcp_head[0].weight[0, 2] = 1.0
+        model.lcp_head[2].weight[0, 0] = 1.0
+
+    microstep_history_memory = torch.zeros(1, model.hidden_size)
+    request_history_memory = torch.zeros(1, model.hidden_size)
+    candidate_states = [
+        torch.zeros(1, model.hidden_size),
+        torch.zeros(1, model.hidden_size),
+    ]
+    lru_features = [
+        (1.0, 1.0, 1.0, 1.0, 1.0),
+        (1.0, 1.0, 1.0, 1.0, 1.0),
+    ]
+    lcp_features = [
+        (0.0, 0.0, 0.1, 0.0, 1.0),
+        (0.0, 0.0, 0.9, 0.0, 1.0),
+    ]
+
+    with torch.no_grad():
+        logits, _ = model.forward(
+            microstep_history_memory,
+            request_history_memory,
+            lru_features,
+            candidate_states=candidate_states,
+            lcp_features=lcp_features,
+            inference=True,
+        )
+
+    assert logits[0, 1] > logits[0, 0]
+    assert torch.allclose(logits[0, 1] - logits[0, 0], torch.tensor(0.8), atol=1e-6)
 
 
 def test_lru_prior_forward_and_batch_paths_match():
@@ -487,6 +587,8 @@ if __name__ == "__main__":
     test_candidate_is_query_only_not_direct_scorer_input()
     test_lru_prior_directly_conditions_score()
     test_lru_prior_alpha_initialization_and_nonnegative()
+    test_old_lru_prior_raw_alpha_checkpoint_preserves_alpha_with_min_bound()
+    test_lcp_feature_head_affects_forward_when_enabled()
     test_lru_prior_forward_and_batch_paths_match()
     test_loss_handles_finite_and_inf_oracle_distances_without_nan()
     print("TRIE-PARROT V1 SEMANTICS TESTS PASSED")

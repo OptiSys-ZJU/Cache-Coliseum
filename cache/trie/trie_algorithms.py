@@ -16,6 +16,46 @@ from cache.evict.evictor import Evictor, LRUEvictor, RandEvictor
 from cache.evict.predictor import OraclePredictor, Predictor
 from cache.trie.oracle import PrefixFutureOracle
 
+LCP_FEATURE_FIELDS = (
+    "lcp_len",
+    "lcp_ratio_candidate",
+    "lcp_ratio_current",
+    "candidate_suffix_len",
+    "current_suffix_len",
+)
+
+
+def lcp_len(left_path, right_path) -> int:
+    length = 0
+    for left, right in zip(left_path, right_path):
+        if left != right:
+            break
+        length += 1
+    return length
+
+
+def candidate_lcp_features(candidate_paths, current_path):
+    current = tuple(current_path or ())
+    rows = []
+    for candidate_path in candidate_paths:
+        candidate = tuple(candidate_path or ())
+        prefix_len = lcp_len(candidate, current)
+        rows.append((
+            float(prefix_len),
+            prefix_len / len(candidate) if candidate else 0.0,
+            prefix_len / len(current) if current else 0.0,
+            float(max(0, len(candidate) - prefix_len)),
+            float(max(0, len(current) - prefix_len)),
+        ))
+    return tuple(rows)
+
+
+def candidate_lcp_diagnostics(candidate_paths, current_path):
+    return tuple(
+        dict(zip(LCP_FEATURE_FIELDS, row))
+        for row in candidate_lcp_features(candidate_paths, current_path)
+    )
+
 class TrieNode:
     def __init__(self):
         self.children = defaultdict(TrieNode)
@@ -769,6 +809,10 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
                 float(len(path_ages)),
             ])
         return rows
+
+    def _candidate_lcp_features(self, candidates: List[TrieNode], current_path: List):
+        candidate_paths = [TrieNode.get_node_id_path(candidate) for candidate in candidates]
+        return candidate_lcp_features(candidate_paths, current_path)
     
     def _get_protected_leaves(self, current_path: List) -> set:
         """
@@ -861,12 +905,18 @@ class TrieModelPredictAlgorithm(TrieEvictAlgorithm):
                         # Fallback: zero state for nodes without cached state
                         leaf_states.append(torch.zeros(1, self.model.hidden_size))
                 
+                forward_kwargs = {"candidate_states": leaf_states}
+                if getattr(self.model, "use_lcp_features", False):
+                    forward_kwargs["lcp_features"] = self._candidate_lcp_features(
+                        candidates,
+                        current_path,
+                    )
                 with torch.no_grad():
                     scores, _ = self.model.forward(
                         self._score_time_microstep_history_memory(current_path),
                         self._request_history_memory(),
                         self._candidate_lru_features(candidates),
-                        candidate_states=leaf_states,
+                        **forward_kwargs,
                     )
                 
                 # Evict the node with the highest eviction logit
@@ -1029,12 +1079,18 @@ class TrieModelGuard(TrieModelPredictAlgorithm):
                     else:
                         leaf_states.append(torch.zeros(1, self.model.hidden_size))
                 
+                forward_kwargs = {"candidate_states": leaf_states}
+                if getattr(self.model, "use_lcp_features", False):
+                    forward_kwargs["lcp_features"] = self._candidate_lcp_features(
+                        candidates,
+                        current_path,
+                    )
                 with torch.no_grad():
                     scores, _ = self.model.forward(
                         self._score_time_microstep_history_memory(current_path),
                         self._request_history_memory(),
                         self._candidate_lru_features(candidates),
-                        candidate_states=leaf_states,
+                        **forward_kwargs,
                     )
                 
                 score_variance = scores.var().item()

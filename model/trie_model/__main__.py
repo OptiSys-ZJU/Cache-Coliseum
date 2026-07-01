@@ -101,14 +101,62 @@ def resolve_lru_prior_config(config: dict):
     )
     return (
         config.get('lru_prior_alpha_init', default_lru_prior_alpha),
+        config.get('lru_prior_alpha_min', 0.0),
         config.get('lru_prior_alpha_max', 1.5),
         config.get('lru_prior_alpha_learnable', not fixed_lru_prior_requested),
     )
 
 
+def scheduled_loss_weight(
+    initial: float,
+    final: float,
+    step: int,
+    decay_after: int = None,
+    decay_steps: int = 1,
+) -> float:
+    """Linearly decay an auxiliary loss weight after a configured step."""
+    if final is None or decay_after is None:
+        return float(initial)
+    initial = float(initial)
+    final = float(final)
+    decay_after = int(decay_after)
+    decay_steps = max(1, int(decay_steps or 1))
+    if step <= decay_after:
+        return initial
+    progress = min(1.0, (float(step) - float(decay_after)) / float(decay_steps))
+    return initial + progress * (final - initial)
+
+
+def apply_loss_weight_schedule(
+    model: TrieParrotModel,
+    config: dict,
+    base_weights: dict,
+    step: int,
+) -> dict:
+    """Apply the configured auxiliary-loss schedule and return active weights."""
+    decay_after = config.get('loss_schedule_after')
+    decay_steps = config.get('loss_schedule_steps', 1)
+    active = {}
+    for attr in (
+        'top_set_ce_weight',
+        'hard_lru_margin_weight',
+        'lcp_wrong_margin_weight',
+    ):
+        active[attr] = scheduled_loss_weight(
+            base_weights.get(attr, getattr(model, attr, 0.0)),
+            config.get(f'{attr}_final'),
+            step,
+            decay_after,
+            decay_steps,
+        )
+        setattr(model, attr, active[attr])
+    return active
+
+
 def create_trie_parrot_model_from_config(config: dict, vocab_size: int):
     (
         lru_prior_alpha_init,
+        lru_prior_alpha_min,
         lru_prior_alpha_max,
         lru_prior_alpha_learnable,
     ) = resolve_lru_prior_config(config)
@@ -143,8 +191,13 @@ def create_trie_parrot_model_from_config(config: dict, vocab_size: int):
         reuse_distance_log_cap=config.get('reuse_distance_log_cap', 5.0),
         ndcg_alpha=config.get('ndcg_alpha', 10.0),
         lru_prior_alpha_init=lru_prior_alpha_init,
+        lru_prior_alpha_min=lru_prior_alpha_min,
         lru_prior_alpha_max=lru_prior_alpha_max,
         lru_prior_alpha_learnable=lru_prior_alpha_learnable,
+        use_lcp_features=resolve_bool_config(config, 'use_lcp_features', False),
+        lcp_wrong_margin_weight=config.get('lcp_wrong_margin_weight', 0.0),
+        lcp_wrong_margin=config.get('lcp_wrong_margin', 0.2),
+        lcp_wrong_ratio_threshold=config.get('lcp_wrong_ratio_threshold', 0.5),
     )
 
 
@@ -515,12 +568,22 @@ def compute_rank_eval_metrics(model: TrieParrotModel, eviction_steps):
                 request_history_paths,
                 device,
             )
+            forward_kwargs = {}
+            if getattr(model, "use_lcp_features", False):
+                lcp_features = getattr(step, "lcp_diagnostics", None)
+                if not lcp_features:
+                    lcp_features = TrieParrotModel.lcp_features_from_paths(
+                        step.leaf_paths,
+                        getattr(step, "current_path", ()),
+                    )
+                forward_kwargs["lcp_features"] = lcp_features
             logits, _ = model(
                 microstep_history_memory,
                 request_history_memory,
                 step.lru_features,
                 candidate_paths=step.leaf_paths,
                 inference=False,
+                **forward_kwargs,
             )
             scores = logits.squeeze(0).detach().float().cpu().tolist()
             relevances = model._transform_oracle_distances(
@@ -722,8 +785,13 @@ def finalize_loss_stats(stats: dict) -> dict:
             stats.get("hard_lru_cases_count", 0)
             / stats["loss_steps"]
         )
+        stats["lcp_wrong_margin_active_frac"] = (
+            stats.get("lcp_wrong_high_lcp_count", 0)
+            / stats["loss_steps"]
+        )
     else:
         stats["hard_lru_active_frac"] = 0.0
+        stats["lcp_wrong_margin_active_frac"] = 0.0
     if stats.get("top_set_acc_count", 0):
         stats["top_set_acc"] = (
             stats.get("top_set_acc_correct", 0)
@@ -757,6 +825,7 @@ def combine_loss_stats(stats_items) -> dict:
     combined = {}
     derived_keys = {
         "hard_lru_active_frac",
+        "lcp_wrong_margin_active_frac",
         "top_set_acc",
         "regret",
     }
@@ -933,6 +1002,7 @@ def summarize_loss_batch(
         "ce_count": 0,
         "top_set_ce_count": 0,
         "hard_lru_margin_count": 0,
+        "lcp_wrong_margin_count": 0,
         "warmup_steps": 0,
         "loss_steps": 0,
         "microstep_access_steps": 0,
@@ -943,6 +1013,9 @@ def summarize_loss_batch(
         "oracle_top_set_steps": 0,
         "hard_lru_cases_count": 0,
         "hard_lru_active_frac": 0.0,
+        "lcp_wrong_cases_count": 0,
+        "lcp_wrong_high_lcp_count": 0,
+        "lcp_wrong_margin_active_frac": 0.0,
         "max_loss_candidates_effective": 0,
     }
 
@@ -1042,6 +1115,9 @@ def summarize_loss_batch(
     if stats["loss_steps"] > 0:
         stats["hard_lru_active_frac"] = (
             stats["hard_lru_cases_count"] / stats["loss_steps"]
+        )
+        stats["lcp_wrong_margin_active_frac"] = (
+            stats["lcp_wrong_high_lcp_count"] / stats["loss_steps"]
         )
 
     return stats
@@ -1147,9 +1223,13 @@ METRIC_FIELDS = [
     "loss_ce",
     "loss_top_set_ce",
     "loss_hard_lru_margin",
+    "loss_lcp_wrong_margin",
     "train_hr",
     "eval_hr",
     "model_prob",
+    "top_set_ce_weight_active",
+    "hard_lru_margin_weight_active",
+    "lcp_wrong_margin_weight_active",
     "full_steps",
     "capped_steps",
     "candidate_count",
@@ -1159,6 +1239,10 @@ METRIC_FIELDS = [
     "eviction_decision_steps",
     "hard_lru_cases_count",
     "hard_lru_active_frac",
+    "lcp_wrong_cases_count",
+    "lcp_wrong_high_lcp_count",
+    "lcp_wrong_margin_count",
+    "lcp_wrong_margin_active_frac",
     "lru_target_kept_count",
     "lru_target_steps",
     "oracle_top_set_kept_count",
@@ -1292,6 +1376,9 @@ def plot_loss_curves(metrics_path: str, run_id: str, output_path: str):
             "loss_hard_lru_margin": [
                 parse_float(row.get("loss_hard_lru_margin")) for row in rows
             ],
+            "loss_lcp_wrong_margin": [
+                parse_float(row.get("loss_lcp_wrong_margin")) for row in rows
+            ],
         }
 
         plt.figure(figsize=(10, 6))
@@ -1419,6 +1506,17 @@ if __name__ == '__main__':
     top_set_ce_weight = config.get('top_set_ce_weight', 0.0)
     hard_lru_margin_weight = config.get('hard_lru_margin_weight', 0.0)
     hard_lru_margin = config.get('hard_lru_margin', 0.2)
+    use_lcp_features = resolve_bool_config(config, 'use_lcp_features', False)
+    lcp_wrong_margin_weight = config.get('lcp_wrong_margin_weight', 0.0)
+    lcp_wrong_margin = config.get('lcp_wrong_margin', 0.2)
+    lcp_wrong_ratio_threshold = config.get('lcp_wrong_ratio_threshold', 0.5)
+    loss_schedule_after = config.get('loss_schedule_after')
+    loss_schedule_steps = config.get('loss_schedule_steps', 1)
+    loss_base_weights = {
+        'top_set_ce_weight': top_set_ce_weight,
+        'hard_lru_margin_weight': hard_lru_margin_weight,
+        'lcp_wrong_margin_weight': lcp_wrong_margin_weight,
+    }
     train_on_eviction_decision = resolve_bool_config(
         config,
         'train_on_eviction_decision',
@@ -1430,6 +1528,7 @@ if __name__ == '__main__':
     ndcg_alpha = config.get('ndcg_alpha', 10.0)
     (
         lru_prior_alpha_init,
+        lru_prior_alpha_min,
         lru_prior_alpha_max,
         lru_prior_alpha_learnable,
     ) = resolve_lru_prior_config(config)
@@ -1481,6 +1580,14 @@ if __name__ == '__main__':
         f"ranking={ranking_loss_weight} reuse={reuse_loss_weight} ce={ce_loss_weight} "
         f"top_set_ce={top_set_ce_weight} "
         f"hard_lru_margin={hard_lru_margin_weight}@{hard_lru_margin} "
+        f"lcp_wrong_margin={lcp_wrong_margin_weight}@{lcp_wrong_margin} "
+        f"lcp_wrong_ratio_threshold={lcp_wrong_ratio_threshold} "
+        f"loss_schedule_after={loss_schedule_after} "
+        f"loss_schedule_steps={loss_schedule_steps} "
+        f"top_set_ce_final={config.get('top_set_ce_weight_final')} "
+        f"hard_lru_margin_final={config.get('hard_lru_margin_weight_final')} "
+        f"lcp_wrong_margin_final={config.get('lcp_wrong_margin_weight_final')} "
+        f"use_lcp_features={use_lcp_features} "
         f"train_on_eviction_decision={train_on_eviction_decision} "
         f"eviction_decision={eviction_decision_loss_weight} "
         f"microstep_access={microstep_access_loss_weight} "
@@ -1490,6 +1597,7 @@ if __name__ == '__main__':
     print(
         "TrieParrot: LRU prior "
         f"alpha_init={lru_prior_alpha_init} "
+        f"alpha_min={lru_prior_alpha_min} "
         f"alpha_max={lru_prior_alpha_max} "
         f"alpha_learnable={lru_prior_alpha_learnable}"
     )
@@ -1528,6 +1636,7 @@ if __name__ == '__main__':
     # Override config vocab_size with actual data vocab_size
     config['vocab_size'] = vocab_size
     config['lru_prior_alpha_init'] = lru_prior_alpha_init
+    config['lru_prior_alpha_min'] = lru_prior_alpha_min
     config['lru_prior_alpha_max'] = lru_prior_alpha_max
     config['lru_prior_alpha_learnable'] = lru_prior_alpha_learnable
     config['train_on_eviction_decision'] = train_on_eviction_decision
@@ -1536,6 +1645,12 @@ if __name__ == '__main__':
     config['top_set_ce_weight'] = top_set_ce_weight
     config['hard_lru_margin_weight'] = hard_lru_margin_weight
     config['hard_lru_margin'] = hard_lru_margin
+    config['use_lcp_features'] = use_lcp_features
+    config['lcp_wrong_margin_weight'] = lcp_wrong_margin_weight
+    config['lcp_wrong_margin'] = lcp_wrong_margin
+    config['lcp_wrong_ratio_threshold'] = lcp_wrong_ratio_threshold
+    config['loss_schedule_after'] = loss_schedule_after
+    config['loss_schedule_steps'] = loss_schedule_steps
     config['async_collection'] = async_collection
     config['collection_autotune'] = collection_autotune
     config['collection_target_train_time_ratio'] = collection_target_train_time_ratio
@@ -1624,6 +1739,7 @@ if __name__ == '__main__':
             'loss/ce': 0.0,
             'loss/top': 0.0,
             'loss/hard_lru': 0.0,
+            'loss/lcp_wrong': 0.0,
             'cand': candidate_mode,
             'train_hr': 0.0,
             'eval_hr': 0.0,
@@ -1648,6 +1764,17 @@ if __name__ == '__main__':
 
             model_prob = get_model_prob(step, dagger_init, dagger_final, dagger_steps)
             postfix['model_prob'] = f'{model_prob:.2f}'
+            active_loss_weights = apply_loss_weight_schedule(
+                model,
+                config,
+                loss_base_weights,
+                step,
+            )
+            postfix['loss_w'] = (
+                f"top:{active_loss_weights['top_set_ce_weight']:.2f}/"
+                f"hard:{active_loss_weights['hard_lru_margin_weight']:.2f}/"
+                f"lcp:{active_loss_weights['lcp_wrong_margin_weight']:.2f}"
+            )
             plan = plan_collection_round(
                 step,
                 total_steps,
@@ -1901,13 +2028,26 @@ if __name__ == '__main__':
                     and loss_microbatch_size < len(batch)
                 )
                 if use_loss_microbatch:
-                    loss_stats = summarize_loss_batch(
-                        model,
-                        batch,
-                        max_loss_candidates,
-                        max_loss_steps_per_snapshot,
-                        loss_warmup_steps,
-                    )
+                    if getattr(model, "lcp_wrong_margin_weight", 0.0) > 0:
+                        with torch.no_grad():
+                            compute_training_losses(
+                                model,
+                                batch,
+                                max_loss_candidates,
+                                max_loss_steps_per_snapshot,
+                                loss_warmup_steps,
+                                train_device_ids,
+                                reduction="sum",
+                            )
+                            loss_stats = dict(model.last_loss_stats)
+                    else:
+                        loss_stats = summarize_loss_batch(
+                            model,
+                            batch,
+                            max_loss_candidates,
+                            max_loss_steps_per_snapshot,
+                            loss_warmup_steps,
+                        )
                     loss_names = TrieParrotModel.loss_names()
                     loss_values = {name: 0.0 for name in loss_names}
                     total_loss_value = 0.0
@@ -1997,6 +2137,9 @@ if __name__ == '__main__':
                 postfix['loss/hard_lru'] = (
                     f'{loss_values.get("hard_lru_margin", 0.0):.4f}'
                 )
+                postfix['loss/lcp_wrong'] = (
+                    f'{loss_values.get("lcp_wrong_margin", 0.0):.4f}'
+                )
                 postfix['cand'] = (
                     f'full:{full_steps}/cap:{capped_steps}/avg:{avg_candidates:.1f}'
                 )
@@ -2011,9 +2154,22 @@ if __name__ == '__main__':
                     "loss_ce": loss_values.get("ce", 0.0),
                     "loss_top_set_ce": loss_values.get("top_set_ce", 0.0),
                     "loss_hard_lru_margin": loss_values.get("hard_lru_margin", 0.0),
+                    "loss_lcp_wrong_margin": loss_values.get(
+                        "lcp_wrong_margin",
+                        0.0,
+                    ),
                     "train_hr": train_hit_rate,
                     "eval_hr": postfix.get('eval_hr', ""),
                     "model_prob": model_prob,
+                    "top_set_ce_weight_active": active_loss_weights[
+                        "top_set_ce_weight"
+                    ],
+                    "hard_lru_margin_weight_active": active_loss_weights[
+                        "hard_lru_margin_weight"
+                    ],
+                    "lcp_wrong_margin_weight_active": active_loss_weights[
+                        "lcp_wrong_margin_weight"
+                    ],
                     "full_steps": full_steps,
                     "capped_steps": capped_steps,
                     "candidate_count": candidate_count,
@@ -2036,6 +2192,22 @@ if __name__ == '__main__':
                     ),
                     "hard_lru_active_frac": loss_stats.get(
                         "hard_lru_active_frac",
+                        "",
+                    ),
+                    "lcp_wrong_cases_count": loss_stats.get(
+                        "lcp_wrong_cases_count",
+                        "",
+                    ),
+                    "lcp_wrong_high_lcp_count": loss_stats.get(
+                        "lcp_wrong_high_lcp_count",
+                        "",
+                    ),
+                    "lcp_wrong_margin_count": loss_stats.get(
+                        "lcp_wrong_margin_count",
+                        "",
+                    ),
+                    "lcp_wrong_margin_active_frac": loss_stats.get(
+                        "lcp_wrong_margin_active_frac",
                         "",
                     ),
                     "lru_target_kept_count": loss_stats.get(

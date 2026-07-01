@@ -32,6 +32,7 @@ from model.trie_model.__main__ import (
     round_step_budget,
     resolve_bool_config,
     resolve_training_round_budget,
+    scheduled_loss_weight,
     should_run_periodic_event,
     latest_training_checkpoint,
     parse_train_device_ids,
@@ -608,6 +609,7 @@ def test_loss_microbatch_sum_matches_full_batch_mean():
         "ce_count",
         "top_set_ce_count",
         "hard_lru_margin_count",
+        "lcp_wrong_margin_count",
         "warmup_steps",
         "loss_steps",
         "microstep_access_steps",
@@ -715,6 +717,53 @@ def test_phase_configs_capture_hard_lru_ablation_knobs():
     assert phase2["hard_lru_margin"] == 0.2
 
 
+def test_phase2_lcp_config_enables_lcp_knobs_and_metrics_fields():
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(__file__)),
+        "configs",
+        "full_parrot_like_phase2_lcp_oasst1_b16_c256.json",
+    )
+    with open(config_path) as f:
+        config = json.load(f)
+
+    assert config["eval_freq"] == 1000
+    assert config["save_freq"] == 1000
+    assert config["rank_eval_freq"] == 1000
+    assert config["use_lcp_features"] is True
+    assert config["lru_prior_alpha_min"] == 0.25
+    assert config["lcp_wrong_margin_weight"] == 0.15
+    assert config["lcp_wrong_margin"] == 0.2
+    assert config["lcp_wrong_ratio_threshold"] == 0.5
+    assert config["loss_schedule_after"] == 5000
+    assert config["loss_schedule_steps"] == 5000
+    assert config["top_set_ce_weight_final"] == 0.35
+    assert config["hard_lru_margin_weight_final"] == 0.35
+    assert config["lcp_wrong_margin_weight_final"] == 0.05
+    assert "loss_lcp_wrong_margin" in METRIC_FIELDS
+    assert "lcp_wrong_margin_count" in METRIC_FIELDS
+    assert "top_set_ce_weight_active" in METRIC_FIELDS
+    assert "hard_lru_margin_weight_active" in METRIC_FIELDS
+    assert "lcp_wrong_margin_weight_active" in METRIC_FIELDS
+
+    model = create_trie_parrot_model_from_config(config, vocab_size=32)
+    assert model.use_lcp_features
+    assert model.lru_prior_alpha_min == 0.25
+    assert model.lcp_wrong_margin_weight == 0.15
+    assert model.lcp_wrong_margin == 0.2
+    assert model.lcp_wrong_ratio_threshold == 0.5
+
+
+def test_scheduled_loss_weight_linear_decay():
+    assert scheduled_loss_weight(1.0, 0.35, 5000, 5000, 5000) == 1.0
+    assert math.isclose(
+        scheduled_loss_weight(1.0, 0.35, 7500, 5000, 5000),
+        0.675,
+        abs_tol=1e-12,
+    )
+    assert scheduled_loss_weight(1.0, 0.35, 10000, 5000, 5000) == 0.35
+    assert scheduled_loss_weight(1.0, None, 10000, 5000, 5000) == 1.0
+
+
 if __name__ == "__main__":
     test_metric_append_writes_header_and_preserves_existing_rows()
     test_metric_append_upgrades_older_header()
@@ -733,4 +782,6 @@ if __name__ == "__main__":
     test_full_dagger_config_uses_lru_trie_fields()
     test_full_parrot_like_config_uses_parrot_window_shape()
     test_phase_configs_capture_hard_lru_ablation_knobs()
+    test_phase2_lcp_config_enables_lcp_knobs_and_metrics_fields()
+    test_scheduled_loss_weight_linear_decay()
     print("TRIE TRAINING METRIC LOGGING TESTS PASSED")
