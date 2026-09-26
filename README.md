@@ -1,10 +1,10 @@
 # Cache-Coliseum
 
 [![Paper](https://img.shields.io/badge/arxiv-2507.16242-1)](https://arxiv.org/abs/2507.16242)
-[![nips](https://img.shields.io/badge/NeurIPS%202025-blueviolet)](https://neurips.cc/virtual/2025/poster/116615)
+[![NeurIPS](https://img.shields.io/badge/NeurIPS%202025-blueviolet)](https://neurips.cc/virtual/2025/poster/116615)
 [![GitHub](https://img.shields.io/badge/GitHub-Repository-black)](https://github.com/OptiSys-ZJU/cache-coliseum)
 
-A benchmark for evaluating learning-augmented caching algorithms, featuring multiple algorithm implementations and a variety of predictors. Implementation of the NeurIPS'25 paper [Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency](https://papers.nips.cc/paper_files/paper/2025/hash/b1e7f61f40d68b2177857bfcb195a507-Abstract-Conference.html) [[arXiv](https://arxiv.org/pdf/2507.16242)].
+A benchmark for evaluating learning-augmented caching algorithms, featuring multiple algorithm implementations and a variety of predictors. Implementation of the NeurIPS'25 paper [Robustifying Learning-Augmented Caching Efficiently without Compromising 1-Consistency](https://proceedings.neurips.cc/paper_files/paper/2025/hash/b1e7f61f40d68b2177857bfcb195a507-Abstract-Conference.html) [[arXiv](https://arxiv.org/pdf/2507.16242)].
 
 ## Experimental Code & Acknowledgements
 
@@ -13,8 +13,6 @@ The experimental scripts, training/evaluation pipelines, data preprocessing, and
 Some parts of the project code were inspired by or adapted from existing open-source repositories, including:
 - [cache_replacement](https://github.com/google-research/google-research/tree/master/cache_replacement)
 - [ML caching with guarantees](https://github.com/chledowski/ml_caching_with_guarantees)
-
-The design and refinement of Guard were contributed by [Peng Chen](https://github.com/Natureal).
 
 ## Traces and Checkpoints
 
